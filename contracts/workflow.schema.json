@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "V0 authority command contracts v1",
+  "description": "Server-internal workflow/progress interfaces and reserved voice/evidence requests. This schema does not enable HTTP routes. Actor identity, support job authority and elapsed time are server-owned.",
+  "$defs": {
+    "Revisions": {
+      "type": "object",
+      "properties": {
+        "workflow": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "content": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "workflow",
+        "content",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "ClipSelection": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        }
+      },
+      "required": [
+        "id",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "Content": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "attribution": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "clips": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/ClipSelection"
+          }
+        }
+      },
+      "required": [
+        "text",
+        "attribution",
+        "clips"
+      ],
+      "additionalProperties": false
+    },
+    "WorkflowAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "save"
+            },
+            "content": {
+              "$ref": "#/$defs/Content"
+            }
+          },
+          "required": [
+            "type",
+            "content"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "correct_transcript"
+            },
+            "source_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "source_id",
+            "text"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "approve"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "decline"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "publish"
+            },
+            "approval_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "required": [
+            "type",
+            "approval_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "unpublish"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "WorkflowCommand": {
+      "type": "object",
+      "properties": {
+        "interview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expected": {
+          "$ref": "#/$defs/Revisions"
+        },
+        "action": {
+          "$ref": "#/$defs/WorkflowAction"
+        }
+      },
+      "required": [
+        "interview_id",
+        "request_id",
+        "expected",
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "ProgressAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "answer"
+            },
+            "follow_up": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "follow_up"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "skip"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "repeat"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "incomplete"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ProgressCommand": {
+      "type": "object",
+      "properties": {
+        "interview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "lease_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "lease_generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempt_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "$ref": "#/$defs/ProgressAction"
+        }
+      },
+      "required": [
+        "interview_id",
+        "lease_id",
+        "lease_generation",
+        "attempt_id",
+        "event_id",
+        "expected_revision",
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "VoiceControlRequest": {
+      "type": "object",
+      "properties": {
+        "interview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lease_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "lease_generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "action": {
+          "enum": [
+            "resume",
+            "skip",
+            "repeat",
+            "stop",
+            "finish",
+            "discard"
+          ]
+        },
+        "expected_progress_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "interview_id",
+        "request_id",
+        "expected_revision",
+        "lease_id",
+        "lease_generation",
+        "action",
+        "expected_progress_revision"
+      ],
+      "additionalProperties": false
+    },
+    "SourceLocator": {
+      "type": "object",
+      "properties": {
+        "interview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "attempt_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "interview_id",
+        "attempt_id",
+        "source_id",
+        "evidence_revision"
+      ],
+      "additionalProperties": false
+    },
+    "RetryRequest": {
+      "type": "object",
+      "properties": {
+        "interview_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "expected": {
+          "$ref": "#/$defs/Revisions"
+        },
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "required": [
+        "interview_id",
+        "request_id",
+        "expected",
+        "job_id"
+      ],
+      "additionalProperties": false
+    },
+    "SupportJob": {
+      "type": "object",
+      "properties": {
+        "content_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "content_revision",
+        "evidence_revision",
+        "content_hash"
+      ],
+      "additionalProperties": false
+    },
+    "SupportResult": {
+      "type": "object",
+      "properties": {
+        "content_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "supported",
+            "unsupported",
+            "ambiguous",
+            "failed"
+          ]
+        },
+        "all_substantive_claims_checked": {
+          "type": "boolean"
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt_version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "content_revision",
+        "evidence_revision",
+        "status",
+        "all_substantive_claims_checked",
+        "source_ids",
+        "model",
+        "prompt_version"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$ref": "#/$defs/WorkflowCommand"
+}

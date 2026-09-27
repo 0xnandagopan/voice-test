@@ -2366,6 +2366,7 @@ dependencies = [
  "url",
  "uuid",
  "v0-domain",
+ "v0-evidence",
  "v0-voice",
 ]
 
@@ -2405,6 +2406,7 @@ name = "v0-voice"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "reqwest",

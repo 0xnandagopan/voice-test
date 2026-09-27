@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+pub mod workflow;
 
 pub const CONSENT_POLICY_VERSION: &str = "recording-v1";
 pub const INTERVIEW_BUDGET_SECONDS: i32 = 360;

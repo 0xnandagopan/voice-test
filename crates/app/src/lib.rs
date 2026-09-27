@@ -3,6 +3,9 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod leases;
+pub mod progress;
+pub mod voice_hook;
+pub mod workflow;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
@@ -82,7 +85,7 @@ async fn policy(
     Ok(response)
 }
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/health", get(handlers::health))
         .route("/api/ready", get(handlers::ready))
         .route("/api/operator/login", post(handlers::login))
@@ -119,7 +122,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), policy))
-        .with_state(state)
+        .with_state(state.clone());
+    // Machine-authenticated provider callback uses a scoped Bearer token, not
+    // browser cookies. Keep it outside the browser Origin policy.
+    api.merge(voice_hook::router(state))
 }
 pub fn with_static(app: Router, dir: &str) -> Router {
     app.fallback_service(

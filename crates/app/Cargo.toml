@@ -26,5 +26,6 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+v0-evidence = { path = "../evidence" }
 tower.workspace = true
 http-body-util.workspace = true

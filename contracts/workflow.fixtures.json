@@ -1,0 +1,105 @@
+{
+  "workflow": [
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "save",
+        "content": {
+          "text": "It helped, but setup was hard.",
+          "attribution": "Synthetic participant",
+          "clips": []
+        }
+      }
+    },
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "correct_transcript",
+        "source_id": "attempt/turn/customer",
+        "text": "It helped a little."
+      }
+    },
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "approve"
+      }
+    },
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "decline"
+      }
+    },
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "publish",
+        "approval_id": "00000000-0000-4000-8000-000000000001"
+      }
+    },
+    {
+      "interview_id": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "expected": {
+        "workflow": 0,
+        "content": 0,
+        "evidence": 0
+      },
+      "action": {
+        "type": "unpublish"
+      }
+    }
+  ],
+  "progress": {
+    "interview_id": "00000000-0000-4000-8000-000000000001",
+    "lease_id": "00000000-0000-4000-8000-000000000001",
+    "lease_generation": 1,
+    "attempt_id": "00000000-0000-4000-8000-000000000001",
+    "event_id": "final-user-item",
+    "expected_revision": 0,
+    "action": {
+      "type": "answer",
+      "follow_up": true
+    }
+  },
+  "voice": {
+    "interview_id": "00000000-0000-4000-8000-000000000001",
+    "request_id": "00000000-0000-4000-8000-000000000001",
+    "expected_revision": 0,
+    "lease_id": "00000000-0000-4000-8000-000000000001",
+    "lease_generation": 1,
+    "action": "resume",
+    "expected_progress_revision": 0
+  }
+}
