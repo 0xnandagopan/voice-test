@@ -41,6 +41,26 @@ async fn run() -> Result<serde_json::Value, String> {
     )
     .await?;
     let first_id = ready(&mut client).await?;
+    if env::var("VOICE_PROBE_MODE").as_deref() == Ok("stop") {
+        client
+            .send(&ClientEvent::End)
+            .await
+            .map_err(|e| e.to_string())?;
+        let observed = timeout(Duration::from_secs(5), async {
+            loop {
+                match client.receive().await {
+                    Ok(Some(ProviderEvent::Ended)) => return true,
+                    Ok(None) | Err(_) => return false,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        return Ok(
+            json!({"synthetic":true,"audio_uploaded":false,"session_ids":[first_id],"ready":true,"terminal_end_sent":true,"terminal_end_observed":observed}),
+        );
+    }
     // Drain greeting before injecting a synthetic text answer. No audio is uploaded.
     let greeting_deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -160,7 +180,7 @@ async fn run() -> Result<serde_json::Value, String> {
 async fn main() {
     // Dropping a socket after an outer timeout permits at most the provider's
     // documented 30s grace. Individual checks are budgeted under 90 seconds.
-    let result = timeout(Duration::from_secs(110), run()).await;
+    let result = timeout(Duration::from_secs(90), run()).await;
     let report = match result {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => json!({"error":error}),
