@@ -51,6 +51,10 @@ pub struct Segment {
 pub struct Manifest {
     pub schema_version: u32,
     pub provider_session_id: String,
+    #[serde(default)]
+    pub provider_close_reason: Option<String>,
+    #[serde(default)]
+    pub product_end_reason: Option<String>,
     pub artifact_identity: String,
     pub recording_sha256: String,
     pub timeline_sha256: String,
@@ -64,6 +68,8 @@ pub struct Manifest {
     pub incomplete_turn_ids: Vec<String>,
     pub recording_validation: String,
     pub approval_eligible: bool,
+    #[serde(default)]
+    pub media: Option<crate::media::MediaReport>,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -154,6 +160,8 @@ pub fn build(
     Ok(Manifest {
         schema_version: 1,
         provider_session_id: session.into(),
+        provider_close_reason: None,
+        product_end_reason: None,
         artifact_identity: format!("{session}:{}", meta.file),
         recording_sha256: digest(audio),
         timeline_sha256: digest(timeline_bytes),
@@ -168,5 +176,6 @@ pub fn build(
         // Header + metadata validation is deliberately not decoded-media validation.
         recording_validation: "header_and_metadata_only".into(),
         approval_eligible: false,
+        media: None,
     })
 }

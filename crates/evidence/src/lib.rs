@@ -1,7 +1,9 @@
 //! Private recording recovery. Imported does not mean aligned or approval eligible.
 pub mod jobs;
 pub mod manifest;
+pub mod media;
 pub mod provider;
+pub mod recovery;
 pub mod storage;
 
 #[derive(Debug, thiserror::Error)]

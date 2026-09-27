@@ -22,13 +22,14 @@ async fn inspect_real_history_without_logging_customer_content() {
         .fetch(&session)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    let manifest = manifest::build(
+    let mut manifest = manifest::build(
         &session,
         &artifacts.audio,
         &artifacts.timeline,
         &artifacts.metadata,
     )
     .unwrap();
+    manifest.provider_close_reason = artifacts.close_reason.clone();
     println!(
         "recording_bytes={} duration_ms={} customer_segments={} missing_alignment={} incomplete_turns={} approval_eligible={}",
         artifacts.audio.len(),
@@ -46,6 +47,30 @@ async fn inspect_real_history_without_logging_customer_content() {
         manifest.incomplete_turn_ids.len(),
         manifest.approval_eligible
     );
+    if let (Ok(ffmpeg), Ok(ffprobe)) = (std::env::var("FFMPEG_PATH"), std::env::var("FFPROBE_PATH"))
+    {
+        let validator = v0_evidence::media::FfmpegValidator::new(
+            ffmpeg,
+            ffprobe,
+            std::env::temp_dir().join("v0-live-media-checks"),
+        );
+        let report = validator
+            .validate(&artifacts.audio, &manifest)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "decoded_duration_ms={} metadata_delta_ms={} available_ranges={} audible_ranges={} alignment_proven={}",
+            report.decoded_duration_ms,
+            report.metadata_duration_delta_ms,
+            report.ranges.iter().filter(|r| r.within_recording).count(),
+            report
+                .ranges
+                .iter()
+                .filter(|r| r.audible_samples > 0)
+                .count(),
+            report.alignment_proven
+        );
+    }
     assert!(
         !manifest.approval_eligible,
         "this foundation must not claim validated alignment"

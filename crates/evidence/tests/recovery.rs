@@ -12,6 +12,7 @@ use v0_evidence::{
 
 fn artifacts() -> Artifacts {
     Artifacts {
+        close_reason: Some("client_end".into()),
         audio: b"OggSsynthetic-header-not-real-audio".to_vec(),
         timeline: serde_json::to_vec(&json!({"session_id":"sess_test","started_at_unix_ms":0,"turns":[{"turn_id":"turn1","item_id":"item1","status":"completed","user_transcript":"It helped, but setup was hard.","agent_text":"What was hard?","agent_reply_started_at_ms":5000,"agent_reply_ended_at_ms":6000},{"turn_id":"turn2","status":"interrupted","user_transcript":"I started to"}]})).unwrap(),
         metadata: serde_json::to_vec(&json!({"session_id":"sess_test","started_at":"1970-01-01T00:00:00Z","ended_at":"1970-01-01T00:00:10Z","format":"ogg/opus","channels":2,"channel_layout":"stereo (left=user, right=agent)","sample_rate":24000,"file":"sess_test/recording/audio.ogg"})).unwrap(),
@@ -136,6 +137,11 @@ async fn database() -> (PgPool, String, String) {
     pool.execute(include_str!("../../../migrations/0001_foundation.sql"))
         .await
         .unwrap();
+    pool.execute(include_str!(
+        "../../../migrations/0002_workflow_authority.sql"
+    ))
+    .await
+    .unwrap();
     (pool, schema, url)
 }
 async fn seed(pool: &PgPool) -> (Uuid, Uuid) {
@@ -551,4 +557,129 @@ fn provider_range_keeps_distinct_recording_origin_and_remains_unverified() {
     assert_eq!(m.segments[0].alignment, "provider_range_unverified");
     assert_eq!(m.dropped_chunks, Some(1));
     assert!(!m.approval_eligible);
+}
+
+struct PendingArtifacts;
+#[async_trait]
+impl HistoryProvider for PendingArtifacts {
+    async fn fetch(&self, _: &str) -> Result<Artifacts> {
+        Err(Error::NotReady)
+    }
+}
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_delayed_artifacts_survive_worker_restart_and_preserve_reconstruction_progress() {
+    let (pool, schema, url) = database().await;
+    let (i, a) = seed(&pool).await;
+    sqlx::query("UPDATE interviews SET topic_index=1,time_consumed_seconds=73,followup_counts='[1,0,0]' WHERE id=$1").bind(i).execute(&pool).await.unwrap();
+    let id = jobs::enqueue_import(&pool, i, a).await.unwrap();
+    let first = jobs::claim(&pool).await.unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("v0-restart-test-{}", Uuid::new_v4()));
+    let storage = LocalPrivateStorage::new(&dir).await.unwrap();
+    assert!(matches!(
+        jobs::dispatch(&pool, &first, &PendingArtifacts, &storage).await,
+        Err(Error::NotReady)
+    ));
+    jobs::fail(&pool, &first, "artifacts_not_ready")
+        .await
+        .unwrap();
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+    let restarted = PgPool::connect_with(options).await.unwrap();
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&restarted)
+        .await
+        .unwrap();
+    let next = jobs::claim(&restarted).await.unwrap().unwrap();
+    assert_ne!(first.token, next.token);
+    jobs::dispatch(&restarted, &next, &Fixture, &storage)
+        .await
+        .unwrap();
+    let restored = v0_evidence::recovery::recover_interview(&restarted, i)
+        .await
+        .unwrap();
+    assert_eq!(restored.topic_index, 1);
+    assert_eq!(restored.time_consumed_seconds, 73);
+    assert_eq!(restored.followup_counts, json!([1, 0, 0]));
+    assert!(restored.requires_customer_confirmation);
+    assert!(!restored.may_advance_progress);
+    assert_eq!(restored.unresolved_answers.len(), 2);
+    assert!(restored.recorded_utterances.is_empty());
+    assert_eq!(
+        restored.unresolved_answers[0].source_id,
+        "sess_test/turn/turn1/customer"
+    );
+    assert_eq!(restored.attempts[0].incomplete_turn_ids, vec!["turn2"]);
+    sqlx::query("UPDATE interviews SET state='revoked' WHERE id=$1")
+        .bind(i)
+        .execute(&restarted)
+        .await
+        .unwrap();
+    assert!(matches!(
+        v0_evidence::recovery::recover_interview(&restarted, i).await,
+        Err(Error::Stale)
+    ));
+    tokio::fs::remove_dir_all(dir).await.unwrap();
+    drop_database(restarted, schema, url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_failure_releases_job_before_waiting_for_interview_lock() {
+    let (pool, schema, url) = database().await;
+    let (i, a) = seed(&pool).await;
+    let id = jobs::enqueue_import(&pool, i, a).await.unwrap();
+    sqlx::query("UPDATE jobs SET max_attempts=1 WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = jobs::claim(&pool).await.unwrap().unwrap();
+    let mut authority = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(i)
+        .fetch_one(&mut *authority)
+        .await
+        .unwrap();
+    let cloned = pool.clone();
+    let fail = tokio::spawn(async move { jobs::fail(&cloned, &job, "provider_unavailable").await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let state: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if state == "failed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("job failure must commit before waiting on authority");
+    sqlx::query("SET LOCAL lock_timeout='500ms'")
+        .execute(&mut *authority)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM jobs WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *authority)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE interviews SET state='revoked' WHERE id=$1")
+        .bind(i)
+        .execute(&mut *authority)
+        .await
+        .unwrap();
+    authority.commit().await.unwrap();
+    fail.await.unwrap().unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM interviews WHERE id=$1")
+        .bind(i)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "revoked");
+    drop_database(pool, schema, url).await;
 }

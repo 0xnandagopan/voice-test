@@ -6,6 +6,7 @@ use std::time::Duration;
 use url::Url;
 
 pub struct Artifacts {
+    pub close_reason: Option<String>,
     pub audio: Vec<u8>,
     pub timeline: Vec<u8>,
     pub metadata: Vec<u8>,
@@ -26,6 +27,7 @@ pub struct AssemblyHistory {
 struct Session {
     id: String,
     status: String,
+    public_close_reason: Option<String>,
     #[serde(default)]
     artifacts: Vec<Artifact>,
 }
@@ -152,6 +154,7 @@ impl HistoryProvider for AssemblyHistory {
             }
         };
         Ok(Artifacts {
+            close_reason: session.public_close_reason.clone(),
             audio: self
                 .download(get("audio")?, 32 * 1024 * 1024, false)
                 .await?,

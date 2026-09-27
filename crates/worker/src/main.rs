@@ -26,11 +26,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("EVIDENCE_STORAGE_DIR").unwrap_or_else(|_| ".local/private-evidence".into()),
     )
     .await?;
+    let validator = v0_evidence::media::FfmpegValidator::new(
+        env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),
+        env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into()),
+        env::var("EVIDENCE_WORK_DIR").unwrap_or_else(|_| ".local/evidence-jobs".into()),
+    );
     loop {
         if let Some(job) = jobs::claim(&pool).await? {
             let outcome = tokio::time::timeout(
                 Duration::from_secs(100),
-                jobs::dispatch(&pool, &job, &provider, &storage),
+                jobs::dispatch_with_media(&pool, &job, &provider, &storage, Some(&validator)),
             )
             .await;
             let code = match outcome {

@@ -20,8 +20,15 @@ pub async fn enqueue_import(pool: &PgPool, interview: Uuid, attempt: Uuid) -> Re
 
 pub async fn claim(pool: &PgPool) -> Result<Option<Job>> {
     // A worker dying on its final attempt must become visibly failed, never stick running.
-    sqlx::query("WITH exhausted AS (UPDATE jobs SET status='failed',last_error='lease_expired',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now() AND attempts>=max_attempts RETURNING interview_id,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN (SELECT interview_id FROM exhausted WHERE kind='import_evidence') AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now()")
-        .execute(pool).await?;
+    let exhausted = sqlx::query("UPDATE jobs SET status='failed',last_error='lease_expired',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now() AND attempts>=max_attempts RETURNING id,interview_id,kind")
+        .fetch_all(pool).await?;
+    // Autocommit releases job locks before acquiring interview locks. Failure
+    // propagation is fenced by the still-failed job and current workflow state.
+    for row in exhausted {
+        if row.get::<String, _>("kind") == "import_evidence" {
+            propagate_failure(pool, row.get("id"), row.get("interview_id")).await?;
+        }
+    }
     let token = Uuid::new_v4();
     let row = sqlx::query("WITH candidate AS (SELECT id FROM jobs WHERE ((status='queued' AND available_at<=now()) OR (status='running' AND lease_until<=now())) AND attempts<max_attempts ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET status='running',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=(SELECT id FROM candidate) RETURNING id,interview_id,kind,payload")
         .bind(token).fetch_optional(pool).await?;
@@ -45,8 +52,20 @@ pub async fn fail(pool: &PgPool, job: &Job, error_code: &str) -> Result<()> {
         | "unsupported_job" => error_code,
         _ => "import_failed",
     };
-    sqlx::query("WITH changed AS (UPDATE jobs SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'queued' END,available_at=now()+make_interval(secs=>LEAST(300,attempts*15)),last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() RETURNING interview_id,status,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN(SELECT interview_id FROM changed WHERE status='failed' AND kind='import_evidence') AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now()")
-        .bind(job.id).bind(job.token).bind(code).execute(pool).await?;
+    let changed=sqlx::query("UPDATE jobs SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'queued' END,available_at=now()+make_interval(secs=>LEAST(300,attempts*15)),last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() RETURNING status,kind")
+        .bind(job.id).bind(job.token).bind(code).fetch_optional(pool).await?;
+    if changed.is_some_and(|row| {
+        row.get::<String, _>("status") == "failed"
+            && row.get::<String, _>("kind") == "import_evidence"
+    }) {
+        propagate_failure(pool, job.id, job.interview_id).await?;
+    }
+    Ok(())
+}
+
+async fn propagate_failure(pool: &PgPool, job: Uuid, interview: Uuid) -> Result<()> {
+    sqlx::query("UPDATE interviews SET state='recovering',updated_at=now() WHERE id=$1 AND deleted_at IS NULL AND expires_at>now() AND active_since IS NULL AND state IN ('invited','consented','recovering') AND EXISTS(SELECT 1 FROM jobs WHERE id=$2 AND interview_id=$1 AND status='failed')")
+        .bind(interview).bind(job).execute(pool).await?;
     Ok(())
 }
 
@@ -56,8 +75,18 @@ pub async fn dispatch(
     provider: &dyn HistoryProvider,
     storage: &dyn PrivateStorage,
 ) -> Result<()> {
+    dispatch_with_media(pool, job, provider, storage, None).await
+}
+
+pub async fn dispatch_with_media(
+    pool: &PgPool,
+    job: &Job,
+    provider: &dyn HistoryProvider,
+    storage: &dyn PrivateStorage,
+    validator: Option<&crate::media::FfmpegValidator>,
+) -> Result<()> {
     match job.kind.as_str() {
-        "import_evidence" => import(pool, job, provider, storage).await,
+        "import_evidence" => import(pool, job, provider, storage, validator).await,
         "cleanup_objects" => cleanup(pool, job, storage).await,
         _ => Err(Error::Invalid("unsupported job")),
     }
@@ -68,6 +97,7 @@ async fn import(
     job: &Job,
     provider: &dyn HistoryProvider,
     storage: &dyn PrivateStorage,
+    validator: Option<&crate::media::FfmpegValidator>,
 ) -> Result<()> {
     let attempt: Uuid = serde_json::from_value(
         job.payload
@@ -75,7 +105,7 @@ async fn import(
             .cloned()
             .ok_or(Error::Invalid("attempt payload"))?,
     )?;
-    let mapping = sqlx::query("SELECT p.provider_session_id,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now()")
+    let mapping = sqlx::query("SELECT p.provider_session_id,p.product_end_reason,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now()")
         .bind(attempt).bind(job.interview_id).fetch_optional(pool).await?.ok_or(Error::Stale)?;
     let session: Option<String> = mapping.get("provider_session_id");
     let session = session.ok_or(Error::NotReady)?;
@@ -87,12 +117,20 @@ async fn import(
     sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,available_at) VALUES($1,$2,'cleanup_objects',$3,$4,now()+interval '10 minutes') ON CONFLICT(dedupe_key) DO NOTHING")
         .bind(Uuid::new_v4()).bind(job.interview_id).bind(json!({"keys":[audio_key,timeline_key,metadata_key]})).bind(format!("cleanup:{}", job.token)).execute(pool).await?;
     let artifacts = provider.fetch(&session).await?;
-    let manifest = manifest::build(
+    let mut manifest = manifest::build(
         &session,
         &artifacts.audio,
         &artifacts.timeline,
         &artifacts.metadata,
     )?;
+    manifest.provider_close_reason = artifacts.close_reason.clone();
+    manifest.product_end_reason = mapping.get("product_end_reason");
+    if let Some(validator) = validator {
+        manifest.media = Some(validator.validate(&artifacts.audio, &manifest).await?);
+        manifest.recording_validation = "decoded_bounded_alignment_unverified".into();
+        // Successful decoding proves availability, never transcript alignment or meaning.
+        manifest.approval_eligible = false;
+    }
     let mut value = serde_json::to_value(&manifest)?;
     value["timeline_key"] = json!(timeline_key);
     value["metadata_key"] = json!(metadata_key);
