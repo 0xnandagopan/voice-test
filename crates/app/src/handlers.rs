@@ -264,7 +264,14 @@ pub async fn exchange(
             .execute(&mut *tx)
             .await?;
     }
-    let expiry: DateTime<Utc> = row.get("expires_at");
+    let expiry: DateTime<Utc> = if row
+        .get::<Option<DateTime<Utc>>, _>("completed_at")
+        .is_none()
+    {
+        sqlx::query_scalar("UPDATE interviews SET expires_at=clock_timestamp()+interval '14 days',updated_at=clock_timestamp() WHERE id=$1 RETURNING expires_at").bind(input.invitation_id).fetch_one(&mut *tx).await?
+    } else {
+        row.get("expires_at")
+    };
     let seconds = (expiry - Utc::now()).num_seconds().max(0);
     sqlx::query(
         "INSERT INTO sessions(token_hash,role,interview_id,expires_at) VALUES($1,'customer',$2,$3)",
@@ -304,14 +311,22 @@ pub async fn session(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Consent {
+    interview_id: Uuid,
     policy_version: String,
 }
 pub async fn consent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<Consent>,
-) -> Result<Json<SessionView>, ApiError> {
+) -> Result<Response, ApiError> {
     let id = auth::customer(&state, &headers).await?;
+    if id != input.interview_id {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "scope_changed",
+            "This tab belongs to a different invitation. Reopen its private link.",
+        ));
+    }
     if input.policy_version != CONSENT_POLICY_VERSION {
         return Err(ApiError::invalid(
             "Review the current recording policy before consenting.",
@@ -345,14 +360,41 @@ pub async fn consent(
         .await?;
     let result = view(&state, &row);
     tx.commit().await?;
-    Ok(Json(result))
+    let token = auth::cookie(&headers, "customer_session").ok_or_else(ApiError::unauthorized)?;
+    let seconds = (result.expires_at - Utc::now()).num_seconds().max(0);
+    Ok((
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie(
+                "customer_session",
+                &token,
+                state.config.secure_cookie,
+                seconds,
+            ),
+        )],
+        Json(result),
+    )
+        .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Start {
+    interview_id: Uuid,
+    expected_revision: i64,
 }
 pub async fn start(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(input): Json<Revision>,
+    Json(input): Json<Start>,
 ) -> Result<Json<Value>, ApiError> {
     let id = auth::customer(&state, &headers).await?;
+    if id != input.interview_id {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "scope_changed",
+            "This tab belongs to a different invitation. Reopen its private link.",
+        ));
+    }
     let row = sqlx::query("SELECT * FROM interviews WHERE id=$1")
         .bind(id)
         .fetch_one(&state.pool)

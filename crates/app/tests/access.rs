@@ -13,6 +13,115 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower::ServiceExt;
 use uuid::Uuid;
 use v0_app::{AppState, config::Config, leases, router};
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn consent_binds_the_visible_interview_and_refreshes_cookie_expiry() {
+    let t = TestApp::new().await;
+    let op = t.login().await;
+    let invite = t.invite(&op).await;
+    let other = t.invite(&op).await;
+    let customer = t.exchange(&other).await;
+    let (status, _, _) = t
+        .request(
+            "POST",
+            "/api/customer/consent",
+            Some(&customer),
+            json!({"interview_id":invite["invitation"]["id"],"policy_version":"recording-v1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, view, _) = t
+        .request("GET", "/api/customer/session", Some(&customer), json!({}))
+        .await;
+    assert!(view["consented_at"].is_null());
+    let id = Uuid::parse_str(other["invitation"]["id"].as_str().unwrap()).unwrap();
+    sqlx::query("UPDATE interviews SET expires_at=now()+interval '60 seconds' WHERE id=$1")
+        .bind(id)
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    let response = t
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/customer/consent")
+                .header("Origin", "http://localhost:3000")
+                .header("Content-Type", "application/json")
+                .header("Cookie", &customer)
+                .body(Body::from(
+                    json!({"interview_id":id,"policy_version":"recording-v1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()["set-cookie"].to_str().unwrap();
+    let max_age: i64 = cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("Max-Age="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(max_age > 13 * 86400);
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Strict"));
+    t.close().await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn stale_heartbeat_and_expired_lock_wait_cannot_renew_lease() {
+    let t = TestApp::new().await;
+    let op = t.login().await;
+    let invite = t.invite(&op).await;
+    let customer = t.exchange(&invite).await;
+    let id = Uuid::parse_str(invite["invitation"]["id"].as_str().unwrap()).unwrap();
+    t.request(
+        "POST",
+        "/api/customer/consent",
+        Some(&customer),
+        json!({"interview_id":id,"policy_version":"recording-v1"}),
+    )
+    .await;
+    let lease = leases::acquire(&t.pool, id, 2).await.unwrap();
+    assert!(
+        leases::heartbeat(&t.pool, id, Uuid::new_v4(), lease.generation)
+            .await
+            .is_err()
+    );
+    assert!(
+        leases::heartbeat(&t.pool, id, lease.lease_id, lease.generation)
+            .await
+            .unwrap()
+            <= 360
+    );
+    sqlx::query("UPDATE interviews SET lease_expires_at=clock_timestamp()+interval '200 milliseconds' WHERE id=$1").bind(id).execute(&t.pool).await.unwrap();
+    let mut holder = t.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = t.pool.clone();
+    let task = tokio::spawn(async move {
+        leases::heartbeat(&pool, id, lease.lease_id, lease.generation).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    holder.commit().await.unwrap();
+    assert!(task.await.unwrap().is_err());
+    leases::release(&t.pool, id, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    assert!(
+        leases::release(&t.pool, id, lease.lease_id, lease.generation)
+            .await
+            .is_err()
+    );
+    t.close().await;
+}
 const PASSWORD: &str = "synthetic-test-password";
 struct TestApp {
     app: Router,
@@ -175,7 +284,7 @@ async fn invitation_consent_survive_reload_and_never_fake_live_success() {
             "POST",
             "/api/customer/start",
             Some(&customer),
-            json!({"expected_revision":1}),
+            json!({"interview_id":invite["invitation"]["id"],"expected_revision":1}),
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -184,7 +293,7 @@ async fn invitation_consent_survive_reload_and_never_fake_live_success() {
             "POST",
             "/api/customer/consent",
             Some(&customer),
-            json!({"policy_version":"old-policy"}),
+            json!({"interview_id":invite["invitation"]["id"],"policy_version":"old-policy"}),
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -194,7 +303,7 @@ async fn invitation_consent_survive_reload_and_never_fake_live_success() {
             "POST",
             "/api/customer/consent",
             Some(&customer),
-            json!({"policy_version":"recording-v1"}),
+            json!({"interview_id":invite["invitation"]["id"],"policy_version":"recording-v1"}),
         )
         .await;
     assert_eq!(s, StatusCode::OK);
@@ -205,7 +314,7 @@ async fn invitation_consent_survive_reload_and_never_fake_live_success() {
             "POST",
             "/api/customer/consent",
             Some(&customer),
-            json!({"policy_version":"recording-v1"}),
+            json!({"interview_id":invite["invitation"]["id"],"policy_version":"recording-v1"}),
         )
         .await;
     assert_eq!(again["revision"], 2);
@@ -218,7 +327,7 @@ async fn invitation_consent_survive_reload_and_never_fake_live_success() {
             "POST",
             "/api/customer/start",
             Some(&customer),
-            json!({"expected_revision":2}),
+            json!({"interview_id":invite["invitation"]["id"],"expected_revision":2}),
         )
         .await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
@@ -421,7 +530,7 @@ async fn interview_lease_fences_tabs_and_preserves_reconnect_allowance() {
         "POST",
         "/api/customer/consent",
         Some(&customer),
-        json!({"policy_version":"recording-v1"}),
+        json!({"interview_id":invite["invitation"]["id"],"policy_version":"recording-v1"}),
     )
     .await;
     let (a, b) = tokio::join!(

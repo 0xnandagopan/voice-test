@@ -1,5 +1,5 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "errors": {
     "shape": {
       "error": {
@@ -13,7 +13,8 @@
       "conflict",
       "expired",
       "provider_unavailable",
-      "not_ready"
+      "not_ready",
+      "scope_changed"
     ]
   },
   "cookie_policy": "HttpOnly SameSite=Strict; Secure except explicit loopback development. Origin required on mutating API requests.",
@@ -94,7 +95,8 @@
       "method": "POST",
       "path": "/api/customer/consent",
       "body": {
-        "policy_version": "recording-v1"
+        "policy_version": "recording-v1",
+        "interview_id": "UUID"
       },
       "response": "SessionView"
     },
@@ -102,7 +104,8 @@
       "method": "POST",
       "path": "/api/customer/start",
       "body": {
-        "expected_revision": 1
+        "expected_revision": 1,
+        "interview_id": "UUID"
       },
       "response": "503 provider_unavailable/not_ready until live gates implemented; never a simulated successful recording"
     }
