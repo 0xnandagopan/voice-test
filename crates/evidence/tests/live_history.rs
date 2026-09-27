@@ -18,7 +18,10 @@ async fn inspect_real_history_without_logging_customer_content() {
         .map(String::from)
         .collect();
     let provider = AssemblyHistory::new(key, hosts).unwrap();
-    let artifacts = provider.fetch(&session).await.unwrap();
+    let artifacts = provider
+        .fetch(&session)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let manifest = manifest::build(
         &session,
         &artifacts.audio,

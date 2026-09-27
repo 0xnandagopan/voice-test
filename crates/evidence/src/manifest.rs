@@ -16,6 +16,8 @@ pub struct Turn {
     pub item_id: Option<String>,
     pub status: String,
     pub user_transcript: Option<String>,
+    pub user_speech_started_at_ms: Option<i64>,
+    pub user_speech_ended_at_ms: Option<i64>,
     pub agent_text: Option<String>,
     pub agent_reply_started_at_ms: Option<i64>,
     pub agent_reply_ended_at_ms: Option<i64>,
@@ -30,6 +32,8 @@ pub struct Metadata {
     pub channel_layout: String,
     pub sample_rate: u32,
     pub file: String,
+    pub dropped_chunks: Option<u64>,
+    pub uploaded_chunks: Option<u64>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Segment {
@@ -52,6 +56,10 @@ pub struct Manifest {
     pub timeline_sha256: String,
     pub metadata_sha256: String,
     pub duration_ms: u64,
+    pub recording_started_at_unix_ms: i64,
+    pub timeline_started_at_unix_ms: i64,
+    pub dropped_chunks: Option<u64>,
+    pub uploaded_chunks: Option<u64>,
     pub segments: Vec<Segment>,
     pub incomplete_turn_ids: Vec<String>,
     pub recording_validation: String,
@@ -82,10 +90,7 @@ pub fn build(
         return Err(Error::Invalid("unsupported recording format"));
     }
     let duration = (meta.ended_at - meta.started_at).num_milliseconds();
-    if !(1..=390_000).contains(&duration)
-        || meta.started_at.timestamp_millis() != timeline.started_at_unix_ms
-        || meta.file.is_empty()
-    {
+    if !(1..=390_000).contains(&duration) || meta.file.is_empty() {
         return Err(Error::Invalid("recording clock or duration"));
     }
     let mut seen = HashSet::new();
@@ -101,23 +106,29 @@ pub fn build(
         if turn.status != "completed" {
             incomplete.push(turn.turn_id.clone());
         }
-        let agent_range = match (turn.agent_reply_started_at_ms, turn.agent_reply_ended_at_ms) {
-            (Some(start), Some(end)) => {
-                let start = start
-                    .checked_sub(timeline.started_at_unix_ms)
-                    .ok_or(Error::Invalid("range overflow"))?;
-                let end = end
-                    .checked_sub(timeline.started_at_unix_ms)
-                    .ok_or(Error::Invalid("range overflow"))?;
-                if start < 0 || start >= end || end > duration {
-                    return Err(Error::Invalid("source range outside recording"));
+        // Provider times are Unix milliseconds. Recording and timeline clocks have
+        // distinct starts in live artifacts; preserve both, never silently equate them.
+        let range = |start: Option<i64>, end: Option<i64>| -> Result<Option<[u64; 2]>> {
+            match (start, end) {
+                (Some(start), Some(end)) => {
+                    let start = start
+                        .checked_sub(meta.started_at.timestamp_millis())
+                        .ok_or(Error::Invalid("range overflow"))?;
+                    let end = end
+                        .checked_sub(meta.started_at.timestamp_millis())
+                        .ok_or(Error::Invalid("range overflow"))?;
+                    if start < 0 || start >= end || end > duration {
+                        return Err(Error::Invalid("source range outside recording"));
+                    }
+                    Ok(Some([start as u64, end as u64]))
                 }
-                Some([start as u64, end as u64])
+                _ => Ok(None),
             }
-            _ => None,
         };
+        let agent_range = range(turn.agent_reply_started_at_ms, turn.agent_reply_ended_at_ms)?;
+        let customer_range = range(turn.user_speech_started_at_ms, turn.user_speech_ended_at_ms)?;
         for (speaker, channel, text, range) in [
-            ("customer", 0, turn.user_transcript, None),
+            ("customer", 0, turn.user_transcript, customer_range),
             ("agent", 1, turn.agent_text, agent_range),
         ] {
             if let Some(text) = text.filter(|s| !s.trim().is_empty()) {
@@ -148,6 +159,10 @@ pub fn build(
         timeline_sha256: digest(timeline_bytes),
         metadata_sha256: digest(metadata_bytes),
         duration_ms: duration as u64,
+        recording_started_at_unix_ms: meta.started_at.timestamp_millis(),
+        timeline_started_at_unix_ms: timeline.started_at_unix_ms,
+        dropped_chunks: meta.dropped_chunks,
+        uploaded_chunks: meta.uploaded_chunks,
         segments,
         incomplete_turn_ids: incomplete,
         // Header + metadata validation is deliberately not decoded-media validation.

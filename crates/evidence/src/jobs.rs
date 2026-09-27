@@ -13,14 +13,14 @@ pub struct Job {
 }
 
 pub async fn enqueue_import(pool: &PgPool, interview: Uuid, attempt: Uuid) -> Result<Uuid> {
-    let row = sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key) SELECT $1,$2,'import_evidence',$3,$4 FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$5 AND p.interview_id=$2 AND p.provider_session_id IS NOT NULL AND i.deleted_at IS NULL AND i.expires_at>now() ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key=EXCLUDED.dedupe_key RETURNING id")
+    let row = sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key) SELECT $1,$2,'import_evidence',$3,$4 FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$5 AND p.interview_id=$2 AND p.provider_session_id IS NOT NULL AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now() ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key=EXCLUDED.dedupe_key RETURNING id")
         .bind(Uuid::new_v4()).bind(interview).bind(json!({"provider_attempt_id": attempt})).bind(format!("import:{attempt}")).bind(attempt).fetch_optional(pool).await?.ok_or(Error::Stale)?;
     Ok(row.get("id"))
 }
 
 pub async fn claim(pool: &PgPool) -> Result<Option<Job>> {
     // A worker dying on its final attempt must become visibly failed, never stick running.
-    sqlx::query("WITH exhausted AS (UPDATE jobs SET status='failed',last_error='lease_expired',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now() AND attempts>=max_attempts RETURNING interview_id,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN (SELECT interview_id FROM exhausted WHERE kind='import_evidence') AND deleted_at IS NULL AND expires_at>now()")
+    sqlx::query("WITH exhausted AS (UPDATE jobs SET status='failed',last_error='lease_expired',lease_token=NULL,lease_until=NULL WHERE status='running' AND lease_until<=now() AND attempts>=max_attempts RETURNING interview_id,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN (SELECT interview_id FROM exhausted WHERE kind='import_evidence') AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now()")
         .execute(pool).await?;
     let token = Uuid::new_v4();
     let row = sqlx::query("WITH candidate AS (SELECT id FROM jobs WHERE ((status='queued' AND available_at<=now()) OR (status='running' AND lease_until<=now())) AND attempts<max_attempts ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE jobs SET status='running',attempts=attempts+1,lease_token=$1,lease_until=now()+interval '120 seconds' WHERE id=(SELECT id FROM candidate) RETURNING id,interview_id,kind,payload")
@@ -45,7 +45,7 @@ pub async fn fail(pool: &PgPool, job: &Job, error_code: &str) -> Result<()> {
         | "unsupported_job" => error_code,
         _ => "import_failed",
     };
-    sqlx::query("WITH changed AS (UPDATE jobs SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'queued' END,available_at=now()+make_interval(secs=>LEAST(300,attempts*15)),last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() RETURNING interview_id,status,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN(SELECT interview_id FROM changed WHERE status='failed' AND kind='import_evidence') AND deleted_at IS NULL AND expires_at>now()")
+    sqlx::query("WITH changed AS (UPDATE jobs SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'queued' END,available_at=now()+make_interval(secs=>LEAST(300,attempts*15)),last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now() RETURNING interview_id,status,kind) UPDATE interviews SET state='recovering',updated_at=now() WHERE id IN(SELECT interview_id FROM changed WHERE status='failed' AND kind='import_evidence') AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now()")
         .bind(job.id).bind(job.token).bind(code).execute(pool).await?;
     Ok(())
 }
@@ -75,7 +75,7 @@ async fn import(
             .cloned()
             .ok_or(Error::Invalid("attempt payload"))?,
     )?;
-    let mapping = sqlx::query("SELECT p.provider_session_id,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.expires_at>now()")
+    let mapping = sqlx::query("SELECT p.provider_session_id,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now()")
         .bind(attempt).bind(job.interview_id).fetch_optional(pool).await?.ok_or(Error::Stale)?;
     let session: Option<String> = mapping.get("provider_session_id");
     let session = session.ok_or(Error::NotReady)?;
@@ -100,7 +100,7 @@ async fn import(
     storage.put(&timeline_key, &artifacts.timeline).await?;
     storage.put(&metadata_key, &artifacts.metadata).await?;
     let mut tx = pool.begin().await?;
-    let eligible = sqlx::query("SELECT id FROM interviews WHERE id=$1 AND deleted_at IS NULL AND expires_at>now() AND revision=$2 FOR UPDATE")
+    let eligible = sqlx::query("SELECT id FROM interviews WHERE id=$1 AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now() AND revision=$2 FOR UPDATE")
         .bind(job.interview_id).bind(revision).fetch_optional(&mut *tx).await?;
     if eligible.is_none() {
         return Err(Error::Stale);
@@ -108,6 +108,11 @@ async fn import(
     let lease = sqlx::query("SELECT id FROM jobs WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_until>now() FOR UPDATE")
         .bind(job.id).bind(job.token).fetch_optional(&mut *tx).await?;
     if lease.is_none() {
+        return Err(Error::Stale);
+    }
+    let mapping_matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_attempts WHERE id=$1 AND interview_id=$2 AND provider_session_id=$3)")
+        .bind(attempt).bind(job.interview_id).bind(&session).fetch_one(&mut *tx).await?;
+    if !mapping_matches {
         return Err(Error::Stale);
     }
     // The attempt's immutable provider identity plus its unique import prevents duplicate answers.
@@ -152,6 +157,11 @@ async fn cleanup(pool: &PgPool, job: &Job, storage: &dyn PrivateStorage) -> Resu
         return Err(Error::Invalid("cleanup key bound"));
     }
     for key in keys {
+        let owns_lease: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=$1 AND lease_token=$2 AND status='running' AND lease_until>now())")
+            .bind(job.id).bind(job.token).fetch_one(pool).await?;
+        if !owns_lease {
+            return Err(Error::Stale);
+        }
         let referenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evidence_imports WHERE recording_key=$1 OR manifest->>'timeline_key'=$1 OR manifest->>'metadata_key'=$1)").bind(&key).fetch_one(pool).await?;
         if !referenced {
             storage.delete(&key).await?;

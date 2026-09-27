@@ -424,3 +424,131 @@ async fn postgres_expiry_and_revision_races_reject_artifacts() {
         drop_database(pool, schema, url).await;
     }
 }
+
+struct RevokeDuringFetch {
+    pool: PgPool,
+    interview: Uuid,
+}
+#[async_trait]
+impl HistoryProvider for RevokeDuringFetch {
+    async fn fetch(&self, _: &str) -> Result<Artifacts> {
+        sqlx::query("UPDATE interviews SET state='revoked' WHERE id=$1")
+            .bind(self.interview)
+            .execute(&self.pool)
+            .await?;
+        Ok(artifacts())
+    }
+}
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_revocation_is_never_resurrected_by_import_or_failure() {
+    let (pool, schema, url) = database().await;
+    let (i, a) = seed(&pool).await;
+    let id = jobs::enqueue_import(&pool, i, a).await.unwrap();
+    sqlx::query("UPDATE jobs SET max_attempts=1 WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = jobs::claim(&pool).await.unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("v0-evidence-{}", Uuid::new_v4()));
+    let store = LocalPrivateStorage::new(&dir).await.unwrap();
+    assert!(matches!(
+        jobs::dispatch(
+            &pool,
+            &job,
+            &RevokeDuringFetch {
+                pool: pool.clone(),
+                interview: i
+            },
+            &store
+        )
+        .await,
+        Err(Error::Stale)
+    ));
+    assert!(jobs::enqueue_import(&pool, i, a).await.is_err());
+    jobs::fail(&pool, &job, "invalid_artifacts").await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM interviews WHERE id=$1")
+        .bind(i)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "revoked");
+    sqlx::query(
+        "UPDATE jobs SET status='running',lease_until=now()-interval '1 second' WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    jobs::claim(&pool).await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM interviews WHERE id=$1")
+        .bind(i)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "revoked");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence_imports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='cleanup_objects'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cleanup = jobs::claim(&pool).await.unwrap().unwrap();
+    sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
+        .bind(cleanup.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        jobs::dispatch(&pool, &cleanup, &Fixture, &store).await,
+        Err(Error::Stale)
+    ));
+    assert!(
+        tokio::fs::read_dir(&dir)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let new_cleanup = jobs::claim(&pool).await.unwrap().unwrap();
+    jobs::dispatch(&pool, &new_cleanup, &Fixture, &store)
+        .await
+        .unwrap();
+    assert!(
+        tokio::fs::read_dir(&dir)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tokio::fs::remove_dir_all(dir).await.unwrap();
+    drop_database(pool, schema, url).await;
+}
+
+#[test]
+fn provider_range_keeps_distinct_recording_origin_and_remains_unverified() {
+    let mut a = artifacts();
+    let mut timeline: serde_json::Value = serde_json::from_slice(&a.timeline).unwrap();
+    timeline["turns"][0]["user_speech_started_at_ms"] = json!(1000);
+    timeline["turns"][0]["user_speech_ended_at_ms"] = json!(4000);
+    a.timeline = serde_json::to_vec(&timeline).unwrap();
+    let mut metadata: serde_json::Value = serde_json::from_slice(&a.metadata).unwrap();
+    metadata["started_at"] = json!("1970-01-01T00:00:00.023Z");
+    metadata["dropped_chunks"] = json!(1);
+    a.metadata = serde_json::to_vec(&metadata).unwrap();
+    let m = manifest::build("sess_test", &a.audio, &a.timeline, &a.metadata).unwrap();
+    assert_eq!(m.timeline_started_at_unix_ms, 0);
+    assert_eq!(m.recording_started_at_unix_ms, 23);
+    assert_eq!(m.segments[0].source_range_ms, Some([977, 3977]));
+    assert_eq!(m.segments[0].alignment, "provider_range_unverified");
+    assert_eq!(m.dropped_chunks, Some(1));
+    assert!(!m.approval_eligible);
+}
