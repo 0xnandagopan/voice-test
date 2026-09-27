@@ -3,4 +3,5 @@
 pub mod client;
 pub mod controller;
 pub mod next_step;
+pub mod pre_speech;
 pub mod protocol;

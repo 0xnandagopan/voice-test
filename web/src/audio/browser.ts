@@ -2,7 +2,7 @@ import type { AudioDependencies, AudioEngine } from './controller';
 
 export function browserAudioDependencies(): AudioDependencies {
   return {
-    getMicrophone: () => navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}, video: false}),
+    getMicrophone: () => navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: false}, video: false}),
     async createEngine(stream, onPcm): Promise<AudioEngine> {
       const context = new AudioContext();
       const sources = new Set<AudioBufferSourceNode>();

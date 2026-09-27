@@ -47,6 +47,53 @@ impl VoiceClient {
         .map_err(|_| ProviderFailure::Connection)?;
         Ok(Self { socket })
     }
+    /// Server-side short-lived token with a provider session cap. Tokens stay
+    /// internal to this adapter. The relay still enforces cumulative remaining
+    /// allowance; the provider token API has a minimum duration of 60 seconds.
+    pub async fn connect_bounded(
+        api_key: &str,
+        maximum_seconds: u32,
+    ) -> Result<Self, ProviderFailure> {
+        if api_key.trim().is_empty() || !(60..=360).contains(&maximum_seconds) {
+            return Err(ProviderFailure::Configuration);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| ProviderFailure::Configuration)?;
+        let response = client
+            .get("https://agents.assemblyai.com/v1/token")
+            .bearer_auth(api_key)
+            .query(&[
+                ("expires_in_seconds", 60),
+                ("max_session_duration_seconds", maximum_seconds),
+            ])
+            .send()
+            .await
+            .map_err(|_| ProviderFailure::Connection)?;
+        if !response.status().is_success() {
+            return Err(ProviderFailure::Configuration);
+        }
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| ProviderFailure::Protocol)?;
+        let token = body["token"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or(ProviderFailure::Protocol)?;
+        let mut url = url::Url::parse("wss://agents.assemblyai.com/v1/ws")
+            .map_err(|_| ProviderFailure::Configuration)?;
+        url.query_pairs_mut().append_pair("token", token);
+        let (socket, _) = timeout(
+            Duration::from_secs(15),
+            tokio_tungstenite::connect_async(url.as_str()),
+        )
+        .await
+        .map_err(|_| ProviderFailure::Timeout)?
+        .map_err(|_| ProviderFailure::Connection)?;
+        Ok(Self { socket })
+    }
     pub async fn send(&mut self, event: &ClientEvent) -> Result<(), ProviderFailure> {
         let payload = serde_json::to_string(event).map_err(|_| ProviderFailure::Protocol)?;
         timeout(
@@ -58,6 +105,15 @@ impl VoiceClient {
         .map_err(|_| ProviderFailure::Connection)
     }
     pub async fn receive(&mut self) -> Result<Option<ProviderEvent>, ProviderFailure> {
+        self.receive_raw()
+            .await?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| ProviderFailure::Protocol)
+    }
+    /// Server-only diagnostic surface. May contain transcript/configuration secrets;
+    /// callers must never forward or log the raw value.
+    pub async fn receive_raw(&mut self) -> Result<Option<serde_json::Value>, ProviderFailure> {
         loop {
             match timeout(Duration::from_secs(20), self.socket.next())
                 .await
@@ -78,6 +134,14 @@ impl VoiceClient {
                 Some(Err(_)) => return Err(ProviderFailure::Connection),
             }
         }
+    }
+    /// A WebSocket close without session.end requests native-resume grace.
+    /// TCP loss is represented by dropping this client instead.
+    pub async fn disconnect(mut self) -> Result<(), ProviderFailure> {
+        self.socket
+            .close(None)
+            .await
+            .map_err(|_| ProviderFailure::Connection)
     }
     /// Use only for explicit Stop/finish/discard. Accidental disconnect must not end.
     pub async fn end(mut self) -> Result<(), ProviderFailure> {

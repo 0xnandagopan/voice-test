@@ -3,6 +3,7 @@
 //! that stronger property. Drain ONLY in the matching reply.done handler.
 use crate::{
     controller::{Progress, Step},
+    pre_speech::{FollowupKind, QuestionPlan},
     protocol::ClientEvent,
 };
 use serde_json::json;
@@ -10,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct NextStepGate {
-    pending: HashMap<String, bool>,
+    pending: HashMap<String, (bool, FollowupKind)>,
     answered: HashSet<String>,
     latest_answer: Option<String>,
     completed: HashMap<String, ClientEvent>,
@@ -23,10 +24,16 @@ impl NextStepGate {
         }
     }
     pub fn queue(&mut self, call_id: &str, follow_up: bool) {
+        self.queue_classified(call_id, follow_up, FollowupKind::Detail);
+    }
+    pub fn queue_classified(&mut self, call_id: &str, follow_up: bool, kind: FollowupKind) {
         if !call_id.is_empty() && !self.completed.contains_key(call_id) {
-            self.pending.entry(call_id.into()).or_insert(follow_up);
+            self.pending
+                .entry(call_id.into())
+                .or_insert((follow_up, kind));
         }
     }
+    /// Persist the returned progress/question decision before sending this result.
     pub fn reply_done(
         &mut self,
         reply_id: &str,
@@ -41,17 +48,20 @@ impl NextStepGate {
         if let Some(result) = self.completed.get(call_id) {
             return Some(result.clone());
         }
-        let follow_up = self.pending.remove(call_id)?;
+        let (follow_up, kind) = self.pending.remove(call_id)?;
         let has_answer = self
             .latest_answer
             .take()
             .is_some_and(|id| self.answered.insert(id));
-        let step = if has_answer {
-            progress.after_answer(follow_up)
+        let question = if has_answer {
+            let plan = QuestionPlan::after_answer(progress.clone(), follow_up, kind).ok()?;
+            *progress = plan.progress;
+            Some(plan.code.text())
         } else {
-            progress.repeat()
+            None
         };
-        let event=ClientEvent::ToolResult {call_id:call_id.into(), result:json!({"step":step,"followups":progress.followups,"remaining_millis":360_000u64.saturating_sub(progress.consumed_millis),"may_ask":has_answer && step != Step::Complete,"reason":if has_answer {"bounded_next_step"} else {"no_new_complete_answer"}}).to_string(), is_error:!has_answer};
+        let step = progress.current();
+        let event=ClientEvent::ToolResult {call_id:call_id.into(), result:json!({"step":step,"question":question,"must_speak_exactly":true,"followups":progress.followups,"remaining_millis":360_000u64.saturating_sub(progress.consumed_millis),"may_ask":has_answer && step != Step::Complete,"reason":if has_answer {"bounded_next_step"} else {"no_new_complete_answer"}}).to_string(), is_error:!has_answer};
         self.completed.insert(call_id.into(), event.clone());
         Some(event)
     }
