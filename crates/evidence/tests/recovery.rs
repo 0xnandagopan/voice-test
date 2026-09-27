@@ -683,3 +683,76 @@ async fn postgres_failure_releases_job_before_waiting_for_interview_lock() {
     assert_eq!(state, "revoked");
     drop_database(pool, schema, url).await;
 }
+
+#[test]
+fn recovery_never_completes_interrupted_turns_even_with_explicit_finish() {
+    let a = artifacts();
+    let mut manifest = manifest::build("sess_test", &a.audio, &a.timeline, &a.metadata).unwrap();
+    manifest.product_end_reason = Some("explicit_finish".into());
+    manifest.dropped_chunks = Some(0);
+    for segment in manifest
+        .segments
+        .iter_mut()
+        .filter(|s| s.speaker == "customer")
+    {
+        segment.source_range_ms = Some([100, 500]);
+    }
+    let pcm = [1000i16.to_le_bytes(), 1000i16.to_le_bytes()]
+        .concat()
+        .repeat(24_000);
+    manifest.media = Some(v0_evidence::media::check_pcm(&pcm, &manifest));
+    // An earlier interrupted turn stays unresolved, independently of final finish intent.
+    manifest.segments[0].turn_status = "interrupted".into();
+    let (recorded, unresolved) = v0_evidence::recovery::reconstruct(Uuid::new_v4(), &manifest);
+    assert!(recorded.is_empty());
+    assert_eq!(unresolved.len(), 2);
+    assert!(
+        unresolved
+            .iter()
+            .all(|answer| answer.status == "interrupted_turn_requires_confirmation")
+    );
+    // A manifest's explicit incomplete identity also wins over a completed segment status.
+    manifest.segments[0].turn_status = "completed".into();
+    manifest.incomplete_turn_ids.push("turn1".into());
+    let (recorded, unresolved) = v0_evidence::recovery::reconstruct(Uuid::new_v4(), &manifest);
+    assert!(recorded.is_empty());
+    assert_eq!(unresolved.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_recovery_denies_expiry_crossed_while_waiting_for_row_lock() {
+    let (pool, schema, url) = database().await;
+    let (i, _) = seed(&pool).await;
+    sqlx::query("UPDATE interviews SET expires_at=clock_timestamp()+interval '500 milliseconds' WHERE id=$1").bind(i).execute(&pool).await.unwrap();
+    let mut authority = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(i)
+        .fetch_one(&mut *authority)
+        .await
+        .unwrap();
+    let app_name = format!("expiry_recovery_{}", Uuid::new_v4().simple());
+    let recovery_pool = PgPool::connect_with(
+        (*pool.connect_options())
+            .clone()
+            .application_name(&app_name),
+    )
+    .await
+    .unwrap();
+    let recovering = tokio::spawn(async move {
+        let result = v0_evidence::recovery::recover_interview(&recovery_pool, i).await;
+        recovery_pool.close().await;
+        result
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        loop {
+            let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock')").bind(&app_name).fetch_one(&pool).await.unwrap();
+            if waiting {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("recovery must reach the held row lock");
+    sqlx::query("SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM expires_at-clock_timestamp())::double precision)+0.01) FROM interviews WHERE id=$1").bind(i).execute(&mut *authority).await.unwrap();
+    authority.commit().await.unwrap();
+    assert!(matches!(recovering.await.unwrap(), Err(Error::Stale)));
+    drop_database(pool, schema, url).await;
+}

@@ -68,7 +68,12 @@ pub fn reconstruct(
         let bounded = segment.source_range_ms.is_some();
         let uncertain_tail = last_customer == Some(segment.source_id.as_str())
             && manifest.product_end_reason.as_deref() != Some("explicit_finish");
-        let complete = available && clean && bounded && !uncertain_tail;
+        let interrupted = segment.turn_status != "completed"
+            || manifest
+                .incomplete_turn_ids
+                .iter()
+                .any(|id| id == &segment.turn_id);
+        let complete = available && clean && bounded && !uncertain_tail && !interrupted;
         let item = RecoveredAnswer {
             source_id: segment.source_id.clone(),
             provider_attempt_id: attempt,
@@ -80,6 +85,8 @@ pub fn reconstruct(
             needs_alignment_review: true,
             status: if complete {
                 "recorded_utterance_alignment_pending"
+            } else if interrupted {
+                "interrupted_turn_requires_confirmation"
             } else if uncertain_tail {
                 "last_answer_completion_unconfirmed"
             } else if !bounded {
@@ -108,8 +115,25 @@ pub fn reconstruct(
 
 pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<RecoveryContext> {
     let mut tx = pool.begin().await?;
-    let state=sqlx::query("SELECT revision,topic_index,followup_counts,time_consumed_seconds FROM interviews WHERE id=$1 AND deleted_at IS NULL AND state NOT IN ('deleted','revoked') AND expires_at>now() FOR SHARE")
+    let state=sqlx::query("SELECT revision,topic_index,followup_counts,time_consumed_seconds,expires_at,deleted_at,state FROM interviews WHERE id=$1 FOR SHARE")
         .bind(interview).fetch_optional(&mut *tx).await?.ok_or(Error::Stale)?;
+    // now() freezes at transaction start, before a potential row-lock wait.
+    // Read the database wall clock only after acquiring the protected row.
+    let current: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx)
+        .await?;
+    let expires: chrono::DateTime<chrono::Utc> = state.get("expires_at");
+    if expires <= current
+        || state
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")
+            .is_some()
+        || matches!(
+            state.get::<String, _>("state").as_str(),
+            "deleted" | "revoked"
+        )
+    {
+        return Err(Error::Stale);
+    }
     let rows=sqlx::query("SELECT p.id,p.state,e.evidence_revision,e.manifest FROM provider_attempts p LEFT JOIN evidence_imports e ON e.provider_attempt_id=p.id AND e.interview_id=p.interview_id WHERE p.interview_id=$1 ORDER BY p.started_at,p.id")
         .bind(interview).fetch_all(&mut *tx).await?;
     let mut result = RecoveryContext {
@@ -200,6 +224,13 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
             .any(|a| a.recommended_action == "confirm_last_answer_or_repeat")
     {
         result.recommended_action = "confirm_recovered_answers_and_repeat_unresolved".into();
+    }
+    let still_current: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
+        .bind(expires)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !still_current {
+        return Err(Error::Stale);
     }
     tx.commit().await?;
     Ok(result)
