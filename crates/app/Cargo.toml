@@ -1,0 +1,29 @@
+[package]
+name = "v0-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+v0-domain = { path = "../domain" }
+v0-voice = { path = "../voice" }
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+rand.workspace = true
+argon2.workspace = true
+dotenvy.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true

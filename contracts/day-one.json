@@ -1,0 +1,131 @@
+{
+  "contract_version": 1,
+  "errors": {
+    "shape": {
+      "error": {
+        "code": "string",
+        "message": "string"
+      }
+    },
+    "codes": [
+      "unauthorized",
+      "invalid_request",
+      "conflict",
+      "expired",
+      "provider_unavailable",
+      "not_ready"
+    ]
+  },
+  "cookie_policy": "HttpOnly SameSite=Strict; Secure except explicit loopback development. Origin required on mutating API requests.",
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/api/operator/login",
+      "body": {
+        "username": "string",
+        "password": "string"
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/operator/logout",
+      "body": {},
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/operator/me",
+      "response": {
+        "username": "string"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/operator/invitations",
+      "response": {
+        "invitations": []
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/operator/invitations",
+      "body": {
+        "idempotency_key": "UUID",
+        "customer_label": "string",
+        "project_context": "string"
+      },
+      "response": {
+        "invitation": "SessionView",
+        "private_url": "string"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/operator/invitations/{id}/revoke",
+      "body": {
+        "expected_revision": 1
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/customer/exchange",
+      "body": {
+        "invitation_id": "UUID",
+        "token": "string"
+      },
+      "response": {
+        "ok": true
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/customer/session",
+      "response": "SessionView"
+    },
+    {
+      "method": "POST",
+      "path": "/api/customer/consent",
+      "body": {
+        "policy_version": "recording-v1"
+      },
+      "response": "SessionView"
+    },
+    {
+      "method": "POST",
+      "path": "/api/customer/start",
+      "body": {
+        "expected_revision": 1
+      },
+      "response": "503 provider_unavailable/not_ready until live gates implemented; never a simulated successful recording"
+    }
+  ],
+  "SessionView": {
+    "id": "UUID",
+    "customer_label": "string",
+    "project_context": "string",
+    "agency_name": "string",
+    "state": "invited|consented|interviewing|recovering|processing|draft|deleted|revoked",
+    "revision": 1,
+    "consented_at": "ISO8601|null",
+    "consent_policy_version": "recording-v1",
+    "expires_at": "ISO8601",
+    "remaining_seconds": 360,
+    "voice_available": false
+  },
+  "browser_routes": [
+    "/operator",
+    "/i/:invitationId#token=secret",
+    "/interview",
+    "/review",
+    "/t/:slug"
+  ],
+  "day_one_boundary": "No fake approval/publish/generation. Show unavailable or pending surfaces honestly."
+}
