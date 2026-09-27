@@ -1,0 +1,383 @@
+use crate::{AppState, auth, error::ApiError};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::{Row, postgres::PgRow};
+use uuid::Uuid;
+use v0_domain::{CONSENT_POLICY_VERSION, SessionView};
+
+pub async fn health() -> Json<Value> {
+    Json(json!({"status":"ok"}))
+}
+pub async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    sqlx::query("SELECT 1 FROM interviews LIMIT 1")
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({"status":"ready","voice_available":false})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Login {
+    username: String,
+    password: String,
+}
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Login>,
+) -> Result<Response, ApiError> {
+    state.limit_auth()?;
+    if input.username.len() > 120 || input.password.len() > 1024 {
+        return Err(ApiError::unauthorized());
+    }
+    let hash = state.config.operator_password_hash.clone();
+    let valid_user = input.username == state.config.operator_username;
+    let valid = tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&hash).ok().is_some_and(|parsed| {
+            Argon2::default()
+                .verify_password(input.password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    })
+    .await
+    .map_err(|_| ApiError::unauthorized())?;
+    if !valid || !valid_user {
+        return Err(ApiError::unauthorized());
+    }
+    let token = auth::random_secret();
+    let mut tx = state.pool.begin().await?;
+    if let Some(old) = auth::cookie(&headers, "operator_session") {
+        sqlx::query("DELETE FROM sessions WHERE token_hash=$1 AND role='operator'")
+            .bind(auth::hash_secret(&old))
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("INSERT INTO sessions(token_hash, role, expires_at) VALUES ($1,'operator',now()+interval '8 hours')")
+        .bind(auth::hash_secret(&token)).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok((
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie(
+                "operator_session",
+                &token,
+                state.config.secure_cookie,
+                28800,
+            ),
+        )],
+        Json(json!({"ok":true})),
+    )
+        .into_response())
+}
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(token) = auth::cookie(&headers, "operator_session") {
+        sqlx::query("DELETE FROM sessions WHERE token_hash=$1 AND role='operator'")
+            .bind(auth::hash_secret(&token))
+            .execute(&state.pool)
+            .await?;
+    }
+    Ok((
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie("operator_session", "", state.config.secure_cookie, 0),
+        )],
+        Json(json!({"ok":true})),
+    )
+        .into_response())
+}
+pub async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::operator(&state, &headers).await?;
+    Ok(Json(json!({"username":state.config.operator_username})))
+}
+fn view(state: &AppState, row: &PgRow) -> SessionView {
+    SessionView {
+        id: row.get("id"),
+        customer_label: row.get("customer_label"),
+        project_context: row.get("project_context"),
+        agency_name: state.config.agency_name.clone(),
+        state: row.get("state"),
+        revision: row.get("revision"),
+        consented_at: row.get("consented_at"),
+        consent_policy_version: CONSENT_POLICY_VERSION.into(),
+        expires_at: row.get("expires_at"),
+        remaining_seconds: 360 - row.get::<i32, _>("time_consumed_seconds"),
+        voice_available: false,
+    }
+}
+fn available(row: &PgRow) -> Result<(), ApiError> {
+    let status: String = row.get("state");
+    if row.get::<DateTime<Utc>, _>("expires_at") <= Utc::now()
+        || row.get::<Option<DateTime<Utc>>, _>("deleted_at").is_some()
+        || matches!(status.as_str(), "revoked" | "deleted")
+    {
+        return Err(ApiError::expired());
+    }
+    Ok(())
+}
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    auth::operator(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT * FROM interviews WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        json!({"invitations":rows.iter().map(|r|view(&state,r)).collect::<Vec<_>>()}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Invite {
+    idempotency_key: Uuid,
+    customer_label: String,
+    project_context: String,
+}
+pub async fn invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Invite>,
+) -> Result<Json<Value>, ApiError> {
+    auth::operator(&state, &headers).await?;
+    let label = input.customer_label.trim();
+    let context = input.project_context.trim();
+    if label.is_empty()
+        || label.chars().count() > 120
+        || context.is_empty()
+        || context.chars().count() > 2000
+    {
+        return Err(ApiError::invalid(
+            "Provide a customer label and project context within the stated limits.",
+        ));
+    }
+    let request_hash = auth::hash_secret(&json!([label, context]).to_string());
+    let id = Uuid::new_v4();
+    let secret = auth::invitation_secret(&state.config.invitation_signing_key, id);
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("INSERT INTO interviews(id,customer_label,project_context,secret_hash,idempotency_key,request_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,now()+interval '14 days') ON CONFLICT (idempotency_key) DO NOTHING")
+        .bind(id).bind(label).bind(context).bind(auth::hash_secret(&secret)).bind(input.idempotency_key).bind(&request_hash).execute(&mut *tx).await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE idempotency_key=$1 FOR UPDATE")
+        .bind(input.idempotency_key)
+        .fetch_one(&mut *tx)
+        .await?;
+    if row.get::<String, _>("request_hash") != request_hash {
+        return Err(ApiError::conflict());
+    }
+    available(&row)?;
+    let id: Uuid = row.get("id");
+    let token = auth::invitation_secret(&state.config.invitation_signing_key, id);
+    // Key rotation invalidates old links; never return a newly derived but unusable token.
+    if auth::hash_secret(&token) != row.get::<String, _>("secret_hash") {
+        return Err(ApiError::conflict());
+    }
+    sqlx::query("INSERT INTO audit_events(interview_id,event) SELECT $1,'invitation_created' WHERE NOT EXISTS(SELECT 1 FROM audit_events WHERE interview_id=$1 AND event='invitation_created')").bind(id).execute(&mut *tx).await?;
+    let response = json!({"invitation":view(&state,&row),"private_url":format!("{}/i/{}#token={}",state.config.origin,id,token)});
+    tx.commit().await?;
+    Ok(Json(response))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Revision {
+    expected_revision: i64,
+}
+pub async fn revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<Revision>,
+) -> Result<Json<Value>, ApiError> {
+    auth::operator(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    if row.get::<i64, _>("revision") != input.expected_revision {
+        return Err(ApiError::conflict());
+    }
+    let status: String = row.get("state");
+    if !matches!(status.as_str(), "invited" | "consented") {
+        return Err(ApiError::invalid(
+            "Only unused invitations can be revoked here.",
+        ));
+    }
+    sqlx::query(
+        "UPDATE interviews SET state='revoked',revision=revision+1,updated_at=now() WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM sessions WHERE interview_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO audit_events(interview_id,event) VALUES($1,'invitation_revoked')")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exchange {
+    invitation_id: Uuid,
+    token: String,
+}
+pub async fn exchange(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Exchange>,
+) -> Result<Response, ApiError> {
+    state.limit_auth()?;
+    if input.token.len() != 64 {
+        return Err(ApiError::unauthorized());
+    }
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 AND secret_hash=$2 FOR UPDATE")
+        .bind(input.invitation_id)
+        .bind(auth::hash_secret(&input.token))
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    available(&row)?;
+    let token = auth::random_secret();
+    if let Some(old) = auth::cookie(&headers, "customer_session") {
+        sqlx::query("DELETE FROM sessions WHERE token_hash=$1 AND role='customer'")
+            .bind(auth::hash_secret(&old))
+            .execute(&mut *tx)
+            .await?;
+    }
+    let expiry: DateTime<Utc> = row.get("expires_at");
+    let seconds = (expiry - Utc::now()).num_seconds().max(0);
+    sqlx::query(
+        "INSERT INTO sessions(token_hash,role,interview_id,expires_at) VALUES($1,'customer',$2,$3)",
+    )
+    .bind(auth::hash_secret(&token))
+    .bind(input.invitation_id)
+    .bind(expiry)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((
+        [(
+            header::SET_COOKIE,
+            auth::session_cookie(
+                "customer_session",
+                &token,
+                state.config.secure_cookie,
+                seconds,
+            ),
+        )],
+        Json(json!({"ok":true})),
+    )
+        .into_response())
+}
+pub async fn session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SessionView>, ApiError> {
+    let id = auth::customer(&state, &headers).await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    available(&row)?;
+    Ok(Json(view(&state, &row)))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Consent {
+    policy_version: String,
+}
+pub async fn consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Consent>,
+) -> Result<Json<SessionView>, ApiError> {
+    let id = auth::customer(&state, &headers).await?;
+    if input.policy_version != CONSENT_POLICY_VERSION {
+        return Err(ApiError::invalid(
+            "Review the current recording policy before consenting.",
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    available(&row)?;
+    if row
+        .get::<Option<DateTime<Utc>>, _>("consented_at")
+        .is_none()
+    {
+        if row.get::<String, _>("state") != "invited" {
+            return Err(ApiError::conflict());
+        }
+        sqlx::query("UPDATE interviews SET consented_at=now(),consent_policy_version=$2,state='consented',revision=revision+1,updated_at=now(),expires_at=now()+interval '14 days' WHERE id=$1").bind(id).bind(CONSENT_POLICY_VERSION).execute(&mut *tx).await?;
+        sqlx::query("UPDATE sessions SET expires_at=(SELECT expires_at FROM interviews WHERE id=$1) WHERE interview_id=$1").bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO audit_events(interview_id,event) VALUES($1,'recording_consented')",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let result = view(&state, &row);
+    tx.commit().await?;
+    Ok(Json(result))
+}
+pub async fn start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Revision>,
+) -> Result<Json<Value>, ApiError> {
+    let id = auth::customer(&state, &headers).await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    available(&row)?;
+    if row.get::<i64, _>("revision") != input.expected_revision {
+        return Err(ApiError::conflict());
+    }
+    if row
+        .get::<Option<DateTime<Utc>>, _>("consented_at")
+        .is_none()
+    {
+        return Err(ApiError::invalid("Recording consent is required."));
+    }
+    // Do not create a provider session or acquire a lease until G1/G2 are integrated.
+    if state.config.voice_api_key.is_none() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_unavailable",
+            "The live interview is not configured yet. Your consent is saved.",
+        ));
+    }
+    Err(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "not_ready",
+        "The live interview is awaiting voice and recovery verification. Your consent is saved.",
+    ))
+}
