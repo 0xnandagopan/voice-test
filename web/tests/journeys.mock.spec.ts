@@ -25,6 +25,7 @@ async function customer(page: Page) {
       return route.fulfill({ json: session });
     if (path === "/api/customer/consent") {
       expect(route.request().postDataJSON()).toEqual({
+        interview_id: id,
         policy_version: "recording-v1",
       });
       session = {
@@ -35,7 +36,11 @@ async function customer(page: Page) {
       };
       return route.fulfill({ json: session });
     }
-    if (path === "/api/customer/start")
+    if (path === "/api/customer/start") {
+      expect(route.request().postDataJSON()).toEqual({
+        interview_id: id,
+        expected_revision: 2,
+      });
       return route.fulfill({
         status: 503,
         json: {
@@ -45,6 +50,7 @@ async function customer(page: Page) {
           },
         },
       });
+    }
     return route.fulfill({
       status: 404,
       json: { error: { code: "not_ready", message: "Not implemented" } },

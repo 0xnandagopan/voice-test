@@ -430,7 +430,10 @@ function Welcome({ invitationId }: { invitationId?: string }) {
   const [accepted, setAccepted] = useState(false);
   const consent = useMutation({
     mutationFn: () =>
-      api<SessionView>("/customer/consent", { policy_version: "recording-v1" }),
+      api<SessionView>("/customer/consent", {
+        interview_id: session.data?.id,
+        policy_version: "recording-v1",
+      }),
     onSuccess: (data) => client.setQueryData(sessionKey, data),
   });
   if (session.isPending) return <Pending />;
@@ -474,12 +477,13 @@ function Welcome({ invitationId }: { invitationId?: string }) {
             <p>{session.data.project_context}</p>
           </div>
           <div className="facts">
-            <span>◷ Up to 6 minutes</span>
+            <span>◷ Usually 3–5 minutes</span>
             <span>◎ 3 simple topics</span>
             <span>✓ You approve every word</span>
           </div>
           <p className="muted small">
-            English · Desktop or Android Chrome · A quiet spot helps
+            Six-minute maximum · English · Desktop or Android Chrome · A quiet
+            spot helps
           </p>
         </section>
         <section className="card consent-card">
@@ -678,7 +682,10 @@ function Interview() {
   const [stopped, setStopped] = useState(false);
   const start = useMutation({
     mutationFn: () =>
-      api("/customer/start", { expected_revision: session.data?.revision }),
+      api("/customer/start", {
+        interview_id: session.data?.id,
+        expected_revision: session.data?.revision,
+      }),
     onSuccess: () => {
       throw new Error(
         "The live voice connection is not available in this build. No recording has started.",
