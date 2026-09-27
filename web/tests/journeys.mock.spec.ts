@@ -1,0 +1,249 @@
+import { test, expect, type Page } from "@playwright/test";
+const id = "6c28c68e-2296-4c37-b4c0-50d8bbf9e654";
+const fixture = {
+  id,
+  customer_label: "Alex",
+  project_context: "A new website for Studio North",
+  agency_name: "Example Agency",
+  state: "invited",
+  revision: 1,
+  consented_at: null as string | null,
+  consent_policy_version: "recording-v1",
+  expires_at: "2026-10-11T00:00:00Z",
+  remaining_seconds: 360,
+  voice_available: false,
+};
+async function customer(page: Page) {
+  let session = { ...fixture };
+  const calls: string[] = [];
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    calls.push(path);
+    if (path === "/api/customer/exchange")
+      return route.fulfill({ json: { ok: true } });
+    if (path === "/api/customer/session")
+      return route.fulfill({ json: session });
+    if (path === "/api/customer/consent") {
+      expect(route.request().postDataJSON()).toEqual({
+        policy_version: "recording-v1",
+      });
+      session = {
+        ...session,
+        state: "consented",
+        consented_at: new Date().toISOString(),
+        revision: 2,
+      };
+      return route.fulfill({ json: session });
+    }
+    if (path === "/api/customer/start")
+      return route.fulfill({
+        status: 503,
+        json: {
+          error: {
+            code: "provider_unavailable",
+            message: "Live voice is not configured. No recording has started.",
+          },
+        },
+      });
+    return route.fulfill({
+      status: 404,
+      json: { error: { code: "not_ready", message: "Not implemented" } },
+    });
+  });
+  return calls;
+}
+test("customer consent gates microphone; fragment removed; denial retries with synthetic microphone", async ({
+  page,
+}) => {
+  const calls = await customer(page);
+  await page.addInitScript(() => {
+    const original = navigator.mediaDevices.getUserMedia.bind(
+      navigator.mediaDevices,
+    );
+    Object.assign(window, { micCalls: 0 });
+    navigator.mediaDevices.getUserMedia = async (constraints) => {
+      const win = window as unknown as { micCalls: number };
+      win.micCalls++;
+      if (win.micCalls === 1)
+        throw new DOMException("Permission denied", "NotAllowedError");
+      return original(constraints);
+    };
+  });
+  await page.goto(`/i/${id}#token=synthetic-invitation-secret`);
+  await expect(
+    page.getByRole("heading", { name: "Your voice, your choice." }),
+  ).toBeVisible();
+  await expect(page).toHaveURL(`/i/${id}`);
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { micCalls: number }).micCalls,
+    ),
+  ).toBe(0);
+  expect(calls.filter((path) => path.endsWith("/exchange"))).toHaveLength(1);
+  await expect(
+    page.getByRole("button", { name: "I agree — check my sound" }),
+  ).toBeDisabled();
+  await page.getByRole("checkbox", { name: /I consent/ }).check();
+  await page.getByRole("button", { name: "I agree — check my sound" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Let’s check your sound." }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { micCalls: number }).micCalls,
+    ),
+  ).toBe(0);
+  await page
+    .getByRole("button", { name: "Check microphone", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Retry microphone" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Retry microphone" }).click();
+  await expect(page.getByText("Microphone is accessible.")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { micCalls: number }).micCalls,
+    ),
+  ).toBe(2);
+  await expect(
+    page.getByRole("button", { name: "Continue to conversation" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Play test tone" }).click();
+  await page.getByRole("checkbox", { name: "I heard the test tone." }).check();
+  await page.getByRole("button", { name: "Continue to conversation" }).click();
+  await page
+    .getByRole("button", { name: "Start interview", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Live voice is not configured. No recording has started.",
+  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { micCalls: number }).micCalls,
+    ),
+  ).toBe(2);
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByText("Stopped locally.")).toBeVisible();
+});
+test("failed consent does not unlock readiness or ask for microphone", async ({
+  page,
+}) => {
+  await customer(page);
+  await page.route("**/api/customer/consent", (route) =>
+    route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: "not_ready",
+          message: "Consent was not saved. Try again.",
+        },
+      },
+    }),
+  );
+  await page.goto(`/i/${id}#token=test`);
+  await page.getByRole("checkbox", { name: /I consent/ }).check();
+  await page.getByRole("button", { name: "I agree — check my sound" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Consent was not saved. Try again.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Check microphone", exact: true }),
+  ).toHaveCount(0);
+});
+test("revoked exchange removes secret and reports access failure", async ({
+  page,
+}) => {
+  await page.route("**/api/customer/exchange", (route) =>
+    route.fulfill({
+      status: 401,
+      json: {
+        error: { code: "unauthorized", message: "Invitation is unavailable." },
+      },
+    }),
+  );
+  await page.goto(`/i/${id}#token=revoked-secret`);
+  await expect(
+    page.getByRole("heading", { name: "We couldn’t open this invitation." }),
+  ).toBeVisible();
+  expect(new URL(page.url()).hash).toBe("");
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+});
+test("operator signs in, creates, copies and revokes an invitation", async ({
+  page,
+  context,
+}) => {
+  let authenticated = false;
+  let invitations: (typeof fixture)[] = [];
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.route("**/api/operator/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/login")) {
+      authenticated = true;
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (path.endsWith("/me"))
+      return route.fulfill(
+        authenticated
+          ? { json: { username: "operator" } }
+          : {
+              status: 401,
+              json: {
+                error: { code: "unauthorized", message: "Sign in required" },
+              },
+            },
+      );
+    if (path.endsWith("/revoke")) {
+      expect(route.request().postDataJSON()).toEqual({ expected_revision: 1 });
+      invitations = [{ ...fixture, state: "revoked" }];
+      return route.fulfill({ json: { ok: true } });
+    }
+    if (path.endsWith("/invitations") && route.request().method() === "POST") {
+      expect(route.request().postDataJSON().customer_label).toBe("Alex");
+      invitations = [fixture];
+      return route.fulfill({
+        json: {
+          invitation: fixture,
+          private_url: `http://localhost:5173/i/${id}#token=synthetic-secret`,
+        },
+      });
+    }
+    return route.fulfill({ json: { invitations } });
+  });
+  await page.goto("/operator");
+  await page.getByLabel("Username", { exact: true }).fill("operator");
+  await page.getByLabel("Password", { exact: true }).fill("synthetic-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByLabel("Customer name").fill("Alex");
+  await page.getByLabel("Project context").fill(fixture.project_context);
+  await page.getByRole("button", { name: "Create private invitation" }).click();
+  await expect(page.getByText("Alex", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Copy link", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Link copied" })).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toContain(
+    `#token=synthetic-secret`,
+  );
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Revoke", exact: true }).click();
+  await expect(page.getByText("revoked", { exact: true })).toBeVisible();
+});
+test("mobile welcome fits viewport and never fabricates published content", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 393, height: 851 });
+  await customer(page);
+  await page.goto(`/i/${id}#token=test`);
+  await expect(
+    page.getByRole("heading", { name: "Your voice, your choice." }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(393);
+  await page.goto("/t/example");
+  await expect(
+    page.getByRole("heading", { name: "Nothing is published here." }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /Approve|Publish/ }),
+  ).toHaveCount(0);
+});

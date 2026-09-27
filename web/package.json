@@ -1,0 +1,28 @@
+{
+  "name": "voice-testimonial-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "playwright test",
+    "test:api": "playwright test --config playwright.api.config.ts",
+    "format:check": "prettier --check src/App.tsx src/api.ts src/main.tsx src/style.css tests *.ts *.json index.html"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "prettier": "^3.9.8",
+    "typescript": "5.9.3",
+    "vite": "^8.3.0"
+  }
+}
