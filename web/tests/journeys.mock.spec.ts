@@ -131,8 +131,9 @@ test("customer consent gates microphone; fragment removed; denial retries with s
       () => (window as unknown as { micCalls: number }).micCalls,
     ),
   ).toBe(2);
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
-  await expect(page.getByText("Stopped locally.")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Stop", exact: true }),
+  ).toHaveCount(0);
 });
 test("failed consent does not unlock readiness or ask for microphone", async ({
   page,

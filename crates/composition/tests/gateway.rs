@@ -117,15 +117,7 @@ async fn invalid_outputs_fail_closed_without_retries() {
     omitted_clause["text"] = json!("I think it saves roughly two hours a week. Revenue doubled.");
     let mut empty_quotes = draft();
     empty_quotes["claims"][0]["sources"][0]["quote"] = json!("");
-    let mut extra_field = draft();
-    extra_field["approve"] = json!(true);
-    for output in [
-        unknown_source,
-        forged_quote,
-        omitted_clause,
-        empty_quotes,
-        extra_field,
-    ] {
+    for output in [unknown_source, forged_quote, omitted_clause, empty_quotes] {
         let (client, state, server) = mock(
             vec![envelope(output)],
             Duration::ZERO,
@@ -143,13 +135,11 @@ async fn invalid_outputs_fail_closed_without_retries() {
 
 #[tokio::test]
 async fn checker_cannot_rewrite_or_omit_customer_text() {
-    let mut rewrite = check();
-    rewrite["text"] = json!("Revenue might improve.");
     let mut replacement_claim = check();
     replacement_claim["claims"][0]["text"] = json!("Revenue might improve.");
     let mut false_verdict = check();
     false_verdict["verdict"] = json!("supported");
-    for output in [rewrite, replacement_claim, false_verdict] {
+    for output in [replacement_claim, false_verdict] {
         let (client, _, server) = mock(
             vec![envelope(output)],
             Duration::ZERO,
@@ -364,17 +354,19 @@ async fn truncated_markdown_and_tool_outputs_are_not_repaired_or_executed() {
     let mut tools: Value = serde_json::from_str(&envelope(draft()).1).unwrap();
     tools["choices"][0]["message"]["tool_calls"] = json!([{"function":{"name":"publish"}}]);
     let markdown = json!({"choices":[{"finish_reason":"stop","message":{"content":format!("```json\n{}\n```",draft())}}]});
-    for value in [truncated, tools, markdown] {
+    for (value, expected) in [
+        (truncated, "gateway response did not finish normally"),
+        (tools, "gateway response envelope is invalid"),
+        (markdown, "gateway response is not plain JSON"),
+    ] {
         let (client, _, server) = mock(
             vec![(200, value.to_string())],
             Duration::ZERO,
             Duration::from_secs(2),
         )
         .await;
-        assert!(matches!(
-            client.generate(&sources()).await,
-            Err(GatewayError::InvalidOutput)
-        ));
+        let error = client.generate(&sources()).await.err().unwrap();
+        assert_eq!(error.to_string(), expected);
         server.abort();
     }
 }
@@ -409,5 +401,78 @@ async fn future_retry_after_date_is_returned_without_early_retry() {
             retry_after_secs: 599..=601
         })
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn response_schema_errors_are_distinct_from_grounding_failures() {
+    let mut extra_field = draft();
+    extra_field["approve"] = json!(true);
+    let mut rewrite = check();
+    rewrite["text"] = json!("Revenue might improve.");
+    let (client, state, server) = mock(
+        vec![envelope(extra_field), envelope(rewrite)],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(matches!(
+        client.generate(&sources()).await,
+        Err(GatewayError::InvalidSchema)
+    ));
+    assert!(matches!(
+        client.check("It doubled revenue.", &sources()).await,
+        Err(GatewayError::InvalidSchema)
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn request_rejection_is_not_output_validation_and_is_not_retried() {
+    let (client, state, server) = mock(
+        vec![(400, "private provider rejection".into())],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    let error = client.generate(&sources()).await.err().unwrap();
+    assert!(matches!(error, GatewayError::Rejected));
+    assert!(!format!("{error:?}: {error}").contains("private"));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn duplicate_model_output_fields_remain_rejected() {
+    let content = format!("{{\"status\":\"no_draft\",{}", &draft().to_string()[1..]);
+    let response = json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]});
+    let (client, state, server) = mock(
+        vec![(200, response.to_string())],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(matches!(
+        client.generate(&sources()).await,
+        Err(GatewayError::InvalidSchema)
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn account_model_access_rejection_is_actionable_and_keeps_details_private() {
+    let error_body = json!({"code":400,"message":"invalid request body","metadata":{"errors":["Your account does not have access to this LLM Gateway model"],"private":"not for logs"}});
+    let (client, state, server) = mock(
+        vec![(400, error_body.to_string())],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    let error = client.generate(&sources()).await.err().unwrap();
+    assert!(matches!(error, GatewayError::ModelAccessDenied));
+    assert!(!format!("{error:?}: {error}").contains("not for logs"));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     server.abort();
 }

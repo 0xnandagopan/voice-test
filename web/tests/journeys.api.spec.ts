@@ -101,8 +101,9 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
       () => (window as unknown as { micCalls: number }).micCalls,
     ),
   ).toBe(1);
-  await customerPage.getByRole("button", { name: "Stop", exact: true }).click();
-  await expect(customerPage.getByText("Stopped locally.")).toBeVisible();
+  await expect(
+    customerPage.getByRole("button", { name: "Stop", exact: true }),
+  ).toHaveCount(0);
   await customerPage.getByRole("link", { name: "Back to sound check" }).click();
   await page.reload();
   page.once("dialog", (dialog) => dialog.accept());

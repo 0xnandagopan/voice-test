@@ -695,7 +695,13 @@ function Readiness({ session }: { session: SessionView }) {
   );
 }
 function Interview() {
-  const session = useQuery(sessionQuery);
+  const session = useQuery({
+    ...sessionQuery,
+    // Local Stop releases audio before the server finishes recording recovery.
+    // Keep refreshing an occupied lease until the authoritative state settles.
+    refetchInterval: (query) =>
+      query.state.data?.state === "interviewing" ? 2000 : false,
+  });
   const controller = useAudioController();
   const [stopped, setStopped] = useState(false);
   const [active, setActive] = useState(false);
@@ -816,6 +822,17 @@ function Interview() {
     session.data?.state === "completed" ||
     session.data?.state === "processing" ||
     session.data?.state === "draft";
+  const connecting = start.isPending && !stopped && !ended;
+  const showStop = active || connecting || finishing;
+  const reviewRequired =
+    stopped ||
+    ended ||
+    requiresRecovery ||
+    existingSession ||
+    processing ||
+    session.data?.remaining_seconds === 0;
+  const canOfferStart = !active && !reviewRequired;
+  const continuing = (session.data?.remaining_seconds ?? 360) < 360;
   return (
     <Shell>
       <Steps current={3} />
@@ -855,15 +872,27 @@ function Interview() {
                 ? "Tell us your story."
                 : completed || session.data.state === "completed"
                   ? "Your interview is complete."
-                  : ended || requiresRecovery
-                    ? "Review recording recovery."
-                    : "Ready when you are."}
+                  : processing
+                    ? "Your interview is ready for review."
+                    : reviewRequired
+                      ? "Review recording recovery."
+                      : "Ready when you are."}
             </h1>
             <p>
-              Three topics. Up to{" "}
-              {Math.ceil((remaining ?? session.data.remaining_seconds) / 60)}{" "}
-              minutes remaining. Tell us what worked, what changed, and what
-              could have been better.
+              {completed || processing ? (
+                "Review your recordings and prepare the testimonial you want to share."
+              ) : reviewRequired ? (
+                "Review the available recordings before deciding what to do next."
+              ) : (
+                <>
+                  Three topics. Up to{" "}
+                  {Math.ceil(
+                    (remaining ?? session.data.remaining_seconds) / 60,
+                  )}{" "}
+                  minutes remaining. Tell us what worked, what changed, and what
+                  could have been better.
+                </>
+              )}
             </p>
             {!session.data.voice_available && (
               <Notice>
@@ -910,29 +939,39 @@ function Interview() {
               </Notice>
             )}
             <div className="actions">
-              <button
-                disabled={
-                  start.isPending ||
-                  active ||
-                  ended ||
-                  stopped ||
-                  requiresRecovery ||
-                  existingSession ||
-                  processing ||
-                  !session.data.voice_available ||
-                  session.data.remaining_seconds <= 0
-                }
-                onClick={() => {
-                  setError(null);
-                  setStopped(false);
-                  start.mutate();
-                }}
-              >
-                {start.isPending ? "Connecting…" : "Start interview"}
-              </button>
-              <button className="secondary" onClick={stop}>
-                Stop
-              </button>
+              {canOfferStart && (
+                <button
+                  disabled={
+                    start.isPending ||
+                    session.data.state !== "consented" ||
+                    !session.data.voice_available ||
+                    session.data.remaining_seconds <= 0
+                  }
+                  onClick={() => {
+                    setError(null);
+                    setStopped(false);
+                    start.mutate();
+                  }}
+                >
+                  {connecting
+                    ? "Connecting…"
+                    : continuing
+                      ? "Continue interview"
+                      : "Start interview"}
+                </button>
+              )}
+              {showStop && (
+                <button className="secondary" onClick={stop}>
+                  Stop
+                </button>
+              )}
+              {reviewRequired && !showStop && (
+                <Link className="button" to={`/review/${session.data.id}`}>
+                  {completed || processing
+                    ? "Review testimonial"
+                    : "Review recording recovery"}
+                </Link>
+              )}
               {active && (
                 <>
                   <button
@@ -1010,12 +1049,16 @@ function Interview() {
                 ))}
               </section>
             )}
-            <Link className="text-link" to={`/review/${session.data.id}`}>
-              View saved recording and review
-            </Link>
-            <Link className="text-link" to={`/i/${session.data.id}`}>
-              Back to sound check
-            </Link>
+            {!showStop && !reviewRequired && (
+              <nav className="actions" aria-label="Conversation navigation">
+                <Link className="text-link" to={`/review/${session.data.id}`}>
+                  View saved recording and review
+                </Link>
+                <Link className="text-link" to={`/i/${session.data.id}`}>
+                  Back to sound check
+                </Link>
+              </nav>
+            )}
             <p className="small muted">
               A saved recording or recoverable evidence will only be shown after
               server confirmation.

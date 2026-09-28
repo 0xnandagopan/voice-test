@@ -98,7 +98,30 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
             sources.push(json!({"source_id":seg.source_id,"attempt_id":row.get::<Uuid,_>("provider_attempt_id"),"text":seg.text,"corrected_text":before.transcript_corrections.get(&seg.source_id),"speaker":seg.speaker,"start_ms":seg.source_range_ms.map(|r|r[0]),"end_ms":seg.source_range_ms.map(|r|r[1]),"playback_available":check.is_some_and(|c|c.within_recording && c.audible_samples>0 && c.candidate_source_range_ms.is_some()),"alignment_verified":m.approval_eligible && m.media.as_ref().is_some_and(|m|m.alignment_proven)}));
         }
     }
-    let jobs=sqlx::query("SELECT id,kind,status,last_error FROM jobs WHERE interview_id=$1 AND kind IN ('import_evidence','generate_draft','support_check') ORDER BY created_at DESC LIMIT 30").bind(id).fetch_all(&s.pool).await?.into_iter().map(|r|json!({"id":r.get::<Uuid,_>("id"),"kind":r.get::<String,_>("kind"),"status":r.get::<String,_>("status"),"error_code":r.get::<Option<String>,_>("last_error")})).collect::<Vec<_>>();
+    // Jobs are current user actions, not the historical worker audit log. Keep
+    // unresolved imports per attempt so a missing earlier recording stays visible.
+    let jobs = sqlx::query(r#"
+        SELECT DISTINCT ON (kind, task_scope) id,kind,status,last_error
+        FROM (
+            SELECT j.*, CASE WHEN j.kind='import_evidence' THEN j.payload->>'provider_attempt_id' ELSE j.kind END AS task_scope
+            FROM jobs j WHERE j.interview_id=$1 AND j.status<>'cancelled' AND (
+                (j.kind IN ('generate_draft','support_check')
+                    AND j.payload->'content_revision'=$2 AND j.payload->'evidence_revision'=$3
+                    AND j.payload->>'content_hash'=$4)
+                OR (j.kind='import_evidence' AND EXISTS (
+                    SELECT 1 FROM provider_attempts p WHERE p.interview_id=j.interview_id
+                        AND p.id::text=j.payload->>'provider_attempt_id'
+                        AND NOT EXISTS (SELECT 1 FROM evidence_imports e WHERE e.interview_id=p.interview_id AND e.provider_attempt_id=p.id)))
+            )
+        ) current_jobs ORDER BY kind,task_scope,created_at DESC,id DESC
+    "#).bind(id).bind(json!(before.revisions.content)).bind(json!(before.revisions.evidence))
+        .bind(auth::hash_secret(&serde_json::to_value(&before.content).map_err(|_| ApiError::conflict())?.to_string()))
+        .fetch_all(&s.pool).await?.into_iter().map(|r| {
+            let kind: String = r.get("kind");
+            let status: String = r.get("status");
+            let can_retry = status == "failed" && (kind == "import_evidence" || (before.approval.is_none() && !before.declined));
+            json!({"id":r.get::<Uuid,_>("id"),"kind":kind,"status":status,"error_code":r.get::<Option<String>,_>("last_error"),"can_retry":can_retry})
+        }).collect::<Vec<_>>();
     let assessment:Option<Value> = sqlx::query_scalar("SELECT result || jsonb_build_object('content_revision',content_revision,'evidence_revision',evidence_revision) FROM workflow_support_results WHERE interview_id=$1 AND content_revision=$2 AND evidence_revision=$3 AND result->'assessment' IS NOT NULL AND result->'assessment'<>'null'::jsonb")
         .bind(id).bind(before.revisions.content).bind(before.revisions.evidence).fetch_optional(&s.pool).await?;
     let after = workflow::inspect(&s.pool, &t, id).await?;
@@ -106,7 +129,7 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
         return Err(ApiError::conflict());
     }
     Ok(Json(
-        json!({"sources":sources,"jobs":jobs,"evidence_revision":after.revisions.evidence,"assessment":assessment}),
+        json!({"sources":sources,"jobs":jobs,"evidence_revision":after.revisions.evidence,"content_revision":after.revisions.content,"assessment":assessment}),
     ))
 }
 pub async fn customer_evidence(

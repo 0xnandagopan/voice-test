@@ -7,6 +7,7 @@ test("relay readiness gates capture; controls use server revisions; Stop release
     route.fulfill({
       json: {
         id,
+        state: "consented",
         revision: 2,
         consented_at: "2026-09-28T00:00:00Z",
         remaining_seconds: 360,
@@ -107,6 +108,7 @@ test("Stop while relay is connecting prevents subsequent microphone capture", as
     route.fulfill({
       json: {
         id,
+        state: "consented",
         revision: 2,
         consented_at: "2026-09-28T00:00:00Z",
         remaining_seconds: 360,

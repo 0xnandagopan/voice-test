@@ -108,8 +108,20 @@ impl JobFailure {
                 retry_after_secs: 0,
                 terminal: true,
             },
-            _ => Self {
-                code: "generation_validation_failed",
+            error => Self {
+                code: match error {
+                    GatewayError::ModelAccessDenied => "gateway_model_access",
+                    GatewayError::Rejected => "gateway_request_rejected",
+                    GatewayError::IncompleteResponse => "gateway_response_incomplete",
+                    GatewayError::InvalidEnvelope => "gateway_response_invalid",
+                    GatewayError::InvalidJson => "gateway_output_json_invalid",
+                    GatewayError::InvalidSchema => "gateway_output_schema_invalid",
+                    GatewayError::ResponseTooLarge => "gateway_response_too_large",
+                    GatewayError::InvalidInput => "composition_input_invalid",
+                    GatewayError::RequestBudget => "gateway_request_budget_exhausted",
+                    GatewayError::InvalidOutput => "generation_validation_failed",
+                    _ => unreachable!("transient and configuration errors handled above"),
+                },
                 retry_after_secs: 0,
                 terminal: true,
             },
@@ -125,4 +137,38 @@ pub async fn fail(pool: &PgPool, job: &Job, failure: JobFailure) -> Result<(), A
         let _ = workflow::fail_support_job(pool, job.interview_id, job.id).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_failures_keep_safe_actionable_categories() {
+        for (error, expected) in [
+            (GatewayError::Rejected, "gateway_request_rejected"),
+            (GatewayError::ModelAccessDenied, "gateway_model_access"),
+            (
+                GatewayError::IncompleteResponse,
+                "gateway_response_incomplete",
+            ),
+            (GatewayError::InvalidEnvelope, "gateway_response_invalid"),
+            (GatewayError::InvalidJson, "gateway_output_json_invalid"),
+            (GatewayError::InvalidSchema, "gateway_output_schema_invalid"),
+            (GatewayError::ResponseTooLarge, "gateway_response_too_large"),
+            (GatewayError::InvalidInput, "composition_input_invalid"),
+            (GatewayError::InvalidOutput, "generation_validation_failed"),
+            (GatewayError::Authentication, "gateway_configuration"),
+        ] {
+            let failure = JobFailure::gateway(error);
+            assert_eq!(failure.code, expected);
+            assert!(failure.terminal);
+        }
+        let failure = JobFailure::gateway(GatewayError::RateLimited {
+            retry_after_secs: 600,
+        });
+        assert_eq!(failure.code, "gateway_rate_limited");
+        assert_eq!(failure.retry_after_secs, 600);
+        assert!(!failure.terminal);
+    }
 }

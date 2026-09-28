@@ -148,3 +148,39 @@ async fn synthetic_quality_gate() {
         "Synthetic G3 matrix failed; keep model/prompt acceptance gated"
     );
 }
+
+#[tokio::test]
+#[ignore = "explicit two-request synthetic live smoke; does not validate G3"]
+async fn selected_model_draft_and_check_smoke() {
+    assert_eq!(std::env::var("VOICE_LIVE_PROBE").ok().as_deref(), Some("1"));
+    let model = std::env::var("GATEWAY_MODEL").expect("model required");
+    let client = GatewayClient::new(
+        std::env::var("VOICE_AGENT_API_KEY").expect("key required"),
+        model.clone(),
+    )
+    .unwrap()
+    .with_request_budget(2);
+    let sources = evidence(&[
+        ("s1", "I think it saves us roughly two hours a week."),
+        (
+            "s2",
+            "The setup was difficult, but the support team was helpful.",
+        ),
+    ]);
+    let draft = client.generate(&sources).await;
+    let candidate = "I think it saves us roughly two hours a week. The setup was difficult, but the support team was helpful.";
+    let check = client.check(candidate, &sources).await;
+    let generated = draft
+        .as_ref()
+        .is_ok_and(|value| value.status == GenerationStatus::Draft);
+    let supported = check
+        .as_ref()
+        .is_ok_and(|value| value.verdict == Verdict::Supported);
+    let summary = serde_json::json!({"synthetic":true,"model":model,"prompt_version":PROMPT_VERSION,"http_attempt_cap":2,"draft_valid":generated,"check_valid":check.is_ok(),"supported_candidate":supported,"draft_error":draft.err().map(|e|e.to_string()),"check_error":check.err().map(|e|e.to_string()),"g3_passed":false});
+    let path = std::env::var("GATEWAY_SMOKE_SUMMARY").expect("private summary path required");
+    std::fs::write(path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+    assert!(
+        generated && supported,
+        "Selected-model smoke failed; inspect redacted summary"
+    );
+}

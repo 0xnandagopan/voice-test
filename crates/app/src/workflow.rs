@@ -368,6 +368,9 @@ pub async fn complete_support_assessed(
     let job=sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='support_check' AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE")
         .bind(job_id).bind(id).bind(lease_token).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
     let payload: Value = job.get("payload");
+    if !is_latest_composition_job(&mut tx, id, job_id, "support_check", &payload).await? {
+        return Err(ApiError::conflict());
+    }
     if result.content_revision != state.revisions.content
         || result.evidence_revision != state.revisions.evidence
         || payload["content_revision"] != result.content_revision
@@ -434,6 +437,18 @@ pub async fn published(pool: &PgPool, id: Uuid) -> Result<ApprovalSnapshot, ApiE
     Ok(approval)
 }
 
+async fn is_latest_composition_job(
+    tx: &mut Tx<'_>,
+    id: Uuid,
+    job: Uuid,
+    kind: &str,
+    payload: &Value,
+) -> Result<bool, ApiError> {
+    let latest: Option<Uuid> = sqlx::query_scalar("SELECT id FROM jobs WHERE interview_id=$1 AND kind=$2 AND payload->'content_revision'=$3 AND payload->'evidence_revision'=$4 AND payload->'content_hash'=$5 AND status<>'cancelled' ORDER BY created_at DESC,id DESC LIMIT 1")
+        .bind(id).bind(kind).bind(&payload["content_revision"]).bind(&payload["evidence_revision"]).bind(&payload["content_hash"]).fetch_optional(&mut **tx).await?;
+    Ok(latest == Some(job))
+}
+
 async fn enqueue_check(tx: &mut Tx<'_>, id: Uuid, state: &WorkflowView) -> Result<Uuid, ApiError> {
     let key = format!(
         "support:{id}:{}:{}",
@@ -449,6 +464,24 @@ pub struct GenerationRequest {
     pub request_id: Uuid,
     pub expected: Revisions,
 }
+// Generation receipts retain the exact task ID even after its inputs become stale.
+// Other commands compare the full receipt string, so request-ID reuse fails closed.
+fn generation_receipt(expected: &Revisions, job: Uuid) -> Result<String, ApiError> {
+    Ok(format!(
+        "generation:v1:{}:{job}",
+        hash_secret(&encode(expected)?.to_string())
+    ))
+}
+fn generation_receipt_job(receipt: &str, expected: &Revisions) -> Result<Uuid, ApiError> {
+    let prefix = format!(
+        "generation:v1:{}:",
+        hash_secret(&encode(expected)?.to_string())
+    );
+    receipt
+        .strip_prefix(&prefix)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(ApiError::conflict)
+}
 pub async fn request_generation(
     pool: &PgPool,
     token: &str,
@@ -459,6 +492,13 @@ pub async fn request_generation(
     actor(&mut tx, id, token).await?;
     let mut state = load(&mut tx, id).await?;
     evidence(&mut tx, id, &mut state).await?;
+    let existing_receipt: Option<String> = sqlx::query_scalar("SELECT request_hash FROM workflow_receipts WHERE interview_id=$1 AND actor_hash=$2 AND request_id=$3")
+        .bind(id).bind(hash_secret(token)).bind(request.request_id).fetch_optional(&mut *tx).await?;
+    if let Some(receipt) = existing_receipt {
+        let job = generation_receipt_job(&receipt, &request.expected)?;
+        tx.commit().await?;
+        return Ok((job, state));
+    }
     let key = format!(
         "generate:{id}:{}:{}",
         hash_secret(token),
@@ -489,9 +529,21 @@ pub async fn request_generation(
             "A saved recording is required before drafting.",
         ));
     }
-    let job = Uuid::new_v4();
-    let payload = json!({"expected":request.expected,"content_revision":state.revisions.content,"evidence_revision":state.revisions.evidence,"content_hash":hash_secret(&encode(&state.content)?.to_string())});
-    sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'generate_draft',$3,$4,3)").bind(job).bind(id).bind(payload).bind(key).execute(&mut *tx).await?;
+    // The interview lock serializes requests from different tabs and request IDs.
+    // A failed current job is retried explicitly, never multiplied by Preview.
+    let content_hash = hash_secret(&encode(&state.content)?.to_string());
+    let existing_job: Option<Uuid> = sqlx::query_scalar("SELECT id FROM jobs WHERE interview_id=$1 AND kind='generate_draft' AND payload->'content_revision'=$2 AND payload->'evidence_revision'=$3 AND payload->>'content_hash'=$4 AND status<>'cancelled' ORDER BY created_at DESC,id DESC LIMIT 1")
+        .bind(id).bind(json!(state.revisions.content)).bind(json!(state.revisions.evidence)).bind(&content_hash).fetch_optional(&mut *tx).await?;
+    let job = if let Some(job) = existing_job {
+        job
+    } else {
+        let job = Uuid::new_v4();
+        let payload = json!({"expected":request.expected,"content_revision":state.revisions.content,"evidence_revision":state.revisions.evidence,"content_hash":content_hash});
+        sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'generate_draft',$3,$4,3)").bind(job).bind(id).bind(payload).bind(key).execute(&mut *tx).await?;
+        job
+    };
+    sqlx::query("INSERT INTO workflow_receipts(interview_id,actor_hash,request_id,request_hash) VALUES($1,$2,$3,$4)")
+        .bind(id).bind(hash_secret(token)).bind(request.request_id).bind(generation_receipt(&request.expected, job)?).execute(&mut *tx).await?;
     current_access(&mut tx, id).await?;
     tx.commit().await?;
     Ok((job, state))
@@ -519,6 +571,9 @@ pub async fn complete_generation_assessed(
     evidence(&mut tx, id, &mut state).await?;
     let row=sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='generate_draft' AND status='running' AND lease_token=$3 FOR UPDATE").bind(job).bind(id).bind(lease).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
     let payload: Value = row.get("payload");
+    if !is_latest_composition_job(&mut tx, id, job, "generate_draft", &payload).await? {
+        return Err(ApiError::conflict());
+    }
     if payload["content_revision"] != state.revisions.content
         || payload["evidence_revision"] != state.revisions.evidence
         || payload["content_hash"] != hash_secret(&encode(&state.content)?.to_string())
@@ -599,11 +654,24 @@ pub async fn retry_job(
     {
         return Err(ApiError::conflict());
     }
-    if kind != "import_evidence"
-        && (payload["content_revision"] != state.revisions.content
-            || payload["evidence_revision"] != state.revisions.evidence)
-    {
-        return Err(ApiError::conflict());
+    if kind == "import_evidence" {
+        let unresolved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_attempts p WHERE p.interview_id=$1 AND p.id::text=$2 AND NOT EXISTS(SELECT 1 FROM evidence_imports e WHERE e.interview_id=p.interview_id AND e.provider_attempt_id=p.id))")
+            .bind(id).bind(payload["provider_attempt_id"].as_str()).fetch_one(&mut *tx).await?;
+        if !unresolved {
+            return Err(ApiError::conflict());
+        }
+    } else {
+        if payload["content_revision"] != state.revisions.content
+            || payload["evidence_revision"] != state.revisions.evidence
+            || payload["content_hash"] != hash_secret(&encode(&state.content)?.to_string())
+            || state.approval.is_some()
+            || state.declined
+        {
+            return Err(ApiError::conflict());
+        }
+        if !is_latest_composition_job(&mut tx, id, request.job_id, &kind, &payload).await? {
+            return Err(ApiError::conflict());
+        }
     }
     sqlx::query("UPDATE jobs SET status='queued',max_attempts=attempts+3,available_at=clock_timestamp(),last_error=NULL,lease_token=NULL,lease_until=NULL WHERE id=$1").bind(request.job_id).execute(&mut *tx).await?;
     if kind == "support_check" {
@@ -628,8 +696,13 @@ pub async fn composition_input(
     let mut tx = lock(pool, id).await?;
     let mut state = load(&mut tx, id).await?;
     evidence(&mut tx, id, &mut state).await?;
-    let job=sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind IN ('support_check','generate_draft') AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE").bind(job_id).bind(id).bind(lease).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    let job=sqlx::query("SELECT payload,kind FROM jobs WHERE id=$1 AND interview_id=$2 AND kind IN ('support_check','generate_draft') AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE").bind(job_id).bind(id).bind(lease).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
     let payload: Value = job.get("payload");
+    if !is_latest_composition_job(&mut tx, id, job_id, &job.get::<String, _>("kind"), &payload)
+        .await?
+    {
+        return Err(ApiError::conflict());
+    }
     if payload["content_revision"] != state.revisions.content
         || payload["evidence_revision"] != state.revisions.evidence
         || payload["content_hash"] != hash_secret(&encode(&state.content)?.to_string())
@@ -676,11 +749,15 @@ pub async fn fail_support_job(pool: &PgPool, id: Uuid, job_id: Uuid) -> Result<(
     evidence(&mut tx, id, &mut state).await?;
     let payload: Option<Value> = sqlx::query_scalar("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='support_check' AND status='failed' FOR UPDATE")
         .bind(job_id).bind(id).fetch_optional(&mut *tx).await?;
-    if payload.is_some_and(|p| {
+    let current = if let Some(p) = payload {
         p["content_revision"] == state.revisions.content
             && p["evidence_revision"] == state.revisions.evidence
-    }) && state.check == CheckStatus::Pending
-    {
+            && p["content_hash"] == hash_secret(&encode(&state.content)?.to_string())
+            && is_latest_composition_job(&mut tx, id, job_id, "support_check", &p).await?
+    } else {
+        false
+    };
+    if current && state.check == CheckStatus::Pending {
         state.check = CheckStatus::Failed;
         state.revisions.workflow += 1;
         store(&mut tx, id, &state).await?;

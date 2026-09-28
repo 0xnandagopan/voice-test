@@ -24,6 +24,8 @@ async function review(
   const requests: Record<string, any>[] = [];
   let conflict = Boolean(options.stale);
   let assessment: Evidence["assessment"] = null;
+  let jobs: Evidence["jobs"] = [];
+  let taskContentRevision: number | undefined;
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/customer/session")
@@ -60,6 +62,15 @@ async function review(
         state.revisions.content++;
         state.check = "pending";
         state.approval = null;
+        jobs = [
+          {
+            id: "current-check",
+            kind: "support_check",
+            status: "queued",
+            error_code: null,
+            can_retry: false,
+          },
+        ];
       }
       if (body.action.type === "approve") {
         state.approval = {
@@ -85,6 +96,7 @@ async function review(
       return route.fulfill({
         json: {
           evidence_revision: state.revisions.evidence,
+          content_revision: taskContentRevision ?? state.revisions.content,
           assessment:
             assessment?.content_revision === state.revisions.content &&
             assessment?.evidence_revision === state.revisions.evidence
@@ -110,11 +122,26 @@ async function review(
                   kind: "import_evidence",
                   status: "failed",
                   error_code: "unavailable",
+                  can_retry: true,
                 },
               ]
-            : [],
+            : jobs,
         },
       });
+    if (path.endsWith("/retry")) {
+      const body = route.request().postDataJSON();
+      requests.push(body);
+      const job = jobs.find((job) => job.id === body.job_id)!;
+      expect(job.can_retry).toBe(true);
+      job.status = "queued";
+      job.error_code = null;
+      job.can_retry = false;
+      if (job.kind === "support_check") {
+        state.check = "pending";
+        state.revisions.workflow++;
+      }
+      return route.fulfill({ json: { job_id: job.id, state } });
+    }
     if (path.endsWith("/recovery"))
       return route.fulfill({
         json: {
@@ -144,6 +171,12 @@ async function review(
   });
   return {
     requests,
+    pinTaskRevision(value: number) {
+      taskContentRevision = value;
+    },
+    setJobs(value: Evidence["jobs"]) {
+      jobs = value;
+    },
     setAssessment(value: Evidence["assessment"]) {
       assessment = value;
     },
@@ -515,7 +548,13 @@ test("provisional claim references link private sources and disappear after cont
   await expect(suggestions).toHaveCount(0);
   await page.route("**/evidence", (route) =>
     route.fulfill({
-      json: { sources: [], jobs: [], evidence_revision: 1, assessment },
+      json: {
+        sources: [],
+        jobs: [],
+        evidence_revision: 1,
+        content_revision: fixture.state.revisions.content,
+        assessment,
+      },
     }),
   );
   await page.getByRole("button", { name: "Refresh saved status" }).click();
@@ -523,4 +562,159 @@ test("provisional claim references link private sources and disappear after cont
     page.getByText("No recorded sources are available yet."),
   ).toBeVisible();
   await expect(suggestions).toHaveCount(0);
+});
+
+test("draft failure shows one stable retry action and never implies recording loss", async ({
+  page,
+}) => {
+  const fixture = await review(page);
+  fixture.state.content = null;
+  fixture.state.check = "pending";
+  fixture.setJobs([
+    {
+      id: "draft-current",
+      kind: "generate_draft",
+      status: "failed",
+      error_code: "generation_validation_failed",
+      can_retry: true,
+    },
+  ]);
+  await page.goto(`/review/${id}`);
+  await expect(
+    page.getByRole("region", { name: "Draft preparation" }),
+  ).toContainText(
+    "Your recordings are unchanged. No generated draft was saved.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Retry draft preparation", exact: true }),
+  ).toHaveCount(1);
+  await expect(page.getByText(/A processing task did not finish/)).toHaveCount(
+    0,
+  );
+  await expect(page.getByRole("button", { name: /Retry.*\d/ })).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Retry draft preparation", exact: true })
+    .click();
+  await expect(page.getByText(/Draft preparation is queued/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Retry draft/ })).toHaveCount(
+    0,
+  );
+  fixture.setJobs([
+    {
+      id: "draft-current",
+      kind: "generate_draft",
+      status: "failed",
+      error_code: "gateway_model_access",
+      can_retry: true,
+    },
+  ]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByText(/account cannot access the selected drafting model/),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", {
+      name: "Retry after operator update",
+      exact: true,
+    }),
+  ).toHaveCount(1);
+  expect(fixture.requests).toHaveLength(1);
+});
+
+test("manual draft save replaces old draft failures with one current evidence check and survives reload", async ({
+  page,
+}) => {
+  const fixture = await review(page, { unverified: true });
+  fixture.state.content = null;
+  fixture.state.check = "pending";
+  fixture.setJobs([
+    {
+      id: "old-draft",
+      kind: "generate_draft",
+      status: "failed",
+      error_code: "generation_validation_failed",
+      can_retry: true,
+    },
+  ]);
+  await page.goto(`/review/${id}`);
+  await page.getByRole("button", { name: "Write my own draft" }).click();
+  await page
+    .getByLabel("Testimonial text")
+    .fill("The team answered my questions.");
+  await page
+    .getByLabel("Attribution", { exact: true })
+    .fill("Synthetic reviewer");
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(
+    page.getByText("Saved on the server.", { exact: true }),
+  ).toHaveCount(1);
+  await expect(
+    page.getByRole("region", { name: "Evidence check" }),
+  ).toContainText("Your text is saved.");
+  await expect(page.getByRole("button", { name: /Retry draft/ })).toHaveCount(
+    0,
+  );
+  fixture.setCheck("failed");
+  fixture.setJobs([
+    {
+      id: "current-check",
+      kind: "support_check",
+      status: "failed",
+      error_code: "gateway_output_schema_invalid",
+      can_retry: true,
+    },
+  ]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByRole("region", { name: "Evidence check" }),
+  ).toContainText("Your text is saved. Approval remains unavailable.");
+  await expect(
+    page.getByRole("button", { name: "Retry evidence check", exact: true }),
+  ).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveCount(1);
+  await page.reload();
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(
+    "The team answered my questions.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Approve exact testimonial" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Retry evidence check" }).click();
+  await expect(
+    page.getByRole("region", { name: "Evidence check" }),
+  ).toContainText("The evidence check is queued");
+  await expect(page.getByRole("button", { name: /Retry/ })).toHaveCount(0);
+});
+
+test("an old evidence poll cannot attach a failed draft to newer cross-tab content", async ({
+  page,
+}) => {
+  const fixture = await review(page);
+  fixture.setJobs([
+    {
+      id: "old-failed",
+      kind: "generate_draft",
+      status: "failed",
+      error_code: "generation_validation_failed",
+      can_retry: true,
+    },
+  ]);
+  fixture.pinTaskRevision(fixture.state.revisions.content);
+  await page.goto(`/review/${id}`);
+  await expect(
+    page.getByRole("button", { name: "Retry draft preparation" }),
+  ).toBeVisible();
+  fixture.state.content!.text = "Saved from another tab.";
+  fixture.state.revisions.content++;
+  fixture.state.revisions.workflow++;
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(
+    "Saved from another tab.",
+  );
+  await expect(page.getByRole("button", { name: /Retry draft/ })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("region", { name: "Draft preparation" }),
+  ).toHaveCount(0);
 });

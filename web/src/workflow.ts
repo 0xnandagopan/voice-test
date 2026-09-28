@@ -44,8 +44,10 @@ export type Evidence = {
     kind: string;
     status: string;
     error_code: string | null;
+    can_retry: boolean;
   }[];
   evidence_revision: number;
+  content_revision: number;
   assessment?: {
     kind: "generate_draft" | "support_check";
     model: string;

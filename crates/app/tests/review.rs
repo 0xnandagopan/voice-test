@@ -596,3 +596,231 @@ async fn support_failure_advances_revision_and_retry_cannot_use_pre_failure_stat
     assert!(f.state().await.approval.is_none());
     f.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn generation_requests_share_current_task_and_keep_receipts_after_an_edit() {
+    let f = Fixture::new().await;
+    f.trusted_fixture_evidence().await;
+    let expected = f.state().await.revisions;
+    let first = json!({"request_id":Uuid::new_v4(),"expected":expected});
+    let second = json!({"request_id":Uuid::new_v4(),"expected":expected});
+    let path = f.path("generate");
+    let cookie = f.cookie(false);
+    let (a, b) = tokio::join!(
+        f.request("POST", &path, Some(&cookie), first.clone()),
+        f.request("POST", &path, Some(&cookie), second.clone())
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    assert_eq!(a.1["job_id"], b.1["job_id"]);
+    let job = Uuid::parse_str(a.1["job_id"].as_str().unwrap()).unwrap();
+    sqlx::query(
+        "UPDATE jobs SET status='failed',last_error='generation_validation_failed' WHERE id=$1",
+    )
+    .bind(job)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let (_, again, _) = f
+        .request(
+            "POST",
+            &f.path("generate"),
+            Some(&f.cookie(false)),
+            json!({"request_id":Uuid::new_v4(),"expected":expected}),
+        )
+        .await;
+    assert_eq!(again["job_id"], a.1["job_id"]);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind='generate_draft'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let (_, evidence, _) = f
+        .request(
+            "GET",
+            &f.path("evidence"),
+            Some(&f.cookie(false)),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(evidence["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(evidence["jobs"][0]["can_retry"], true);
+
+    assert_eq!(
+        f.action(
+            false,
+            json!({"type":"save","content":content("My own edited draft.")})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for request in [first.clone(), second] {
+        let replay = f
+            .request("POST", &f.path("generate"), Some(&f.cookie(false)), request)
+            .await;
+        assert_eq!(replay.0, StatusCode::OK);
+        assert_eq!(replay.1["job_id"], a.1["job_id"]);
+    }
+    let current = f.state().await.revisions;
+    let mut changed = first;
+    changed["expected"] = json!(current);
+    assert_eq!(
+        f.request("POST", &f.path("generate"), Some(&f.cookie(false)), changed)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &f.path("retry"),
+            Some(&f.cookie(false)),
+            json!({"request_id":Uuid::new_v4(),"job_id":job,"expected":current})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (_, evidence, _) = f
+        .request(
+            "GET",
+            &f.path("evidence"),
+            Some(&f.cookie(false)),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(evidence["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(evidence["jobs"][0]["kind"], "support_check");
+    assert_eq!(evidence["jobs"][0]["can_retry"], false);
+    let unchanged: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id=$1")
+        .bind(job)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(unchanged, "failed");
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn evidence_shows_latest_current_task_and_each_missing_attempt_not_historical_failures() {
+    let f = Fixture::new().await;
+    f.trusted_fixture_evidence().await;
+    let state = f.state().await;
+    let payload = json!({"content_revision":state.revisions.content,"evidence_revision":state.revisions.evidence,"content_hash":hash_secret(&serde_json::to_value(&state.content).unwrap().to_string())});
+    let mut generation = vec![];
+    for _ in 0..3 {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,status,last_error) VALUES($1,$2,'generate_draft',$3,$4,'failed','generation_validation_failed')")
+            .bind(id).bind(f.id).bind(&payload).bind(id.to_string()).execute(&f.pool).await.unwrap();
+        generation.push(id);
+    }
+    let imported: Uuid = sqlx::query_scalar(
+        "SELECT provider_attempt_id FROM evidence_imports WHERE interview_id=$1",
+    )
+    .bind(f.id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let mut missing_jobs = vec![];
+    for attempt in [imported, Uuid::new_v4(), Uuid::new_v4()] {
+        if attempt != imported {
+            sqlx::query(
+                "INSERT INTO provider_attempts(id,interview_id,lease_generation) VALUES($1,$2,2)",
+            )
+            .bind(attempt)
+            .bind(f.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        }
+        let job = Uuid::new_v4();
+        sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,status,last_error) VALUES($1,$2,'import_evidence',$3,$4,'failed','artifact_unavailable')")
+            .bind(job).bind(f.id).bind(json!({"provider_attempt_id":attempt})).bind(format!("import:{attempt}")).execute(&f.pool).await.unwrap();
+        if attempt != imported {
+            missing_jobs.push(job);
+        } else {
+            assert_eq!(
+                f.request(
+                    "POST",
+                    &f.path("retry"),
+                    Some(&f.cookie(false)),
+                    json!({"request_id":Uuid::new_v4(),"job_id":job,"expected":state.revisions})
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+    }
+    let (_, evidence, _) = f
+        .request(
+            "GET",
+            &f.path("evidence"),
+            Some(&f.cookie(false)),
+            Value::Null,
+        )
+        .await;
+    let jobs = evidence["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 3);
+    assert!(jobs.iter().all(|j| j["can_retry"] == true));
+    assert!(jobs.iter().any(|j| j["id"] == json!(generation[2])));
+    for job in missing_jobs {
+        assert!(jobs.iter().any(|j| j["id"] == json!(job)));
+    }
+    assert_eq!(
+        f.request(
+            "POST",
+            &f.path("retry"),
+            Some(&f.cookie(false)),
+            json!({"request_id":Uuid::new_v4(),"job_id":generation[0],"expected":state.revisions})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &f.path("retry"),
+            Some(&f.cookie(false)),
+            json!({"request_id":Uuid::new_v4(),"job_id":generation[2],"expected":state.revisions})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn generation_receipts_fail_closed_for_malformed_or_other_command_request_ids() {
+    let f = Fixture::new().await;
+    f.trusted_fixture_evidence().await;
+    let expected = f.state().await.revisions;
+    for receipt in ["ordinary-command-hash", "generation:v1:invalid:not-a-uuid"] {
+        let request_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO workflow_receipts(interview_id,actor_hash,request_id,request_hash) VALUES($1,$2,$3,$4)")
+            .bind(f.id).bind(hash_secret(&f.customer)).bind(request_id).bind(receipt).execute(&f.pool).await.unwrap();
+        assert_eq!(
+            f.request(
+                "POST",
+                &f.path("generate"),
+                Some(&f.cookie(false)),
+                json!({"request_id":request_id,"expected":expected})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    f.close().await;
+}

@@ -327,3 +327,35 @@ async fn unvalidated_model_cannot_support_approval_but_unsupported_is_preserved(
     }
     db.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL"]
+async fn historical_duplicate_generation_cannot_read_inputs_or_overwrite_current_task() {
+    let db = Db::new().await;
+    let state = db.state().await;
+    let old = db.job("generate_draft", &state).await;
+    let latest = db.job("generate_draft", &state).await;
+    assert!(
+        workflow::composition_input(&db.pool, db.id, old.id, old.token)
+            .await
+            .is_err()
+    );
+    assert!(
+        workflow::complete_generation(
+            &db.pool,
+            db.id,
+            old.id,
+            old.token,
+            Some("Obsolete worker output.".into())
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        workflow::composition_input(&db.pool, db.id, latest.id, latest.token)
+            .await
+            .is_ok()
+    );
+    assert!(db.state().await.content.is_none());
+    db.close().await;
+}

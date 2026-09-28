@@ -37,10 +37,20 @@ pub enum GatewayError {
     RetryExhausted,
     #[error("gateway rate limit requires delayed retry")]
     RateLimited { retry_after_secs: u64 },
+    #[error("gateway account cannot access the selected model")]
+    ModelAccessDenied,
     #[error("gateway rejected request")]
     Rejected,
     #[error("gateway response exceeded size limit")]
     ResponseTooLarge,
+    #[error("gateway response envelope is invalid")]
+    InvalidEnvelope,
+    #[error("gateway response did not finish normally")]
+    IncompleteResponse,
+    #[error("gateway response is not plain JSON")]
+    InvalidJson,
+    #[error("gateway output does not match the required schema")]
+    InvalidSchema,
     #[error("gateway output failed validation")]
     InvalidOutput,
     #[error("explicit request budget exhausted")]
@@ -201,7 +211,8 @@ impl GatewayClient {
         task_prompt: &str,
         input: Value,
     ) -> Result<T, GatewayError> {
-        // No native response_format: configured Qwen model does not advertise it.
+        // Use prompt-produced JSON across configured models; native schema support
+        // must be checked for each selected model before enabling response_format.
         // No fallback list or JSON repair: model changes and malformed output fail closed.
         let body = json!({"model":self.model,"max_tokens":3000,"temperature":0,
             "messages":[{"role":"system","content":format!("{COMMON_PROMPT}\n{task_prompt}")},
@@ -271,6 +282,25 @@ impl GatewayClient {
                 continue;
             }
             if !status.is_success() {
+                // Inspect only bounded provider metadata for a known actionable
+                // rejection; never retain or expose the provider's error body.
+                if status == StatusCode::BAD_REQUEST {
+                    let mut rejection = Vec::new();
+                    while let Some(chunk) =
+                        response.chunk().await.map_err(|_| GatewayError::Rejected)?
+                    {
+                        if rejection.len() + chunk.len() > 16 * 1024 {
+                            return Err(GatewayError::Rejected);
+                        }
+                        rejection.extend_from_slice(&chunk);
+                    }
+                    if let Ok(value) = serde_json::from_slice::<Value>(&rejection)
+                        && value["metadata"]["errors"].as_array().is_some_and(|errors| errors.iter().any(|error| {
+                            error.as_str().is_some_and(|text| text.eq_ignore_ascii_case("Your account does not have access to this LLM Gateway model"))
+                        })) {
+                            return Err(GatewayError::ModelAccessDenied);
+                    }
+                }
                 return Err(GatewayError::Rejected);
             }
             if response
@@ -291,26 +321,34 @@ impl GatewayClient {
                 bytes.extend_from_slice(&chunk);
             }
             let envelope: Value =
-                serde_json::from_slice(&bytes).map_err(|_| GatewayError::InvalidOutput)?;
+                serde_json::from_slice(&bytes).map_err(|_| GatewayError::InvalidEnvelope)?;
             let choices = envelope
                 .get("choices")
                 .and_then(Value::as_array)
                 .filter(|c| c.len() == 1)
-                .ok_or(GatewayError::InvalidOutput)?;
+                .ok_or(GatewayError::InvalidEnvelope)?;
             if choices[0].get("finish_reason").and_then(Value::as_str) != Some("stop") {
-                return Err(GatewayError::InvalidOutput);
+                return Err(GatewayError::IncompleteResponse);
             }
             let message = &choices[0]["message"];
             if message.get("tool_calls").is_some_and(|v| !v.is_null())
                 || message.get("refusal").is_some_and(|v| !v.is_null())
             {
-                return Err(GatewayError::InvalidOutput);
+                return Err(GatewayError::InvalidEnvelope);
             }
             let content = message
                 .get("content")
                 .and_then(Value::as_str)
-                .ok_or(GatewayError::InvalidOutput)?;
-            return serde_json::from_str(content).map_err(|_| GatewayError::InvalidOutput);
+                .ok_or(GatewayError::InvalidEnvelope)?;
+            // Deserialize directly: going through Value would collapse duplicate keys
+            // and could hide malformed/ambiguous model output from strict validation.
+            return serde_json::from_str(content).map_err(|error| {
+                if error.is_data() {
+                    GatewayError::InvalidSchema
+                } else {
+                    GatewayError::InvalidJson
+                }
+            });
         }
         Err(GatewayError::RetryExhausted)
     }

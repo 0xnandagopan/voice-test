@@ -83,6 +83,7 @@ function ReviewWorkspace({ id }: { id: string }) {
   const [message, setMessage] = useState("");
   const [manualDraft, setManualDraft] = useState(false);
   const write = useMutation({
+    onMutate: () => clearActionErrors(),
     mutationFn: ({
       expected,
       action,
@@ -93,9 +94,15 @@ function ReviewWorkspace({ id }: { id: string }) {
     onSuccess: (result) => {
       client.setQueryData(workflowKey(id), result.state);
       client.setQueryData<Evidence>(evidenceKey(id), (old) =>
-        old ? { ...old, assessment: null } : old,
+        old
+          ? {
+              ...old,
+              assessment: null,
+              jobs: old.jobs.filter((job) => job.kind === "import_evidence"),
+            }
+          : old,
       );
-      setMessage("Saved on the server.");
+      setMessage("");
       void client.invalidateQueries({ queryKey: evidenceKey(id) });
     },
     onError: () => {
@@ -103,6 +110,7 @@ function ReviewWorkspace({ id }: { id: string }) {
     },
   });
   const generate = useMutation({
+    onMutate: () => clearActionErrors(),
     mutationFn: () =>
       api<{ job_id: string; state: WorkflowView }>(
         `${interviewPath(id)}/generate`,
@@ -110,9 +118,7 @@ function ReviewWorkspace({ id }: { id: string }) {
       ),
     onSuccess: (result) => {
       client.setQueryData(workflowKey(id), result.state);
-      setMessage(
-        "Draft preparation requested. This does not approve or publish anything.",
-      );
+      setMessage("");
       void client.invalidateQueries({ queryKey: evidenceKey(id) });
     },
     onError: () => {
@@ -120,6 +126,7 @@ function ReviewWorkspace({ id }: { id: string }) {
     },
   });
   const retry = useMutation({
+    onMutate: () => clearActionErrors(),
     mutationFn: (jobId: string) =>
       api<{ job_id: string; state: WorkflowView }>(
         `${interviewPath(id)}/retry`,
@@ -131,7 +138,24 @@ function ReviewWorkspace({ id }: { id: string }) {
       ),
     onSuccess: (result) => {
       client.setQueryData(workflowKey(id), result.state);
-      setMessage("Retry requested. Approval remains gated by the result.");
+      setMessage("");
+      client.setQueryData<Evidence>(evidenceKey(id), (old) =>
+        old
+          ? {
+              ...old,
+              jobs: old.jobs.map((job) =>
+                job.id === result.job_id
+                  ? {
+                      ...job,
+                      status: "queued",
+                      error_code: null,
+                      can_retry: false,
+                    }
+                  : job,
+              ),
+            }
+          : old,
+      );
       void client.invalidateQueries({ queryKey: evidenceKey(id) });
       void client.invalidateQueries({ queryKey: recoveryKey(id) });
     },
@@ -140,6 +164,7 @@ function ReviewWorkspace({ id }: { id: string }) {
     },
   });
   const confirmRecovery = useMutation({
+    onMutate: () => clearActionErrors(),
     mutationFn: () =>
       api<{ revision: number; confirmed: boolean }>(
         `${interviewPath(id)}/recovery/confirm`,
@@ -162,6 +187,12 @@ function ReviewWorkspace({ id }: { id: string }) {
       void client.invalidateQueries({ queryKey: workflowKey(id) });
     },
   });
+  function clearActionErrors(): void {
+    setMessage("");
+    for (const mutation of [write, generate, retry, confirmRecovery]) {
+      if (mutation.isError) mutation.reset();
+    }
+  }
   const errors = [
     workflow.error,
     evidence.error,
@@ -197,7 +228,15 @@ function ReviewWorkspace({ id }: { id: string }) {
     generate.isPending ||
     retry.isPending ||
     confirmRecovery.isPending;
-  const pendingJobs = evidence.data?.jobs.some((job) =>
+  // Independent polls may return old evidence after a cross-tab edit. Keep
+  // recording recovery visible, but never attach an old task to new text.
+  const currentJobs = (evidence.data?.jobs ?? []).filter(
+    (job) =>
+      job.kind === "import_evidence" ||
+      (evidence.data?.content_revision === state.revisions.content &&
+        evidence.data?.evidence_revision === state.revisions.evidence),
+  );
+  const pendingJobs = currentJobs.some((job) =>
     ["queued", "running"].includes(job.status),
   );
   const recordedSources = evidence.data?.sources.some(
@@ -205,14 +244,18 @@ function ReviewWorkspace({ id }: { id: string }) {
   );
   const insufficient =
     !state.content &&
-    evidence.data?.jobs.some(
+    currentJobs.some(
       (job) =>
         job.kind === "generate_draft" &&
         job.error_code === "insufficient_evidence",
     );
-  const failedJobs = evidence.data?.jobs.some((job) =>
-    ["failed", "cancelled"].includes(job.status),
-  );
+  const draftJob = currentJobs.find((job) => job.kind === "generate_draft");
+  const supportTaskVisible =
+    currentJobs.some(
+      (job) =>
+        job.kind === "support_check" &&
+        ["queued", "running", "failed"].includes(job.status),
+    ) ?? false;
   return (
     <>
       <div className="page-heading">
@@ -235,36 +278,11 @@ function ReviewWorkspace({ id }: { id: string }) {
         </Message>
       ))}
       {message && <Message>{message}</Message>}
-      {pendingJobs && (
-        <Message>
-          We are processing your recording or checking your text. Approval stays
-          unavailable until all required checks pass.
-        </Message>
-      )}
-      {failedJobs && (
-        <Message error>
-          A processing task did not finish. Available recordings remain below;
-          missing evidence cannot support approval.
-        </Message>
-      )}
-      {evidence.data?.jobs
-        .filter((job) => job.status === "failed")
-        .map((job, index) => (
-          <button
-            key={job.id}
-            className="secondary"
-            disabled={busy}
-            onClick={() => retry.mutate(job.id)}
-          >
-            Retry{" "}
-            {job.kind === "import_evidence"
-              ? "recording recovery"
-              : job.kind === "support_check"
-                ? "support check"
-                : "draft processing"}{" "}
-            {index + 1}
-          </button>
-        ))}
+      <ProcessingTasks
+        jobs={currentJobs}
+        busy={busy}
+        onRetry={(jobId) => retry.mutate(jobId)}
+      />
       {insufficient && (
         <Message>
           There is not enough recorded detail to prepare a supported draft. No
@@ -292,6 +310,7 @@ function ReviewWorkspace({ id }: { id: string }) {
             <Editor
               state={state}
               busy={busy}
+              supportTaskVisible={supportTaskVisible}
               write={async (expected, action) =>
                 (await write.mutateAsync({ expected, action })).state
               }
@@ -304,16 +323,26 @@ function ReviewWorkspace({ id }: { id: string }) {
                 sources. Recording alignment and support checks must pass before
                 approval. Nothing has been approved.
               </p>
-              <button
-                disabled={!recordedSources || busy || Boolean(pendingJobs)}
-                onClick={() => generate.mutate()}
-              >
-                {generate.isPending
-                  ? "Requesting draft…"
-                  : failedJobs
-                    ? "Retry draft preparation"
+              {!draftJob || draftJob.status === "succeeded" ? (
+                <button
+                  disabled={
+                    !recordedSources ||
+                    busy ||
+                    Boolean(pendingJobs) ||
+                    Boolean(insufficient)
+                  }
+                  onClick={() => generate.mutate()}
+                >
+                  {generate.isPending
+                    ? "Requesting draft…"
                     : "Prepare provisional draft"}
-              </button>
+                </button>
+              ) : (
+                <p>
+                  See draft preparation status above, or write your own draft
+                  below.
+                </p>
+              )}
               <button
                 className="secondary"
                 disabled={busy}
@@ -381,6 +410,127 @@ function ReviewWorkspace({ id }: { id: string }) {
         </section>
       </div>
     </>
+  );
+}
+type ProcessingJob = Evidence["jobs"][number];
+function taskCopy(job: ProcessingJob) {
+  const support = job.kind === "support_check";
+  const recovery = job.kind === "import_evidence";
+  const title = recovery
+    ? "Recording recovery"
+    : support
+      ? "Evidence check"
+      : "Draft preparation";
+  const retryLabel = recovery
+    ? "Retry recording recovery"
+    : support
+      ? "Retry evidence check"
+      : "Retry draft preparation";
+  if (["queued", "running"].includes(job.status)) {
+    const waiting = job.status === "queued";
+    return {
+      title,
+      retryLabel,
+      text: recovery
+        ? "Waiting for your recording to become available. You can leave this page and return later."
+        : support
+          ? `Your text is saved. ${waiting ? "The evidence check is queued" : "We are checking it against your recordings"}; approval will remain unavailable until checks pass.`
+          : `${waiting ? "Draft preparation is queued" : "We are preparing a draft from your recordings"}. You can leave this page and return later.`,
+    };
+  }
+  if (recovery)
+    return {
+      title,
+      retryLabel,
+      text: "One recording could not be recovered. Other available recordings remain below. Retry recovery to check again.",
+    };
+  const preserved = support
+    ? "Your text is saved. Approval remains unavailable."
+    : "Your recordings are unchanged. No generated draft was saved.";
+  let detail: string;
+  switch (job.error_code) {
+    case "gateway_model_access":
+      return {
+        title,
+        retryLabel: "Retry after operator update",
+        text: `${preserved} The operator's account cannot access the selected drafting model. The operator needs to enable access or choose an available model before you retry.`,
+      };
+    case "gateway_configuration":
+    case "gateway_request_rejected":
+      return {
+        title,
+        retryLabel: "Retry after operator update",
+        text: `${preserved} The drafting service needs attention from the operator before this can complete. Retrying without an update may fail again.`,
+      };
+    case "gateway_rate_limited":
+      detail = "The drafting service is busy. Please try again later.";
+      break;
+    case "gateway_unavailable":
+      detail =
+        "The drafting service could not be reached. Please try again later.";
+      break;
+    case "gateway_response_incomplete":
+      detail =
+        "The drafting service returned an incomplete response. You can retry.";
+      break;
+    case "generation_validation_failed":
+    case "gateway_response_invalid":
+    case "gateway_output_schema_invalid":
+    case "gateway_output_json_invalid":
+    case "gateway_response_too_large":
+      detail =
+        "The drafting service returned a response we could not verify. You can retry; if it repeats, contact the operator.";
+      break;
+    case "gateway_request_budget_exhausted":
+    case "composition_input_invalid":
+      detail =
+        "The available recorded text could not be processed. Please contact the operator.";
+      break;
+    default:
+      detail = support
+        ? "The automated evidence check did not finish. You can retry."
+        : "The draft could not be prepared. You can retry or write your own draft.";
+  }
+  return { title, retryLabel, text: `${preserved} ${detail}` };
+}
+function ProcessingTasks({
+  jobs,
+  busy,
+  onRetry,
+}: {
+  jobs: ProcessingJob[];
+  busy: boolean;
+  onRetry: (id: string) => void;
+}) {
+  return (
+    <div className="processing-tasks">
+      {jobs
+        .filter((job) => ["queued", "running", "failed"].includes(job.status))
+        .map((job) => {
+          const copy = taskCopy(job);
+          return (
+            <section
+              className={`notice processing-task ${job.status === "failed" ? "error" : ""}`}
+              key={job.id}
+              aria-label={copy.title}
+            >
+              <div role={job.status === "failed" ? "alert" : "status"}>
+                <strong>{copy.title}</strong>
+                <p>{copy.text}</p>
+              </div>
+              {job.status === "failed" && job.can_retry && (
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => onRetry(job.id)}
+                >
+                  {copy.retryLabel}
+                </button>
+              )}
+            </section>
+          );
+        })}
+    </div>
   );
 }
 function RecoveryStatus({
@@ -498,10 +648,12 @@ function RecoveryStatus({
 function Editor({
   state,
   busy,
+  supportTaskVisible,
   write,
 }: {
   state: WorkflowView;
   busy: boolean;
+  supportTaskVisible: boolean;
   write: (expected: Revisions, action: WorkflowAction) => Promise<WorkflowView>;
 }) {
   const [base, setBase] = useState(state);
@@ -534,9 +686,9 @@ function Editor({
     unsupported:
       "The saved text contains claims that are not supported. Edit it to match the recording and save for a fresh check.",
     ambiguous:
-      "Some claims are unclear against the recording. Clarify your text or correct the transcript, then save for a fresh check.",
+      "Support has not been verified for this saved text. Review any claim notes below; approval remains unavailable.",
     failed:
-      "The support check failed to complete. Your saved text is preserved; approval remains unavailable.",
+      "Your text is saved. The evidence check could not finish, so approval remains unavailable.",
   }[state.check];
   async function save() {
     try {
@@ -684,11 +836,13 @@ function Editor({
           Save changes
         </button>
       </form>
-      <Message
-        error={["unsupported", "ambiguous", "failed"].includes(state.check)}
-      >
-        {checkMessage}
-      </Message>
+      {!(supportTaskVisible && ["pending", "failed"].includes(state.check)) && (
+        <Message
+          error={["unsupported", "ambiguous", "failed"].includes(state.check)}
+        >
+          {checkMessage}
+        </Message>
+      )}
       {state.approval && (
         <Message>
           You approved this saved version. Publication is a separate operator

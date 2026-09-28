@@ -650,3 +650,13 @@ textarea {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.processing-task {
+  margin: 16px 0;
+}
+.processing-task p {
+  margin: 8px 0 12px;
+}
+.processing-task button {
+  white-space: normal;
+}
