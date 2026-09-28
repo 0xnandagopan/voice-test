@@ -700,6 +700,10 @@ function Interview() {
   const [stopped, setStopped] = useState(false);
   const [active, setActive] = useState(false);
   const [ended, setEnded] = useState(false);
+  const [completed, setCompleted] = useState(false);
+  const [budgetExhausted, setBudgetExhausted] = useState(false);
+  const [canFinish, setCanFinish] = useState(false);
+  const [finishing, setFinishing] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [remaining, setRemaining] = useState<number | null>(null);
   const [captions, setCaptions] = useState<
@@ -722,6 +726,9 @@ function Interview() {
     transport.current = null;
     setActive(false);
     setStopped(true);
+    setCanFinish(false);
+    setFinishing(false);
+    void session.refetch();
   }
   const start = useMutation({
     mutationFn: async () => {
@@ -751,8 +758,18 @@ function Interview() {
             onAudio,
             (event) => {
               if (attempt.signal.aborted) return;
-              if (event.type === "ready" || event.type === "state")
+              if (event.type === "ready" || event.type === "state") {
                 setRemaining(event.remaining_seconds);
+                setCanFinish(event.can_finish === true);
+              }
+              if (event.type === "control_rejected") {
+                setFinishing(false);
+                setError(
+                  new Error(
+                    "That control was not applied because the conversation changed. Check the current question and try again. You can still Stop at any time.",
+                  ),
+                );
+              }
               if (event.type === "caption")
                 setCaptions((previous) => ({
                   ...previous,
@@ -761,11 +778,19 @@ function Interview() {
               if (event.type === "ended") {
                 setActive(false);
                 setEnded(true);
+                setCompleted(event.reason === "explicit_finish");
+                setBudgetExhausted(event.reason === "budget_exhausted");
+                if (event.reason === "budget_exhausted") setRemaining(0);
+                setCanFinish(false);
+                setFinishing(false);
                 void session.refetch();
               }
               if (event.type === "error") {
                 setActive(false);
                 setEnded(true);
+                setCanFinish(false);
+                setFinishing(false);
+                void session.refetch();
                 setError(
                   new Error(
                     "The connection stopped. Your microphone has been released. Check recording recovery before continuing.",
@@ -785,6 +810,12 @@ function Interview() {
   });
   const scopeMismatch =
     session.data && pinnedInterview.current !== session.data.id;
+  const requiresRecovery = session.data?.state === "recovering";
+  const existingSession = session.data?.state === "interviewing" && !active;
+  const processing =
+    session.data?.state === "completed" ||
+    session.data?.state === "processing" ||
+    session.data?.state === "draft";
   return (
     <Shell>
       <Steps current={3} />
@@ -822,9 +853,11 @@ function Interview() {
             <h1>
               {active
                 ? "Tell us your story."
-                : ended
-                  ? "Review what was recovered."
-                  : "Ready when you are."}
+                : completed || session.data.state === "completed"
+                  ? "Your interview is complete."
+                  : ended || requiresRecovery
+                    ? "Review recording recovery."
+                    : "Ready when you are."}
             </h1>
             <p>
               Three topics. Up to{" "}
@@ -850,13 +883,45 @@ function Interview() {
             )}
             {ended && (
               <Notice>
-                The conversation has ended. Available recordings may still be
-                recovering.
+                {completed
+                  ? "The server confirmed the interview is complete. Recording recovery may still be in progress; completion does not approve or publish a testimonial."
+                  : budgetExhausted
+                    ? "Your six-minute interview allowance is used. Recording has stopped. Review the available recording; reconnecting cannot reset the allowance."
+                    : "The connection has ended. Review recording recovery before continuing. Available recordings may still be recovering."}
+              </Notice>
+            )}
+            {requiresRecovery && !ended && (
+              <Notice>
+                Review and acknowledge recording recovery before starting again.
+                Your used time and question counts are preserved.
+              </Notice>
+            )}
+            {existingSession && (
+              <Notice>
+                A conversation may still be active or awaiting recovery. No
+                microphone is active in this tab. Review recording recovery
+                before trying again.
+              </Notice>
+            )}
+            {processing && !ended && (
+              <Notice>
+                Your interview is ready for recording review. No recording
+                starts automatically.
               </Notice>
             )}
             <div className="actions">
               <button
-                disabled={start.isPending || active || ended || stopped}
+                disabled={
+                  start.isPending ||
+                  active ||
+                  ended ||
+                  stopped ||
+                  requiresRecovery ||
+                  existingSession ||
+                  processing ||
+                  !session.data.voice_available ||
+                  session.data.remaining_seconds <= 0
+                }
                 onClick={() => {
                   setError(null);
                   setStopped(false);
@@ -872,6 +937,7 @@ function Interview() {
                 <>
                   <button
                     className="secondary"
+                    disabled={finishing}
                     onClick={() => {
                       try {
                         transport.current?.control("repeat");
@@ -884,6 +950,7 @@ function Interview() {
                   </button>
                   <button
                     className="secondary"
+                    disabled={finishing}
                     onClick={() => {
                       try {
                         transport.current?.control("skip");
@@ -893,6 +960,31 @@ function Interview() {
                     }}
                   >
                     Skip topic
+                  </button>
+                  <button
+                    disabled={!canFinish || finishing}
+                    onClick={() => {
+                      try {
+                        if (!transport.current)
+                          throw new Error(
+                            "The voice connection is unavailable.",
+                          );
+                        transport.current.control("finish");
+                        setFinishing(true);
+                        setError(null);
+                      } catch (reason) {
+                        setFinishing(false);
+                        setError(
+                          reason instanceof Error
+                            ? reason
+                            : new Error(
+                                "Finish could not be requested. You can still Stop at any time.",
+                              ),
+                        );
+                      }
+                    }}
+                  >
+                    {finishing ? "Finishing…" : "Finish interview"}
                   </button>
                 </>
               )}

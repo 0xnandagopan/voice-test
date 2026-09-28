@@ -323,7 +323,7 @@ pub async fn confirm_recovery(
         ));
     }
     let mut tx = s.pool.begin().await?;
-    let row=sqlx::query("SELECT revision,state,expires_at,deleted_at,lease_expires_at FROM interviews WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await?;
+    let row=sqlx::query("SELECT revision,state,expires_at,deleted_at,lease_expires_at,time_consumed_seconds,completed_at FROM interviews WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await?;
     let authorized:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND role='customer' AND interview_id=$2 AND expires_at>clock_timestamp())").bind(auth::hash_secret(&t)).bind(id).fetch_one(&mut *tx).await?;
     let fingerprint = auth::hash_secret(
         &serde_json::to_value(&r)
@@ -351,7 +351,11 @@ pub async fn confirm_recovery(
             json!({"revision":row.get::<i64,_>("revision"),"confirmed":true}),
         ));
     }
-    if row.get::<String, _>("state") != "recovering"
+    if row.get::<i32, _>("time_consumed_seconds") >= 360
+        || row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+            .is_some()
+        || row.get::<String, _>("state") != "recovering"
         || row.get::<i64, _>("revision") != r.expected_revision
         || row
             .get::<Option<chrono::DateTime<chrono::Utc>>, _>("lease_expires_at")

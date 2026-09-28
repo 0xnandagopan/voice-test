@@ -14,6 +14,24 @@ pub async fn acquire(
     interview: Uuid,
     expected_revision: i64,
 ) -> Result<InterviewLease, ApiError> {
+    acquire_inner(pool, interview, expected_revision, None).await
+}
+/// Browser acquisition requires explicit consent/recovery acknowledgement.
+/// Native resume remains a separate trusted path and cannot bypass this check.
+pub async fn acquire_customer(
+    pool: &PgPool,
+    token: &str,
+    interview: Uuid,
+    expected_revision: i64,
+) -> Result<InterviewLease, ApiError> {
+    acquire_inner(pool, interview, expected_revision, Some(token)).await
+}
+async fn acquire_inner(
+    pool: &PgPool,
+    interview: Uuid,
+    expected_revision: i64,
+    customer: Option<&str>,
+) -> Result<InterviewLease, ApiError> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR UPDATE")
         .bind(interview)
@@ -34,6 +52,20 @@ pub async fn acquire(
             .is_none()
     {
         return Err(ApiError::invalid("Recording consent is required."));
+    }
+    if let Some(token) = customer {
+        let valid:bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND interview_id=$2 AND role='customer' AND expires_at>clock_timestamp())")
+            .bind(crate::auth::hash_secret(token)).bind(interview).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(ApiError::unauthorized());
+        }
+        if state != "consented"
+            || row
+                .get::<Option<DateTime<Utc>>, _>("completed_at")
+                .is_some()
+        {
+            return Err(ApiError::conflict());
+        }
     }
     if row.get::<i64, _>("revision") != expected_revision {
         return Err(ApiError::conflict());
@@ -85,12 +117,16 @@ pub async fn heartbeat(
         return Err(ApiError::expired());
     }
     let since: DateTime<Utc> = row.get("active_since");
-    let elapsed = (((now - since).num_milliseconds().clamp(0, 360_000) + 999) / 1000) as i32;
-    let consumed = (row.get::<i32, _>("time_consumed_seconds") + elapsed).min(360);
-    sqlx::query("UPDATE interviews SET time_consumed_seconds=$4, active_since=clock_timestamp(), lease_expires_at=clock_timestamp()+make_interval(secs => $5), state=CASE WHEN $4>=360 THEN 'recovering' ELSE state END WHERE id=$1 AND lease_id=$2 AND lease_generation=$3")
-        .bind(interview).bind(lease_id).bind(generation).bind(consumed).bind((360-consumed).min(30) as f64).execute(&mut *tx).await?;
+    let baseline: i32 = row.get("time_consumed_seconds");
+    let deadline = since + chrono::Duration::seconds(i64::from(360 - baseline));
+    let remaining_ms = (deadline - now).num_milliseconds().max(0);
+    let remaining = ((remaining_ms + 999) / 1000).min(360) as i32;
+    // Keep the original attempt clock. Rounding each heartbeat to whole seconds
+    // would repeatedly charge fractional seconds and shorten a six-minute call.
+    sqlx::query("UPDATE interviews SET lease_expires_at=LEAST($4,clock_timestamp()+interval '30 seconds') WHERE id=$1 AND lease_id=$2 AND lease_generation=$3")
+        .bind(interview).bind(lease_id).bind(generation).bind(deadline).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(360 - consumed)
+    Ok(remaining)
 }
 
 pub async fn release(

@@ -75,22 +75,27 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
   await customerPage
     .getByRole("button", { name: "Continue to conversation" })
     .click();
-  const startResponse = customerPage.waitForResponse(
-    (response) => new URL(response.url()).pathname === "/api/customer/start",
+  await expect(
+    customerPage.getByRole("button", { name: "Start interview", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    customerPage.getByText(/Live interviews are not ready/),
+  ).toBeVisible();
+  // UI availability is advisory: the API must independently reject a direct Start.
+  const session = await (
+    await customer.request.get(new URL("/api/customer/session", url).href)
+  ).json();
+  const unavailable = await customer.request.post(
+    new URL("/api/customer/start", url).href,
+    {
+      headers: { Origin: new URL(url).origin },
+      data: { interview_id: session.id, expected_revision: session.revision },
+    },
   );
-  await customerPage
-    .getByRole("button", { name: "Start interview", exact: true })
-    .click();
-  const unavailable = await startResponse;
   expect(unavailable.status()).toBe(503);
   expect((await unavailable.json()).error.code).toMatch(
     /^(provider_unavailable|not_ready)$/,
   );
-  expect(unavailable.request().postDataJSON()).toMatchObject({
-    interview_id: new URL(url).pathname.split("/").pop(),
-    expected_revision: expect.any(Number),
-  });
-  await expect(customerPage.getByRole("alert")).toBeVisible();
   expect(
     await customerPage.evaluate(
       () => (window as unknown as { micCalls: number }).micCalls,

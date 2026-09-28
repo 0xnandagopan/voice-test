@@ -16,8 +16,15 @@ use v0_app::{
 type Result<T> = std::result::Result<T, &'static str>;
 
 async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) -> Result<()> {
-    let controls = env::var("VOICE_RELAY_CASE").as_deref() == Ok("controls_loss");
-    summary["case"] = json!(if controls {
+    let case = env::var("VOICE_RELAY_CASE").unwrap_or_default();
+    let controls = case == "controls_loss";
+    let mid_skip = case == "mid_skip_finish";
+    let cap = case == "full_cap";
+    summary["case"] = json!(if mid_skip {
+        "mid_skip_repeat_finish"
+    } else if cap {
+        "full_elapsed_cap"
+    } else if controls {
         "repeat_skip_loss"
     } else {
         "fragmented_stop"
@@ -53,7 +60,7 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
         .build()
         .map_err(|_| "http_client")?;
     let cookie = format!("customer_session={secret}");
-    let outcome=timeout(Duration::from_secs(70),async {
+    let outcome=timeout(Duration::from_secs(if cap {400} else {100}),async {
         let denied=http.post("http://127.0.0.1:3000/api/customer/start").header("Origin",origin).header("Cookie",&cookie).json(&json!({"interview_id":id,"expected_revision":1})).send().await.map_err(|_|"start_before_consent_transport")?;
         summary["before_consent_status"]=json!(denied.status().as_u16());
         if denied.status()!=reqwest::StatusCode::BAD_REQUEST {return Err("start_before_consent_not_denied");}
@@ -73,6 +80,7 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
         };
         let mut bad=make_request();bad.headers_mut().insert("Origin","https://untrusted.invalid".parse().unwrap());
         summary["cross_origin_upgrade_rejected"]=json!(tokio_tungstenite::connect_async(bad).await.is_err());
+        let started=tokio::time::Instant::now();
         let (mut socket,_)=tokio_tungstenite::connect_async(make_request()).await.map_err(|_|"relay_connect")?;
         let pcm=fs::read(env::var("VOICE_PROBE_PCM").map_err(|_|"synthetic_pcm_path")?).map_err(|_|"synthetic_pcm_read")?;
         if pcm.is_empty()||pcm.len()>720000||pcm.len()%2!=0{return Err("synthetic_pcm_bounds");}
@@ -96,7 +104,14 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
                             summary["duplicate_socket_rejected"]=json!(duplicate["type"]=="error"&&duplicate["code"]=="conflict");
                         }
                         Some("caption") if event["speaker"]=="interviewer" && event["final"]==true=>{
-                            if !greeting {greeting=true;feeding=true;} else if answer_finals>0 {
+                            if !greeting {greeting=true;feeding= !cap;} else if mid_skip {
+                                match control_stage {
+                                    1=>{skip_text=event["text"].as_str().map(str::to_owned);repeat_text=skip_text.clone();socket.send(Message::Text(json!({"type":"control","request_id":Uuid::new_v4(),"action":"repeat","expected_revision":revision,"expected_progress_revision":progress_revision}).to_string().into())).await.map_err(|_|"mid_repeat_send")?;control_stage=2;}
+                                    2=>{summary["repeat_exact_text"]=json!(event["text"].as_str()==repeat_text.as_deref());socket.send(Message::Text(json!({"type":"control","request_id":Uuid::new_v4(),"action":"skip","expected_revision":revision,"expected_progress_revision":progress_revision}).to_string().into())).await.map_err(|_|"result_skip_send")?;control_stage=3;}
+                                    3=>{socket.send(Message::Text(json!({"type":"control","request_id":Uuid::new_v4(),"action":"skip","expected_revision":revision,"expected_progress_revision":progress_revision}).to_string().into())).await.map_err(|_|"completion_skip_send")?;control_stage=4;}
+                                    _=>{}
+                                }
+                            } else if answer_finals>0 {
                                 answer_reply=true;
                                 if controls {
                                     match control_stage {
@@ -109,13 +124,16 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
                             }
                         }
                         Some("caption") if event["speaker"]=="customer" && event["final"]==true=>{answer_finals+=1;}
+                        Some("caption") if event["speaker"]=="customer" && event["final"]==false && mid_skip && control_stage==0=>{socket.send(Message::Text(json!({"type":"control","request_id":Uuid::new_v4(),"action":"skip","expected_revision":revision,"expected_progress_revision":progress_revision}).to_string().into())).await.map_err(|_|"mid_utterance_skip_send")?;control_stage=1;summary["skip_during_provisional_answer"]=json!(true);}
+                        Some("state") if mid_skip && control_stage==4 && event["can_finish"]==true=>{socket.send(Message::Text(json!({"type":"control","request_id":Uuid::new_v4(),"action":"finish","expected_revision":revision,"expected_progress_revision":progress_revision}).to_string().into())).await.map_err(|_|"finish_send")?;control_stage=5;stopped=true;}
                         Some("caption") if event["speaker"]=="customer" && event["final"]==false && controls && control_stage==3=>{abrupt=true;break;}
                         Some("audio") if answer_finals>0=>{reply_audio+=1;}
                         Some("error")=>return Err("relay_error_event"),
+                        Some("control_rejected")=>return Err("relay_control_rejected"),
                         Some("ended")=>{summary["ended_reason"]=event["reason"].clone();summary["recovery_pending"]=event["recovery_pending"].clone();break;}
                         _=>{}
                     }
-                    if !controls && answer_reply && sent==frames.len() && !stopped {
+                    if !controls && !mid_skip && !cap && answer_reply && sent==frames.len() && !stopped {
                         socket.send(Message::Text(json!({"type":"stop","request_id":Uuid::new_v4()}).to_string().into())).await.map_err(|_|"stop_transport")?;stopped=true;
                     }
                 }
@@ -132,6 +150,7 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
             let _=timeout(Duration::from_secs(12),async {while socket.next().await.is_some(){}}).await;
             let _=socket.close(None).await;
         }
+        summary["elapsed_seconds"]=json!(started.elapsed().as_secs_f64());
         summary["abrupt_disconnect"]=json!(abrupt);summary["control_stage"]=json!(control_stage);summary["skip_changes_question"]=json!(skip_text.is_some()&&skip_text!=repeat_text);summary["first_input_frames_sent"]=json!(first_input_frames);
         summary["ready"]=json!(ready);summary["greeting_delivered"]=json!(greeting);summary["input_frames_sent"]=json!(sent);summary["input_frames_total"]=json!(frames.len());summary["answer_final_events"]=json!(answer_finals);summary["reply_audio_frames"]=json!(reply_audio);summary["answer_reply_delivered"]=json!(answer_reply);summary["explicit_stop_sent"]=json!(stopped);
         observed?;
@@ -139,6 +158,14 @@ async fn journey(pool: &PgPool, origin: &str, key: String, summary: &mut Value) 
         summary["state"]=json!(row.get::<String,_>("state"));summary["lease_released"]=json!(row.get::<Option<Uuid>,_>("lease_id").is_none());summary["completed_answers"]=json!(row.get::<i32,_>("completed_answers"));summary["followups"]=row.get::<Value,_>("followup_counts");summary["product_end_reason"]=json!(row.get::<Option<String>,_>("product_end_reason"));summary["provider_agent_deleted"]=json!(row.get::<Option<String>,_>("provider_agent_id").is_none()&&row.get::<Option<String>,_>("provider_agent_name").is_none());
         summary["consumed_seconds"]=json!(row.get::<i32,_>("time_consumed_seconds"));summary["topic"]=json!(row.get::<i32,_>("topic_index"));summary["incomplete_turn_count"]=json!(row.get::<Value,_>("incomplete_turn_ids").as_array().map(Vec::len));
         let kinds:Vec<String>=sqlx::query_scalar("SELECT kind FROM jobs WHERE interview_id=$1 ORDER BY kind").bind(id).fetch_all(pool).await.map_err(|_|"durable_jobs")?;summary["durable_jobs"]=json!(kinds);
+        if cap {
+            if !ready||!greeting||sent!=0||summary["product_end_reason"]!="budget_exhausted"||summary["consumed_seconds"]!=360||summary["lease_released"]!=true||summary["provider_agent_deleted"]!=true||!(355.0..=385.0).contains(&started.elapsed().as_secs_f64()){return Err("full_cap_acceptance_failed");}
+            return Ok(());
+        }
+        if mid_skip {
+            if !ready||!greeting||control_stage!=5||answer_finals==0||summary["product_end_reason"]!="explicit_finish"||summary["state"]!="completed"||summary["topic"]!=3||summary["completed_answers"]!=0||summary["followups"]!=json!([0,0,0])||summary["repeat_exact_text"]!=true||summary["lease_released"]!=true||summary["provider_agent_deleted"]!=true {return Err("mid_skip_finish_acceptance_failed");}
+            return Ok(());
+        }
         if !ready||!greeting||!answer_reply||reply_audio==0||(!controls&&sent!=frames.len())||summary["completed_answers"]!=1||summary["lease_released"]!=true||summary["product_end_reason"]!=if controls {"transport_lost"} else {"explicit_stop"}||summary["provider_agent_deleted"]!=true||summary["cross_origin_upgrade_rejected"]!=true||summary["duplicate_socket_rejected"]!=true {return Err("relay_acceptance_failed");}
         if controls && (!abrupt||control_stage!=3||summary["repeat_exact_text"]!=true||summary["skip_changes_question"]!=true||summary["topic"]!=1||summary["followups"]!=json!([1,0,0])||summary["consumed_seconds"].as_i64().is_none_or(|n|!(320..=360).contains(&n))||summary["incomplete_turn_count"].as_u64().is_none_or(|n|n==0)){return Err("controls_loss_acceptance_failed");}
         Ok::<(),&'static str>(())

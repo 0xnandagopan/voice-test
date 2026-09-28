@@ -288,6 +288,14 @@ pub async fn finalize_relay(
         .map(|s| (((until - s).num_milliseconds().clamp(0, 360000) + 999) / 1000) as i32)
         .unwrap_or(0);
     let consumed = (row.get::<i32, _>("time_consumed_seconds") + elapsed).min(360);
+    let finished = reason == v0_domain::workflow::AttemptEndReason::ExplicitFinish;
+    if finished
+        && (row.get::<i32, _>("topic_index") < 3
+            || row.get::<Option<String>, _>("incomplete_turn").is_some()
+            || !incomplete_turn_ids.is_empty())
+    {
+        return Err(ApiError::conflict());
+    }
     let encoded = serde_json::to_value(reason).map_err(|_| ApiError::conflict())?;
     let available = row.get::<Option<DateTime<Utc>>, _>("deleted_at").is_none()
         && row.get::<DateTime<Utc>, _>("expires_at") > now
@@ -295,8 +303,15 @@ pub async fn finalize_relay(
             row.get::<String, _>("state").as_str(),
             "revoked" | "deleted"
         );
-    let mapped=sqlx::query("UPDATE provider_attempts SET product_end_reason=COALESCE(product_end_reason,$4),ended_at=COALESCE(ended_at,clock_timestamp()),state='ended',incomplete_turn_ids=$5 WHERE id=$1 AND interview_id=$2 AND lease_generation=$3 RETURNING provider_session_id").bind(attempt).bind(id).bind(generation).bind(encoded.as_str().ok_or_else(ApiError::conflict)?).bind(serde_json::json!(incomplete_turn_ids)).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
-    sqlx::query("UPDATE interviews SET time_consumed_seconds=$2,active_since=NULL,lease_id=NULL,lease_expires_at=NULL,state=CASE WHEN $3 THEN 'recovering' ELSE state END,revision=revision+1 WHERE id=$1").bind(id).bind(consumed).bind(available).execute(&mut *tx).await?;
+    if finished && !available {
+        return Err(ApiError::conflict());
+    }
+    let mapped=sqlx::query("UPDATE provider_attempts SET product_end_reason=COALESCE(product_end_reason,$4),ended_at=COALESCE(ended_at,clock_timestamp()),state='ended',incomplete_turn_ids=(SELECT COALESCE(jsonb_agg(DISTINCT value),'[]'::jsonb) FROM jsonb_array_elements(incomplete_turn_ids || $5::jsonb)) WHERE id=$1 AND interview_id=$2 AND lease_generation=$3 AND (NOT $6 OR incomplete_turn_ids='[]'::jsonb) RETURNING provider_session_id").bind(attempt).bind(id).bind(generation).bind(encoded.as_str().ok_or_else(ApiError::conflict)?).bind(serde_json::json!(incomplete_turn_ids)).bind(finished).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    sqlx::query("UPDATE interviews SET time_consumed_seconds=$2,active_since=NULL,lease_id=NULL,lease_expires_at=NULL,state=CASE WHEN $3 AND $4 THEN 'completed' WHEN $3 THEN 'recovering' ELSE state END,completed_at=CASE WHEN $3 AND $4 THEN COALESCE(completed_at,$5) ELSE completed_at END,expires_at=CASE WHEN $3 AND $4 AND completed_at IS NULL THEN $5+interval '30 days' ELSE expires_at END,revision=revision+1,updated_at=clock_timestamp() WHERE id=$1")
+        .bind(id).bind(consumed).bind(available).bind(finished).bind(now).execute(&mut *tx).await?;
+    if available && finished {
+        sqlx::query("UPDATE sessions SET expires_at=(SELECT expires_at FROM interviews WHERE id=$1) WHERE interview_id=$1 AND role='customer'").bind(id).execute(&mut *tx).await?;
+    }
     if available
         && mapped
             .get::<Option<String>, _>("provider_session_id")

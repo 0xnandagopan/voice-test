@@ -8,6 +8,7 @@ export type SessionView = {
     | "consented"
     | "interviewing"
     | "recovering"
+    | "completed"
     | "processing"
     | "draft"
     | "deleted"

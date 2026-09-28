@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Protocol observations: official AssemblyAI events-reference and
-/// turn-detection-and-interruptions, checked 2026-09-27. Unknown events fail soft.
+/// turn-detection-and-interruptions, checked 2026-09-28. Unknown events fail soft.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ProviderEvent {
@@ -14,6 +14,8 @@ pub enum ProviderEvent {
     Error { code: String },
     #[serde(rename = "input.speech.started")]
     SpeechStarted,
+    #[serde(rename = "input.speech.stopped")]
+    SpeechStopped,
     #[serde(rename = "reply.started")]
     ReplyStarted { reply_id: String, item_id: String },
     #[serde(rename = "reply.audio")]

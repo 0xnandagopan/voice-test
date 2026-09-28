@@ -118,12 +118,14 @@ test("customer consent gates microphone; fragment removed; denial retries with s
   await page.getByRole("button", { name: "Play test tone" }).click();
   await page.getByRole("checkbox", { name: "I heard the test tone." }).check();
   await page.getByRole("button", { name: "Continue to conversation" }).click();
-  await page
-    .getByRole("button", { name: "Start interview", exact: true })
-    .click();
-  await expect(page.getByRole("alert")).toHaveText(
-    "Live voice is not configured. No recording has started.",
-  );
+  await expect(
+    page.getByRole("button", { name: "Start interview", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    page.getByText("Live interviews are not ready in this build.", {
+      exact: false,
+    }),
+  ).toBeVisible();
   expect(
     await page.evaluate(
       () => (window as unknown as { micCalls: number }).micCalls,

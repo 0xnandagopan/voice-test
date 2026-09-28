@@ -1170,24 +1170,48 @@ async fn delayed_pre_skip_answer_cannot_advance_new_topic() {
     voice_hook::control_question(&d.pool, &d.customer, control)
         .await
         .unwrap();
-    assert!(
+    // The callback can render the selected topic using retained old history.
+    let response = response_json(
         voice_hook::complete(&d.pool, attempt, &secret, completion_request(&users))
             .await
-            .is_err()
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "What changed when you worked with the agency?"
     );
-    assert!(
-        voice_hook::authorize_answer(
-            &d.pool,
-            attempt,
-            old,
-            "late-final",
-            &users[0],
-            lease.lease_id,
-            lease.generation
-        )
+    voice_hook::mark_incomplete(
+        &d.pool,
+        attempt,
+        "late-final",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    voice_hook::authorize_answer(
+        &d.pool,
+        attempt,
+        old,
+        "late-final",
+        "The setup still took some time.",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    let users = vec![users[0].clone(), "The setup still took some time.".into()];
+    voice_hook::complete(&d.pool, attempt, &secret, completion_request(&users))
         .await
-        .is_err()
-    );
+        .unwrap();
+    let pending: Value =
+        sqlx::query_scalar("SELECT incomplete_turn_ids FROM provider_attempts WHERE id=$1")
+            .bind(attempt)
+            .fetch_one(&d.pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, json!([]));
     let counts: Value = sqlx::query_scalar("SELECT followup_counts FROM interviews WHERE id=$1")
         .bind(d.id)
         .fetch_one(&d.pool)
@@ -1202,10 +1226,8 @@ async fn delayed_pre_skip_answer_cannot_advance_new_topic() {
     assert_eq!(topic, 1);
     // Provider history retains the abandoned earlier utterance; it cannot be
     // silently rewritten or promoted into a new answer by the callback.
-    let fresh = vec![
-        users[0].clone(),
-        "Answer to the current change question".into(),
-    ];
+    let mut fresh = users;
+    fresh.push("Answer to the current change question".into());
     admitted_completion(&d.pool, attempt, &secret, completion_request(&fresh))
         .await
         .unwrap();
@@ -1473,5 +1495,128 @@ async fn callback_can_wait_for_trusted_final_but_cannot_admit_its_own_text() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+    d.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn finish_requires_current_revisions_scope_lease_and_no_provisional_items() {
+    use v0_app::voice_hook;
+    let d = Db::new().await;
+    let lease = leases::acquire(&d.pool, d.id, 1).await.unwrap();
+    let attempt = Uuid::new_v4();
+    progress::prepare_attempt(&d.pool, d.id, lease.lease_id, lease.generation, attempt)
+        .await
+        .unwrap();
+    voice_hook::bind(&d.pool, d.id, attempt, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    progress::map_attempt(
+        &d.pool,
+        d.id,
+        lease.lease_id,
+        lease.generation,
+        attempt,
+        "synthetic-finish",
+    )
+    .await
+    .unwrap();
+    let mut command = VoiceControlRequest {
+        interview_id: d.id,
+        request_id: Uuid::new_v4(),
+        expected_revision: 2,
+        expected_progress_revision: 1,
+        lease_id: lease.lease_id,
+        lease_generation: lease.generation,
+        action: VoiceAction::Finish,
+    };
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.customer, &command)
+            .await
+            .is_err()
+    );
+    // Topic exhaustion is a fixture here; the bounded topic progression is
+    // independently exercised by the full trusted-answer hook tests.
+    sqlx::query("UPDATE interviews SET topic_index=3 WHERE id=$1")
+        .bind(d.id)
+        .execute(&d.pool)
+        .await
+        .unwrap();
+    command.expected_progress_revision =
+        sqlx::query_scalar("SELECT progress_revision FROM interviews WHERE id=$1")
+            .bind(d.id)
+            .fetch_one(&d.pool)
+            .await
+            .unwrap();
+    voice_hook::validate_finish(&d.pool, &d.customer, &command)
+        .await
+        .unwrap();
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.operator, &command)
+            .await
+            .is_err()
+    );
+    command.expected_revision -= 1;
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.customer, &command)
+            .await
+            .is_err()
+    );
+    command.expected_revision += 1;
+    command.expected_progress_revision += 1;
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.customer, &command)
+            .await
+            .is_err()
+    );
+    command.expected_progress_revision -= 1;
+    command.lease_id = Uuid::new_v4();
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.customer, &command)
+            .await
+            .is_err()
+    );
+    command.lease_id = lease.lease_id;
+    voice_hook::mark_incomplete(
+        &d.pool,
+        attempt,
+        "unfinished-item",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    voice_hook::mark_incomplete(
+        &d.pool,
+        attempt,
+        "unfinished-item",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    let pending: Value =
+        sqlx::query_scalar("SELECT incomplete_turn_ids FROM provider_attempts WHERE id=$1")
+            .bind(attempt)
+            .fetch_one(&d.pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, json!(["unfinished-item"]));
+    assert!(
+        voice_hook::validate_finish(&d.pool, &d.customer, &command)
+            .await
+            .is_err()
+    );
+    assert!(
+        voice_hook::mark_incomplete(
+            &d.pool,
+            attempt,
+            "wrong-generation",
+            lease.lease_id,
+            lease.generation + 1
+        )
+        .await
+        .is_err()
+    );
     d.close().await;
 }

@@ -148,7 +148,8 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
         attempts: vec![],
         recorded_utterances: vec![],
         unresolved_answers: vec![],
-        requires_customer_confirmation: true,
+        requires_customer_confirmation: state.get::<String, _>("state") != "completed"
+            && state.get::<i32, _>("time_consumed_seconds") < 360,
         may_advance_progress: false,
         recommended_action: "confirm_recovered_answers_before_resume".into(),
     };
@@ -245,6 +246,9 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
             .any(|a| a.recommended_action == "confirm_last_answer_or_repeat")
     {
         result.recommended_action = "confirm_recovered_answers_and_repeat_unresolved".into();
+    }
+    if !result.requires_customer_confirmation {
+        result.recommended_action = "review_available_recordings".into();
     }
     let still_current: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
         .bind(expires)

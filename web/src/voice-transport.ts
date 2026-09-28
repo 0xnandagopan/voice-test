@@ -4,6 +4,7 @@ export type RelayState = {
   revision: number;
   progress_revision: number;
   remaining_seconds: number;
+  can_finish: boolean;
 };
 export type RelayEvent =
   | ({ type: "ready"; attempt_id: string } & RelayState)
@@ -16,9 +17,10 @@ export type RelayEvent =
       final: boolean;
     }
   | { type: "ended"; reason: string; recovery_required: boolean }
-  | { type: "error"; code: string };
+  | { type: "error"; code: string }
+  | { type: "control_rejected"; code: string };
 export type RelayTransport = VoiceTransport & {
-  control(action: "skip" | "repeat"): void;
+  control(action: "skip" | "repeat" | "finish"): void;
 };
 /** Only a same-origin application relay can receive microphone audio. */
 export function connectRelay(
@@ -114,6 +116,10 @@ export function connectRelay(
                 close,
                 control(action) {
                   if (!latest) throw new Error("Voice session is not ready.");
+                  if (action === "finish" && latest.can_finish !== true)
+                    throw new Error(
+                      "The interview is not ready to finish yet.",
+                    );
                   send({
                     type: "control",
                     request_id: crypto.randomUUID(),
@@ -130,6 +136,7 @@ export function connectRelay(
             latest = event;
             onEvent(event);
             break;
+          case "control_rejected":
           case "caption":
             onEvent(event);
             break;

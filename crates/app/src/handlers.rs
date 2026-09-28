@@ -115,7 +115,19 @@ fn view(state: &AppState, row: &PgRow) -> SessionView {
         consented_at: row.get("consented_at"),
         consent_policy_version: CONSENT_POLICY_VERSION.into(),
         expires_at: row.get("expires_at"),
-        remaining_seconds: 360 - row.get::<i32, _>("time_consumed_seconds"),
+        remaining_seconds: {
+            let elapsed = row
+                .get::<Option<DateTime<Utc>>, _>("active_since")
+                .map(|at| {
+                    let until = row
+                        .get::<Option<DateTime<Utc>>, _>("lease_expires_at")
+                        .unwrap_or_else(Utc::now)
+                        .min(Utc::now());
+                    ((until - at).num_milliseconds().clamp(0, 360000) / 1000) as i32
+                })
+                .unwrap_or(0);
+            (360 - row.get::<i32, _>("time_consumed_seconds") - elapsed).max(0)
+        },
         voice_available: state.controlled_voice_origin.is_some(),
     }
 }

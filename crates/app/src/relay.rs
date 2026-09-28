@@ -37,6 +37,59 @@ enum BrowserEvent {
     },
 }
 
+/// Tracks provider reply lifecycle independently of browser playback. A control
+/// waits for the superseded reply to drain before requesting its replacement.
+struct ReplyGate {
+    identity: Option<String>,
+    active: bool,
+    requested: bool,
+    suppressed: bool,
+    pending_control: bool,
+}
+impl ReplyGate {
+    fn greeting() -> Self {
+        Self {
+            identity: None,
+            active: false,
+            requested: true,
+            suppressed: false,
+            pending_control: false,
+        }
+    }
+    fn control(&mut self) {
+        self.suppressed = true;
+        self.pending_control = true;
+    }
+    fn requested_replacement(&mut self) {
+        self.pending_control = false;
+        self.requested = true;
+    }
+    fn final_answer(&mut self) {
+        // Providers can finalize another fragment of the same answer after
+        // reply.started. That does not promise a second reply.started event.
+        // Keep waiting only when no reply is currently serving that answer.
+        if !self.active {
+            self.requested = true;
+        }
+    }
+    fn started(&mut self, id: String) {
+        self.identity = Some(id);
+        self.active = true;
+        self.requested = false;
+        self.suppressed = self.pending_control;
+    }
+    fn done(&mut self, id: &str, interrupted: bool) -> bool {
+        if self.identity.as_deref() != Some(id) {
+            return false;
+        }
+        self.active = false;
+        if interrupted {
+            self.suppressed = true;
+        }
+        true
+    }
+}
+
 async fn emit(socket: &mut WebSocket, value: Value) -> Result<(), ApiError> {
     timeout(
         Duration::from_secs(2),
@@ -66,10 +119,16 @@ async fn current_access(
     }
     Ok(())
 }
-async fn state(pool: &PgPool, id: Uuid, kind: &str, remaining: i32) -> Result<Value, ApiError> {
-    let row=sqlx::query("SELECT revision,progress_revision,topic_index,followup_counts,completed_answers FROM interviews WHERE id=$1").bind(id).fetch_one(pool).await?;
+async fn state(
+    pool: &PgPool,
+    id: Uuid,
+    kind: &str,
+    remaining: i32,
+    quiet: bool,
+) -> Result<Value, ApiError> {
+    let row=sqlx::query("SELECT revision,progress_revision,topic_index,followup_counts,completed_answers,incomplete_turn FROM interviews WHERE id=$1").bind(id).fetch_one(pool).await?;
     Ok(
-        json!({"type":kind,"revision":row.get::<i64,_>("revision"),"progress_revision":row.get::<i64,_>("progress_revision"),"remaining_seconds":remaining,"topic":row.get::<i32,_>("topic_index"),"followups":row.get::<Value,_>("followup_counts"),"completed_answers":row.get::<i32,_>("completed_answers")}),
+        json!({"type":kind,"revision":row.get::<i64,_>("revision"),"progress_revision":row.get::<i64,_>("progress_revision"),"remaining_seconds":remaining,"topic":row.get::<i32,_>("topic_index"),"followups":row.get::<Value,_>("followup_counts"),"completed_answers":row.get::<i32,_>("completed_answers"),"can_finish":quiet && row.get::<i32,_>("topic_index")>=3 && row.get::<Option<String>,_>("incomplete_turn").is_none()}),
     )
 }
 fn safe_id(id: &str) -> bool {
@@ -182,7 +241,9 @@ pub async fn run(
     expected_revision: i64,
     config: RelayConfig,
 ) {
-    let lease = match leases::acquire(&pool, interview, expected_revision).await {
+    let lease = match leases::acquire_customer(&pool, &customer_token, interview, expected_revision)
+        .await
+    {
         Ok(lease) => lease,
         Err(error) => {
             let _ = emit(&mut socket, json!({"type":"error","code":error.1})).await;
@@ -222,7 +283,7 @@ pub async fn run(
         }).await.map_err(|_|unavailable())??;
         progress::map_attempt(&pool,interview,lease.lease_id,lease.generation,attempt,&session).await?;
         let remaining=leases::heartbeat(&pool,interview,lease.lease_id,lease.generation).await?;
-        let mut ready=state(&pool,interview,"ready",remaining).await?;
+        let mut ready=state(&pool,interview,"ready",remaining,false).await?;
         ready["attempt_id"]=json!(attempt);ready["lease_id"]=json!(lease.lease_id);ready["lease_generation"]=json!(lease.generation);
         Ok::<_,ApiError>((ready,remaining))
             }=>result?,
@@ -238,10 +299,10 @@ pub async fn run(
         let mut heartbeat=interval(Duration::from_secs(10));
         let mut guard=interval(Duration::from_secs(1));
         let mut speech_question=None;
-        let mut reply_active=false;
-        let mut reply_identity=None::<String>;
+        let mut playback=ReplyGate::greeting();
+        let mut speech_active=false;
+        let mut awaiting_final=false;
         let mut reply_delivered=false;
-        let mut suppress=false;
         let mut offered_at_audio=None;
         let mut agent_captions=BTreeMap::<String,String>::new();
         let mut control_receipts=BTreeMap::<Uuid,String>::new();
@@ -254,7 +315,7 @@ pub async fn run(
                 _=heartbeat.tick()=>{
                     remaining=leases::heartbeat(&pool,interview,lease.lease_id,lease.generation).await?;
                     if remaining<=0 {reason=AttemptEndReason::BudgetExhausted;break;}
-                    emit(&mut socket,state(&pool,interview,"state",remaining).await?).await?;
+                    emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;
                 }
                 browser=socket.recv()=>{
                     let Some(Ok(message))=browser else {break;};
@@ -274,67 +335,93 @@ pub async fn run(
                         }
                         BrowserEvent::Control{request_id,action,expected_revision,expected_progress_revision}=>{
                             if matches!(action,VoiceAction::Finish) {
-                                let completed:bool=sqlx::query_scalar("SELECT topic_index>=3 AND incomplete_turn IS NULL FROM interviews WHERE id=$1").bind(interview).fetch_one(&pool).await?;
-                                if completed && incomplete.is_empty() && !reply_active {reason=AttemptEndReason::ExplicitFinish;break;}
-                                emit(&mut socket,json!({"type":"error","code":"finish_not_ready"})).await?;continue;
+                                let request=VoiceControlRequest{interview_id:interview,request_id,expected_revision,expected_progress_revision,lease_id:lease.lease_id,lease_generation:lease.generation,action};
+                                let result=voice_hook::validate_finish(&pool,&customer_token,&request).await;
+                                if result.is_ok() && !speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control {reason=AttemptEndReason::ExplicitFinish;break;}
+                                let code=result.err().map(|e|e.1).unwrap_or("finish_not_ready");
+                                emit(&mut socket,json!({"type":"control_rejected","code":code})).await?;
+                                emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;continue;
                             }
-                            if !matches!(action,VoiceAction::Skip|VoiceAction::Repeat){emit(&mut socket,json!({"type":"error","code":"unsupported_control"})).await?;continue;}
+                            if !matches!(action,VoiceAction::Skip|VoiceAction::Repeat){emit(&mut socket,json!({"type":"control_rejected","code":"unsupported_control"})).await?;emit(&mut socket,state(&pool,interview,"state",remaining,false).await?).await?;continue;}
                             let meaning=serde_json::to_string(&(expected_revision,expected_progress_revision,&action)).map_err(|_|ApiError::conflict())?;
                             if let Some(prior)=control_receipts.get(&request_id) {
-                                if prior!=&meaning {emit(&mut socket,json!({"type":"error","code":"conflict"})).await?;}
-                                else {emit(&mut socket,state(&pool,interview,"state",remaining).await?).await?;}
+                                if prior!=&meaning {emit(&mut socket,json!({"type":"control_rejected","code":"conflict"})).await?;}
+                                {emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;}
                                 continue;
                             }
                             if control_receipts.len()>=100 {return Err(ApiError::conflict());}
                             match voice_hook::control_question(&pool,&customer_token,VoiceControlRequest{interview_id:interview,request_id,expected_revision,expected_progress_revision,lease_id:lease.lease_id,lease_generation:lease.generation,action}).await {
-                                Ok(_)=>{control_receipts.insert(request_id,meaning);suppress=true;speech_question=None;emit(&mut socket,json!({"type":"clear_playback"})).await?;client.send(&ClientEvent::Reply{instructions:"Speak only the exact current permitted question.".into()}).await.map_err(|_|unavailable())?;emit(&mut socket,state(&pool,interview,"state",remaining).await?).await?;}
-                                Err(error)=>{emit(&mut socket,json!({"type":"error","code":error.1})).await?;}
+                                Ok(_)=>{control_receipts.insert(request_id,meaning);playback.control();
+                                    // Keep speech_question pinned across Skip/Repeat. Its final
+                                    // remains history of the old question, never a new answer.
+                                    emit(&mut socket,json!({"type":"clear_playback"})).await?;
+                                    if !playback.active && !playback.requested && !speech_active && !awaiting_final && incomplete.is_empty() {
+                                        client.send(&ClientEvent::Reply{instructions:"Speak only the exact current permitted question.".into()}).await.map_err(|_|unavailable())?;
+                                        playback.requested_replacement();
+                                    }
+                                    emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;}
+                                Err(error)=>{emit(&mut socket,json!({"type":"control_rejected","code":error.1})).await?;emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;}
                             }
                         }
                     }
                 }
                 event=client.receive()=>{
                     match event.map_err(|_|unavailable())? {
-                        Some(ProviderEvent::SpeechStarted)=>{speech_question=voice_hook::questions(&pool,attempt,lease.lease_id,lease.generation).await?.1;}
+                        Some(ProviderEvent::SpeechStarted)=>{speech_active=true;awaiting_final=true;speech_question=voice_hook::questions(&pool,attempt,lease.lease_id,lease.generation).await?.1;emit(&mut socket,state(&pool,interview,"state",remaining,false).await?).await?;}
+                        Some(ProviderEvent::SpeechStopped)=>{speech_active=false;}
                         Some(ProviderEvent::UserDelta{item_id,text})=>{
+                            awaiting_final=true;
+                            if !incomplete.contains_key(&item_id) {voice_hook::mark_incomplete(&pool,attempt,&item_id,lease.lease_id,lease.generation).await?;}
                             if let Some(question)=speech_question {incomplete.insert(item_id.clone(),question);}
                             emit(&mut socket,json!({"type":"caption","speaker":"customer","item_id":item_id,"text":text,"final":false})).await?;
                         }
                         Some(ProviderEvent::UserFinal{item_id,text})=>{
                             let question=incomplete.get(&item_id).copied().or(speech_question).ok_or_else(ApiError::conflict)?;
                             voice_hook::authorize_answer(&pool,attempt,question,&item_id,&text,lease.lease_id,lease.generation).await?;
-                            incomplete.remove(&item_id);
+                            incomplete.remove(&item_id);awaiting_final= !incomplete.is_empty();playback.final_answer();
                             emit(&mut socket,json!({"type":"caption","speaker":"customer","item_id":item_id,"text":text,"final":true})).await?;
                         }
-                        Some(ProviderEvent::ReplyStarted{reply_id,..})=>{reply_identity=Some(reply_id);reply_active=true;reply_delivered=false;suppress=false;offered_at_audio=None;emit(&mut socket,json!({"type":"reply_started"})).await?;}
+                        Some(ProviderEvent::ReplyStarted{reply_id,..})=>{playback.started(reply_id);reply_delivered=false;offered_at_audio=None;if !playback.suppressed {emit(&mut socket,json!({"type":"reply_started"})).await?;}emit(&mut socket,state(&pool,interview,"state",remaining,false).await?).await?;}
                         Some(ProviderEvent::Audio{data})=>{
-                            if suppress {continue;}
-                            if !reply_active{return Err(ApiError::conflict());}
+                            if playback.suppressed {continue;}
+                            if !playback.active{return Err(ApiError::conflict());}
                             if !reply_delivered {
                                 let permit=voice_hook::questions(&pool,attempt,lease.lease_id,lease.generation).await?.0;
                                 voice_hook::mark_delivered(&pool,attempt,permit,lease.lease_id,lease.generation).await?;
                                 offered_at_audio=Some(permit);reply_delivered=true;
-                                emit(&mut socket,state(&pool,interview,"state",remaining).await?).await?;
+                                emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;
                             }
                             emit(&mut socket,json!({"type":"audio","audio":data})).await?;
                         }
-                        Some(ProviderEvent::AgentDelta{item_id,delta,..})=>{
+                        Some(ProviderEvent::AgentDelta{item_id,reply_id,delta})=>{
+                            if playback.suppressed || playback.identity.as_deref()!=Some(reply_id.as_str()){continue;}
                             let text=agent_captions.entry(item_id.clone()).or_default();if !text.is_empty(){text.push(' ');}text.push_str(&delta);
                             emit(&mut socket,json!({"type":"caption","speaker":"interviewer","item_id":item_id,"text":text,"final":false})).await?;
                         }
                         Some(ProviderEvent::AgentFinal{item_id,text,interrupted,reply_id})=>{
-                            if reply_identity.as_deref()!=Some(reply_id.as_str()){continue;}
-                            if !interrupted && !suppress {
+                            if playback.identity.as_deref()!=Some(reply_id.as_str()){continue;}
+                            if !interrupted && !playback.suppressed {
                                 let permit=offered_at_audio.ok_or_else(ApiError::conflict)?;
                                 let plan:Value=sqlx::query_scalar("SELECT plan FROM question_permits WHERE id=$1 AND attempt_id=$2").bind(permit).bind(attempt).fetch_one(&pool).await?;
                                 let plan:v0_voice::pre_speech::QuestionPlan=serde_json::from_value(plan).map_err(|_|ApiError::conflict())?;
                                 if v0_voice::history::words(&text)!=v0_voice::history::words(plan.code.text()){return Err(ApiError::conflict());}
                             }
-                            if interrupted {suppress=true;emit(&mut socket,json!({"type":"clear_playback"})).await?;}
+                            if interrupted {playback.suppressed=true;emit(&mut socket,json!({"type":"clear_playback"})).await?;}
                             agent_captions.remove(&item_id);
-                            emit(&mut socket,json!({"type":"caption","speaker":"interviewer","item_id":item_id,"text":text,"final":true})).await?;
+                            if !playback.suppressed {emit(&mut socket,json!({"type":"caption","speaker":"interviewer","item_id":item_id,"text":text,"final":true})).await?;}
                         }
-                        Some(ProviderEvent::ReplyDone{status,reply_id})=>{if reply_identity.as_deref()!=Some(reply_id.as_str()){continue;}reply_active=false;if status=="interrupted"{suppress=true;emit(&mut socket,json!({"type":"clear_playback"})).await?;}}
+                        Some(ProviderEvent::ReplyDone{status,reply_id})=>{
+                            if !playback.done(&reply_id,status=="interrupted"){continue;}
+                            if status=="interrupted"{playback.suppressed=true;emit(&mut socket,json!({"type":"clear_playback"})).await?;}
+                            // The documented reply lifecycle must drain before a
+                            // replacement is requested. Never unsuppress a late
+                            // reply.started while a control is still waiting.
+                            if playback.pending_control && !speech_active && !awaiting_final && incomplete.is_empty() {
+                                client.send(&ClientEvent::Reply{instructions:"Speak only the exact current permitted question.".into()}).await.map_err(|_|unavailable())?;
+                                playback.requested_replacement();
+                            }
+                            emit(&mut socket,state(&pool,interview,"state",remaining,!speech_active && !awaiting_final && incomplete.is_empty() && !playback.active && !playback.requested && !playback.pending_control).await?).await?;
+                        }
                         Some(ProviderEvent::Ended)|None=>break,
                         Some(ProviderEvent::Error{..})=>return Err(unavailable()),
                         _=>{}
@@ -344,6 +431,16 @@ pub async fn run(
         }
         Ok(())
     }.await;
+    // The database clock can reach the allowance a few milliseconds before
+    // the socket's monotonic timer. Preserve the truthful reason when a guard
+    // or heartbeat wins that race, without touching a later lease generation.
+    if matches!(reason, AttemptEndReason::TransportLost) {
+        let exhausted:Result<bool,_>=sqlx::query_scalar("SELECT time_consumed_seconds + COALESCE(EXTRACT(EPOCH FROM(clock_timestamp()-active_since)),0)>=360 FROM interviews WHERE id=$1 AND lease_id=$2 AND lease_generation=$3")
+            .bind(interview).bind(lease.lease_id).bind(lease.generation).fetch_one(&pool).await;
+        if matches!(exhausted, Ok(true)) {
+            reason = AttemptEndReason::BudgetExhausted;
+        }
+    }
     // Explicit terminal cleanup even after local/provider failures; this relay
     // uses recording-backed recovery, not an unproven native-resume assumption.
     let _ = emit(&mut socket, json!({"type":"clear_playback"})).await;
@@ -374,10 +471,70 @@ pub async fn run(
             let _ = leases::release(&pool, interview, lease.lease_id, lease.generation).await;
         }
     }
-    let _=emit(&mut socket,json!({"type":"ended","reason":reason,"recovery_required":true,"recovery_pending":end.is_ok()})).await;
+    // A requested Finish is not a durable completion acknowledgement.
+    let reported_reason = if end.is_ok() {
+        reason
+    } else {
+        AttemptEndReason::TransportLost
+    };
+    let _=emit(&mut socket,json!({"type":"ended","reason":reported_reason,"recovery_required":true,"recovery_pending":end.is_ok()})).await;
     if let Err(error) = outcome {
         let _ = emit(&mut socket, json!({"type":"error","code":error.1})).await;
     }
     cleanup_agent(&pool, attempt, &config).await;
     let _ = socket.close().await;
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::ReplyGate;
+    #[test]
+    fn fragmented_final_after_reply_started_does_not_wait_for_a_second_reply() {
+        let mut gate = ReplyGate::greeting();
+        gate.started("greeting".into());
+        assert!(gate.done("greeting", false));
+        gate.final_answer(); // Recorded first final at 2362 ms.
+        assert!(gate.requested);
+        gate.started("answer-reply".into()); // Recorded at 2369 ms.
+        gate.final_answer(); // Another final at 7962 ms, same answer.
+        assert!(gate.active && !gate.requested);
+        assert!(gate.done("answer-reply", false)); // 11983 ms, no second start.
+        assert!(!gate.active && !gate.requested);
+        // The next distinct answer after reply completion must still wait.
+        gate.final_answer();
+        assert!(gate.requested);
+    }
+    #[test]
+    fn skip_during_pending_old_reply_suppresses_until_it_drains() {
+        let mut gate = ReplyGate::greeting();
+        gate.control(); // Skip arrives before old greeting's reply.started.
+        gate.started("old-greeting".into());
+        assert!(gate.active && gate.suppressed && gate.pending_control);
+        assert!(gate.done("old-greeting", false));
+        assert!(gate.suppressed && gate.pending_control && !gate.active);
+        gate.requested_replacement();
+        assert!(gate.suppressed && gate.requested); // Late old audio stays muted.
+        gate.started("replacement".into());
+        assert!(gate.active && !gate.suppressed && !gate.pending_control);
+        assert!(!gate.done("old-greeting", true)); // Delayed old terminal event.
+        assert!(gate.active && !gate.suppressed);
+        assert!(gate.done("replacement", false));
+        assert!(!gate.active && !gate.requested);
+    }
+    #[test]
+    fn repeat_and_confirmed_interruption_clear_only_the_active_reply() {
+        let mut gate = ReplyGate::greeting();
+        gate.started("question".into());
+        gate.control();
+        assert!(gate.suppressed);
+        assert!(gate.done("question", true));
+        gate.requested_replacement();
+        gate.started("repeat".into());
+        assert!(!gate.suppressed);
+        assert!(gate.done("repeat", true));
+        assert!(gate.suppressed && !gate.active);
+        // A natural successor after semantic interruption is audible.
+        gate.started("after-answer".into());
+        assert!(!gate.suppressed && gate.active);
+    }
 }

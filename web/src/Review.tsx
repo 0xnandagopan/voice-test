@@ -841,19 +841,18 @@ function Source({
 }) {
   const current = correction ?? source.corrected_text ?? source.text;
   const [text, setText] = useState(current);
-  const [editing, setEditing] = useState(false);
   const [baseText, setBaseText] = useState(current);
   const [baseRevisions, setBaseRevisions] = useState(revisions);
   const dirty = text !== baseText;
   const stale = !sameRevisions(revisions, baseRevisions);
   const [playbackError, setPlaybackError] = useState(false);
   useEffect(() => {
-    if (!editing || !dirty) {
+    if (!dirty) {
       setText(current);
       setBaseText(current);
       setBaseRevisions(revisions);
     }
-  }, [current, editing, revisions, dirty]);
+  }, [current, revisions, dirty]);
   return (
     <article className="source-record" id={`recorded-source-${index + 1}`}>
       <h3>
@@ -891,7 +890,7 @@ function Source({
           Playback unavailable. Refresh your access and try again.
         </Message>
       )}
-      <details onToggle={(event) => setEditing(event.currentTarget.open)}>
+      <details>
         <summary>Correct this transcript</summary>
         {stale && (
           <Message error>

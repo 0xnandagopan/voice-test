@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod leases;
 pub mod live;
 pub mod progress;
+pub mod recovery_maintenance;
 pub mod relay;
 pub mod review;
 pub mod voice_hook;

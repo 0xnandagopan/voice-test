@@ -31,7 +31,7 @@ env = os.environ.copy()
 env.update(DATABASE_URL=database, APP_ORIGIN=origin, BIND_ADDR=f"127.0.0.1:{port}",
     COOKIE_SECURE="false", AGENCY_NAME="Synthetic test agency", OPERATOR_USERNAME="headless-test",
     OPERATOR_PASSWORD_HASH=hashed, INVITATION_SIGNING_KEY=secrets.token_hex(32),
-    VOICE_AGENT_API_KEY="", WEB_DIST=str(root / "web/dist"), RUST_LOG="warn",
+    VOICE_AGENT_API_KEY="", VOICE_TEST_ENABLED="false", VOICE_PUBLIC_ORIGIN="", WEB_DIST=str(root / "web/dist"), RUST_LOG="warn",
     TEST_BASE_URL=origin, TEST_OPERATOR_USERNAME="headless-test", TEST_OPERATOR_PASSWORD=password)
 subprocess.run([str(binary), "migrate"], env=env, cwd=root, check=True)
 with tempfile.TemporaryFile() as log:

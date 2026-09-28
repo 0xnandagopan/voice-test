@@ -14,6 +14,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_connections(4)
         .connect(&env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required in .env")?)
         .await?;
+    let recovery_pool = pool.clone();
+    let _recovery = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if v0_app::recovery_maintenance::reap_expired(&recovery_pool)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    error_code = "relay_recovery_failed",
+                    "Recovery maintenance will retry"
+                );
+            }
+        }
+    });
     let key = env::var("VOICE_AGENT_API_KEY").map_err(
         |_| "Populate VOICE_AGENT_API_KEY in the local .env before running live recovery",
     )?;
