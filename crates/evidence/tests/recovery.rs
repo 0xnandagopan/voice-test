@@ -756,3 +756,237 @@ async fn postgres_recovery_denies_expiry_crossed_while_waiting_for_row_lock() {
     assert!(matches!(recovering.await.unwrap(), Err(Error::Stale)));
     drop_database(pool, schema, url).await;
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_import_denies_deadlines_crossed_during_lock_waits() {
+    // Cover expiry while waiting for authority, lease expiry at either lock,
+    // and expiry in a later write after the initial protected time check.
+    for (expire_interview, lock_target) in [
+        (true, "interview"),
+        (false, "interview"),
+        (false, "job"),
+        (true, "attempt"),
+    ] {
+        let (pool, schema, url) = database().await;
+        let (i, a) = seed(&pool).await;
+        jobs::enqueue_import(&pool, i, a).await.unwrap();
+        let job = jobs::claim(&pool).await.unwrap().unwrap();
+        let job_id = job.id;
+        let deadline: chrono::DateTime<chrono::Utc> = if expire_interview {
+            sqlx::query_scalar("UPDATE interviews SET expires_at=clock_timestamp()+interval '2 seconds' WHERE id=$1 RETURNING expires_at")
+                .bind(i).fetch_one(&pool).await.unwrap()
+        } else {
+            sqlx::query_scalar("UPDATE jobs SET lease_until=clock_timestamp()+interval '2 seconds' WHERE id=$1 RETURNING lease_until")
+                .bind(job_id).fetch_one(&pool).await.unwrap()
+        };
+        let mut authority = pool.begin().await.unwrap();
+        let (query, id) = match lock_target {
+            "interview" => ("SELECT id FROM interviews WHERE id=$1 FOR UPDATE", i),
+            "job" => ("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_id),
+            _ => ("SELECT id FROM provider_attempts WHERE id=$1 FOR UPDATE", a),
+        };
+        sqlx::query(query)
+            .bind(id)
+            .fetch_one(&mut *authority)
+            .await
+            .unwrap();
+        let app_name = format!("import_deadline_{}", Uuid::new_v4().simple());
+        let import_pool = PgPool::connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name(&app_name),
+        )
+        .await
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("v0-evidence-{}", Uuid::new_v4()));
+        let store = LocalPrivateStorage::new(&dir).await.unwrap();
+        let importing = tokio::spawn(async move {
+            let result = jobs::dispatch(&import_pool, &job, &Fixture, &store).await;
+            import_pool.close().await;
+            result
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock' AND xact_start<$2)")
+                    .bind(&app_name).bind(deadline).fetch_one(&pool).await.unwrap();
+                if waiting { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("import transaction must begin before deadline and reach held lock");
+        sqlx::query("SELECT pg_sleep(GREATEST(0,EXTRACT(EPOCH FROM $1::timestamptz-clock_timestamp())::double precision)+0.01)")
+            .bind(deadline).execute(&mut *authority).await.unwrap();
+        authority.commit().await.unwrap();
+        assert!(
+            matches!(importing.await.unwrap(), Err(Error::Stale)),
+            "deadline check failed for {expire_interview}/{lock_target}"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence_imports")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id=$1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "running",
+            "failed import must not mark job succeeded"
+        );
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+        drop_database(pool, schema, url).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_old_attempt_import_preserves_newer_active_interview() {
+    let (pool, schema, url) = database().await;
+    let (i, a) = seed(&pool).await;
+    let next = Uuid::new_v4();
+    sqlx::query("UPDATE provider_attempts SET state='ended' WHERE id=$1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO provider_attempts(id,interview_id,provider_session_id,lease_generation,state) VALUES($1,$2,'sess_newer',2,'active')")
+        .bind(next).bind(i).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE interviews SET state='interviewing',active_since=clock_timestamp(),lease_id=$2,lease_generation=2,lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1")
+        .bind(i).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    jobs::enqueue_import(&pool, i, a).await.unwrap();
+    let job = jobs::claim(&pool).await.unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("v0-evidence-{}", Uuid::new_v4()));
+    let store = LocalPrivateStorage::new(&dir).await.unwrap();
+    jobs::dispatch(&pool, &job, &Fixture, &store).await.unwrap();
+    let state: (String, bool, i64) = sqlx::query_as(
+        "SELECT state,active_since IS NOT NULL,lease_generation FROM interviews WHERE id=$1",
+    )
+    .bind(i)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, ("interviewing".into(), true, 2));
+    let active: String = sqlx::query_scalar("SELECT state FROM provider_attempts WHERE id=$1")
+        .bind(next)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(active, "active");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM evidence_imports WHERE provider_attempt_id=$1")
+            .bind(a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    tokio::fs::remove_dir_all(dir).await.unwrap();
+    drop_database(pool, schema, url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn postgres_recovery_distinguishes_terminal_artifact_failure_from_retry() {
+    let (pool, schema, url) = database().await;
+    let (i, a) = seed(&pool).await;
+    sqlx::query(
+        "UPDATE provider_attempts SET provider_session_id='sess_recovery_test' WHERE id=$1",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (other_interview, other_attempt) = seed(&pool).await;
+    sqlx::query("UPDATE interviews SET topic_index=1,followup_counts='[1,0,0]',time_consumed_seconds=42 WHERE id=$1")
+        .bind(i).execute(&pool).await.unwrap();
+    let id = jobs::enqueue_import(&pool, i, a).await.unwrap();
+    for (status, attempts, expired, unavailable) in [
+        ("queued", 1, false, false),
+        ("failed", 1, false, true),
+        ("queued", 5, false, true),
+        ("running", 5, false, false),
+        ("running", 1, true, false),
+        ("running", 5, true, true),
+        ("cancelled", 1, false, true),
+        ("succeeded", 1, false, true),
+    ] {
+        sqlx::query("UPDATE jobs SET status=$2,attempts=$3,max_attempts=5,lease_until=clock_timestamp()+make_interval(secs=>$4) WHERE id=$1")
+            .bind(id).bind(status).bind(attempts).bind(if expired { -60.0_f64 } else { 60.0 }).execute(&pool).await.unwrap();
+        // Repeated reads cannot reset progress or consume retries.
+        for _ in 0..2 {
+            let view = v0_evidence::recovery::recover_interview(&pool, i)
+                .await
+                .unwrap();
+            assert_eq!(view.attempts.len(), 1);
+            assert_eq!(
+                view.attempts[0].status,
+                if unavailable {
+                    "recording_artifacts_unavailable"
+                } else {
+                    "awaiting_recording_artifacts"
+                },
+                "{status}/{attempts}/{expired}"
+            );
+            assert_eq!(
+                view.recommended_action,
+                if unavailable {
+                    "retry_recovery_or_discard"
+                } else {
+                    "wait_for_recording_recovery"
+                }
+            );
+            assert_eq!(view.attempts[0].recommended_action, view.recommended_action);
+            assert_eq!(view.topic_index, 1);
+            assert_eq!(view.followup_counts, json!([1, 0, 0]));
+            assert_eq!(view.time_consumed_seconds, 42);
+            assert!(!view.may_advance_progress);
+            assert!(view.requires_customer_confirmation);
+            assert!(view.recorded_utterances.is_empty());
+        }
+        let consumed: i32 = sqlx::query_scalar("SELECT attempts FROM jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(consumed, attempts);
+    }
+    // A job naming this attempt under another interview must not affect it.
+    sqlx::query("UPDATE jobs SET status='failed',interview_id=$2 WHERE id=$1")
+        .bind(id)
+        .bind(other_interview)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = v0_evidence::recovery::recover_interview(&pool, i)
+        .await
+        .unwrap();
+    assert_eq!(view.attempts[0].status, "awaiting_recording_artifacts");
+    // Neither may a canonical key whose payload names a different attempt.
+    sqlx::query("UPDATE jobs SET interview_id=$2,payload=$3 WHERE id=$1")
+        .bind(id)
+        .bind(i)
+        .bind(json!({"provider_attempt_id":other_attempt}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = v0_evidence::recovery::recover_interview(&pool, i)
+        .await
+        .unwrap();
+    assert_eq!(view.attempts[0].status, "awaiting_recording_artifacts");
+    sqlx::query("UPDATE jobs SET payload=$2 WHERE id=$1")
+        .bind(id)
+        .bind(json!({"provider_attempt_id":a}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Another pending attempt cannot mask the terminal gap in the overall view.
+    sqlx::query("INSERT INTO provider_attempts(id,interview_id,provider_session_id,lease_generation) VALUES($1,$2,'sess_pending',2)")
+        .bind(Uuid::new_v4()).bind(i).execute(&pool).await.unwrap();
+    let view = v0_evidence::recovery::recover_interview(&pool, i)
+        .await
+        .unwrap();
+    assert_eq!(view.attempts.len(), 2);
+    assert_eq!(view.recommended_action, "retry_recovery_or_discard");
+    drop_database(pool, schema, url).await;
+}

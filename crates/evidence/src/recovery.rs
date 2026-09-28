@@ -134,7 +134,10 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
     {
         return Err(Error::Stale);
     }
-    let rows=sqlx::query("SELECT p.id,p.state,e.evidence_revision,e.manifest FROM provider_attempts p LEFT JOIN evidence_imports e ON e.provider_attempt_id=p.id AND e.interview_id=p.interview_id WHERE p.interview_id=$1 ORDER BY p.started_at,p.id")
+    // Read only the canonical import job, scoped to both attempt and interview.
+    // An exhausted worker can remain running until the next claim sweep; its
+    // expired lease already means no automatic recovery attempt remains.
+    let rows=sqlx::query("SELECT p.id,p.state,e.evidence_revision,e.manifest,COALESCE(j.status IN ('failed','cancelled','succeeded') OR (j.attempts>=j.max_attempts AND (j.status='queued' OR (j.status='running' AND (j.lease_until IS NULL OR j.lease_until<=clock_timestamp())))),false) AS artifacts_unavailable FROM provider_attempts p LEFT JOIN evidence_imports e ON e.provider_attempt_id=p.id AND e.interview_id=p.interview_id LEFT JOIN jobs j ON j.dedupe_key='import:'||p.id::text AND j.interview_id=p.interview_id AND j.kind='import_evidence' AND j.payload->>'provider_attempt_id'=p.id::text WHERE p.interview_id=$1 ORDER BY p.started_at,p.id")
         .bind(interview).fetch_all(&mut *tx).await?;
     let mut result = RecoveryContext {
         interview_id: interview,
@@ -200,18 +203,36 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
                 artifact_sha256: Some(manifest.recording_sha256),
             });
         } else {
+            let unavailable: bool = row.get("artifacts_unavailable");
             result.attempts.push(AttemptRecovery {
                 provider_attempt_id: attempt,
-                status: "awaiting_recording_artifacts".into(),
+                status: if unavailable {
+                    "recording_artifacts_unavailable"
+                } else {
+                    "awaiting_recording_artifacts"
+                }
+                .into(),
                 evidence_revision: None,
                 incomplete_turn_ids: vec![],
                 artifact_sha256: None,
-                recommended_action: "wait_for_recording_recovery".into(),
+                recommended_action: if unavailable {
+                    "retry_recovery_or_discard"
+                } else {
+                    "wait_for_recording_recovery"
+                }
+                .into(),
                 untranscribed_audio_ranges_ms: vec![],
             });
         }
     }
     if result
+        .attempts
+        .iter()
+        .any(|a| a.status == "recording_artifacts_unavailable")
+    {
+        // One terminal gap must not be hidden by another attempt still polling.
+        result.recommended_action = "retry_recovery_or_discard".into();
+    } else if result
         .attempts
         .iter()
         .any(|a| a.status == "awaiting_recording_artifacts")

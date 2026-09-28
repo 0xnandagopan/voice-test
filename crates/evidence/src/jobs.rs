@@ -138,16 +138,17 @@ async fn import(
     storage.put(&timeline_key, &artifacts.timeline).await?;
     storage.put(&metadata_key, &artifacts.metadata).await?;
     let mut tx = pool.begin().await?;
-    let eligible = sqlx::query("SELECT id FROM interviews WHERE id=$1 AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND expires_at>now() AND revision=$2 FOR UPDATE")
+    let eligible = sqlx::query("SELECT expires_at FROM interviews WHERE id=$1 AND deleted_at IS NULL AND state NOT IN ('revoked','deleted') AND revision=$2 FOR UPDATE")
         .bind(job.interview_id).bind(revision).fetch_optional(&mut *tx).await?;
-    if eligible.is_none() {
-        return Err(Error::Stale);
-    }
-    let lease = sqlx::query("SELECT id FROM jobs WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_until>now() FOR UPDATE")
+    let eligible = eligible.ok_or(Error::Stale)?;
+    let expires_at: chrono::DateTime<chrono::Utc> = eligible.get("expires_at");
+    let lease = sqlx::query("SELECT lease_until FROM jobs WHERE id=$1 AND status='running' AND lease_token=$2 FOR UPDATE")
         .bind(job.id).bind(job.token).fetch_optional(&mut *tx).await?;
-    if lease.is_none() {
-        return Err(Error::Stale);
-    }
+    let lease = lease.ok_or(Error::Stale)?;
+    let lease_until: chrono::DateTime<chrono::Utc> = lease.get("lease_until");
+    // Both rows are protected now. Transaction-start now() could predate an
+    // arbitrarily long lock wait, so evaluate the actual wall clock here.
+    ensure_import_time(&mut tx, expires_at, lease_until).await?;
     let mapping_matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_attempts WHERE id=$1 AND interview_id=$2 AND provider_session_id=$3)")
         .bind(attempt).bind(job.interview_id).bind(&session).fetch_one(&mut *tx).await?;
     if !mapping_matches {
@@ -176,12 +177,29 @@ async fn import(
         .bind(attempt)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE interviews SET state='recovering',updated_at=now() WHERE id=$1")
+    sqlx::query("UPDATE interviews SET state='recovering',updated_at=clock_timestamp() WHERE id=$1 AND active_since IS NULL AND state IN ('invited','consented','recovering')")
         .bind(job.interview_id)
         .execute(&mut *tx)
         .await?;
+    // Later writes can also wait (for example on an attempt row). Roll back
+    // every attachment if either deadline elapsed before completion.
+    ensure_import_time(&mut tx, expires_at, lease_until).await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn ensure_import_time(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    lease_until: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let current: bool =
+        sqlx::query_scalar("SELECT clock_timestamp() < $1 AND clock_timestamp() < $2")
+            .bind(expires_at)
+            .bind(lease_until)
+            .fetch_one(&mut **tx)
+            .await?;
+    if current { Ok(()) } else { Err(Error::Stale) }
 }
 
 async fn cleanup(pool: &PgPool, job: &Job, storage: &dyn PrivateStorage) -> Result<()> {
