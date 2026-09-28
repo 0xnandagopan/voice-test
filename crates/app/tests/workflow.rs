@@ -1080,6 +1080,14 @@ async fn admitted_completion(
         if let Some(row) = row
             && users.len() as i32 > row.get::<i32, _>("processed_user_count")
         {
+            v0_app::voice_hook::mark_delivered(
+                pool,
+                attempt,
+                row.get("last_permit_id"),
+                row.get("lease_id"),
+                row.get("lease_generation"),
+            )
+            .await?;
             v0_app::voice_hook::authorize_answer(
                 pool,
                 attempt,
@@ -1131,6 +1139,9 @@ async fn delayed_pre_skip_answer_cannot_advance_new_topic() {
             .await
             .unwrap();
     let users: Vec<String> = vec!["Answer to the old problem question".into()];
+    voice_hook::mark_delivered(&d.pool, attempt, old, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
     voice_hook::authorize_answer(
         &d.pool,
         attempt,
@@ -1189,9 +1200,278 @@ async fn delayed_pre_skip_answer_cannot_advance_new_topic() {
         .await
         .unwrap();
     assert_eq!(topic, 1);
-    let fresh = vec!["Answer to the current change question".into()];
+    // Provider history retains the abandoned earlier utterance; it cannot be
+    // silently rewritten or promoted into a new answer by the callback.
+    let fresh = vec![
+        users[0].clone(),
+        "Answer to the current change question".into(),
+    ];
     admitted_completion(&d.pool, attempt, &secret, completion_request(&fresh))
         .await
         .unwrap();
+    d.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn split_merged_history_advances_only_once_per_delivered_question() {
+    use v0_app::voice_hook;
+    let d = Db::new().await;
+    let lease = leases::acquire(&d.pool, d.id, 1).await.unwrap();
+    let attempt = Uuid::new_v4();
+    progress::prepare_attempt(&d.pool, d.id, lease.lease_id, lease.generation, attempt)
+        .await
+        .unwrap();
+    let secret = voice_hook::bind(&d.pool, d.id, attempt, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    progress::map_attempt(
+        &d.pool,
+        d.id,
+        lease.lease_id,
+        lease.generation,
+        attempt,
+        "split-merge-provider",
+    )
+    .await
+    .unwrap();
+    let (greeting, delivered) =
+        voice_hook::questions(&d.pool, attempt, lease.lease_id, lease.generation)
+            .await
+            .unwrap();
+    assert_eq!(delivered, None);
+    assert!(
+        voice_hook::authorize_answer(
+            &d.pool,
+            attempt,
+            greeting,
+            "one",
+            "It maybe saved two hours.",
+            lease.lease_id,
+            lease.generation
+        )
+        .await
+        .is_err()
+    );
+    voice_hook::mark_delivered(&d.pool, attempt, greeting, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    voice_hook::authorize_answer(
+        &d.pool,
+        attempt,
+        greeting,
+        "one",
+        "It maybe saved two hours.",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    let first = response_json(
+        voice_hook::complete(
+            &d.pool,
+            attempt,
+            &secret,
+            completion_request(&["It maybe saved two hours.".into()]),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let (offered, delivered) =
+        voice_hook::questions(&d.pool, attempt, lease.lease_id, lease.generation)
+            .await
+            .unwrap();
+    assert_ne!(offered, greeting);
+    assert_eq!(delivered, Some(greeting));
+    // Speech continues before the offered follow-up actually starts playing.
+    voice_hook::authorize_answer(
+        &d.pool,
+        attempt,
+        greeting,
+        "two",
+        "But setup remained difficult.",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    for users in [
+        vec![
+            "It maybe saved two hours.".into(),
+            "But setup remained difficult.".into(),
+        ],
+        vec!["It maybe saved two hours, but setup remained difficult.".into()],
+    ] {
+        let replay = response_json(
+            voice_hook::complete(&d.pool, attempt, &secret, completion_request(&users))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(replay["id"], first["id"]);
+    }
+    let answers: i32 = sqlx::query_scalar("SELECT completed_answers FROM interviews WHERE id=$1")
+        .bind(d.id)
+        .fetch_one(&d.pool)
+        .await
+        .unwrap();
+    assert_eq!(answers, 1);
+    let counts: Value = sqlx::query_scalar("SELECT followup_counts FROM interviews WHERE id=$1")
+        .bind(d.id)
+        .fetch_one(&d.pool)
+        .await
+        .unwrap();
+    assert_eq!(counts, json!([1, 0, 0]));
+    assert!(
+        voice_hook::complete(
+            &d.pool,
+            attempt,
+            &secret,
+            completion_request(&["It saved two hours, but setup remained difficult.".into()])
+        )
+        .await
+        .is_err()
+    );
+    // Only actual delivery changes which question can receive a fresh answer.
+    voice_hook::mark_delivered(&d.pool, attempt, offered, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    assert!(
+        voice_hook::authorize_answer(
+            &d.pool,
+            attempt,
+            greeting,
+            "late",
+            "Another old answer",
+            lease.lease_id,
+            lease.generation
+        )
+        .await
+        .is_err()
+    );
+    voice_hook::authorize_answer(
+        &d.pool,
+        attempt,
+        offered,
+        "three",
+        "I do not know.",
+        lease.lease_id,
+        lease.generation,
+    )
+    .await
+    .unwrap();
+    let next = response_json(
+        voice_hook::complete(
+            &d.pool,
+            attempt,
+            &secret,
+            completion_request(&[
+                "It maybe saved two hours, but setup remained difficult.".into(),
+                "I do not know.".into(),
+            ]),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_ne!(first["id"], next["id"]);
+    d.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn callback_can_wait_for_trusted_final_but_cannot_admit_its_own_text() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use v0_app::voice_hook;
+    let d = Db::new().await;
+    let lease = leases::acquire(&d.pool, d.id, 1).await.unwrap();
+    let attempt = Uuid::new_v4();
+    progress::map_attempt(
+        &d.pool,
+        d.id,
+        lease.lease_id,
+        lease.generation,
+        attempt,
+        "callback-order-provider",
+    )
+    .await
+    .unwrap();
+    let secret = voice_hook::bind(&d.pool, d.id, attempt, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    let question = voice_hook::questions(&d.pool, attempt, lease.lease_id, lease.generation)
+        .await
+        .unwrap()
+        .0;
+    voice_hook::mark_delivered(&d.pool, attempt, question, lease.lease_id, lease.generation)
+        .await
+        .unwrap();
+    let config = v0_app::config::Config {
+        origin: "http://localhost:3000".into(),
+        agency_name: "Synthetic".into(),
+        operator_username: "operator".into(),
+        operator_password_hash: "unused".into(),
+        invitation_signing_key: "synthetic-signing-key-with-32-bytes".into(),
+        secure_cookie: false,
+        voice_api_key: None,
+    };
+    let app = voice_hook::router(v0_app::AppState::new(d.pool.clone(), config));
+    let request = |text: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/voice-hook/{attempt}/chat/completions"))
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {secret}"))
+            .body(Body::from(
+                json!({"messages":[{"role":"user","content":text}],"stream":false}).to_string(),
+            ))
+            .unwrap()
+    };
+    let received = app.clone().oneshot(request("A trusted short answer."));
+    let admitted = async {
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        voice_hook::authorize_answer(
+            &d.pool,
+            attempt,
+            question,
+            "trusted-final",
+            "A trusted short answer.",
+            lease.lease_id,
+            lease.generation,
+        )
+        .await
+        .unwrap();
+    };
+    let (response, ()) = tokio::join!(received, admitted);
+    assert_eq!(response.unwrap().status(), StatusCode::OK);
+    let unknown = app
+        .oneshot(request("Invented answer not present in a final event."))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::CONFLICT);
+    assert!(
+        voice_hook::authorize_answer(
+            &d.pool,
+            attempt,
+            question,
+            "trusted-final",
+            "Changed final contents.",
+            lease.lease_id,
+            lease.generation
+        )
+        .await
+        .is_err()
+    );
+    let count: i32 = sqlx::query_scalar("SELECT completed_answers FROM interviews WHERE id=$1")
+        .bind(d.id)
+        .fetch_one(&d.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
     d.close().await;
 }

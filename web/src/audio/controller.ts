@@ -15,6 +15,8 @@ export class AudioController {
   private engine?: AudioEngine;
   private transport?: VoiceTransport;
   private suppressPlayback = false;
+  private pendingPlayback: ArrayBuffer[] = [];
+  private pendingPlaybackBytes = 0;
   private readonly deps: AudioDependencies;
   private readonly onState?: (state: AudioState) => void;
   constructor(deps: AudioDependencies, onState?: (state: AudioState) => void) {this.deps = deps; this.onState = onState;}
@@ -43,6 +45,7 @@ export class AudioController {
   async start(options: {consented: boolean; connect: (onEvent: (event: VoiceEvent) => void) => Promise<VoiceTransport>}): Promise<void> {
     const generation = this.begin(options.consented, 'connecting');
     this.suppressPlayback = false;
+    this.pendingPlayback = []; this.pendingPlaybackBytes = 0;
     try {
       // Application relay resolves only after server consent/lease check and durable provider mapping.
       const transport = await options.connect(event => {if (generation === this.generation) this.event(event);});
@@ -56,7 +59,10 @@ export class AudioController {
         try {this.transport?.sendAudio(pcm);} catch {this.stop(); this.setState('error');}
       });
       if (generation !== this.generation) {engine.close(); return;}
-      this.engine = engine; this.setState('active');
+      this.engine = engine;
+      for (const pcm of this.pendingPlayback) engine.play(pcm);
+      this.pendingPlayback = []; this.pendingPlaybackBytes = 0;
+      this.setState('active');
     } catch {
       if (generation === this.generation) {this.stop(); this.setState('error'); throw new Error('Voice connection failed. Your microphone has been released.');}
     }
@@ -66,7 +72,7 @@ export class AudioController {
     if (event.type === 'disconnect' || event.type === 'session.error') {this.release(false); this.setState('error'); return;}
     // Do not flush on input.speech.started: semantic back-channels are not barge-in.
     if ((event.type === 'reply.done' && event.status === 'interrupted') || (event.type === 'transcript.agent' && event.interrupted)) {
-      this.suppressPlayback = true; this.engine?.clearPlayback();
+      this.suppressPlayback = true; this.pendingPlayback = []; this.pendingPlaybackBytes = 0; this.engine?.clearPlayback();
     }
     if (event.type === 'reply.started') this.suppressPlayback = false;
     if (event.type === 'reply.audio' && event.data && !this.suppressPlayback) {
@@ -74,12 +80,20 @@ export class AudioController {
         const binary = atob(event.data); const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         if (bytes.length % 2) throw new Error('Invalid PCM');
-        this.engine?.play(bytes.buffer);
+        if (this.engine) this.engine.play(bytes.buffer);
+        else {
+          // At most ten seconds of PCM16/24kHz while microphone permission and
+          // engine startup are pending. Never grow without bounds or replay
+          // interrupted greetings after permission is granted.
+          if (this.pendingPlaybackBytes + bytes.byteLength > 480_000) throw new Error('Playback startup buffer exceeded');
+          this.pendingPlayback.push(bytes.buffer); this.pendingPlaybackBytes += bytes.byteLength;
+        }
       } catch {this.stop(); this.setState('error');}
     }
   }
   private release(terminal: boolean) {
     ++this.generation;
+    this.pendingPlayback = []; this.pendingPlaybackBytes = 0;
     this.releaseStream(this.stream); this.stream = undefined;
     const engine = this.engine; this.engine = undefined;
     try {engine?.clearPlayback();} catch { /* Continue releasing resources. */ }

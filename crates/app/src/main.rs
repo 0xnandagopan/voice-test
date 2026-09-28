@@ -12,7 +12,7 @@ use v0_app::{AppState, config::Config, router, with_static};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    v0_app::config::load_dotenv()?;
     if env::args().nth(1).as_deref() == Some("hash-password") {
         let mut password = String::new();
         io::stdin().read_to_string(&mut password)?;
@@ -50,8 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.secure_cookie && !address.ip().is_loopback() {
         return Err("Insecure development cookies require a loopback bind".into());
     }
+    let mut state = AppState::new(pool, config);
+    if env::var("VOICE_TEST_ENABLED").as_deref() == Ok("true") {
+        state = state.with_controlled_voice(
+            env::var("VOICE_PUBLIC_ORIGIN")
+                .map_err(|_| "VOICE_PUBLIC_ORIGIN is required for controlled voice")?,
+        )?;
+    }
     let app = with_static(
-        router(AppState::new(pool, config)),
+        router(state),
         &env::var("WEB_DIST").unwrap_or_else(|_| "web/dist".into()),
     );
     let listener = tokio::net::TcpListener::bind(address).await?;

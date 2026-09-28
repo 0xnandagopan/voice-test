@@ -20,7 +20,9 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiErro
     sqlx::query("SELECT 1 FROM interviews LIMIT 1")
         .execute(&state.pool)
         .await?;
-    Ok(Json(json!({"status":"ready","voice_available":false})))
+    Ok(Json(
+        json!({"status":"ready","voice_available":state.controlled_voice_origin.is_some()}),
+    ))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,7 +116,7 @@ fn view(state: &AppState, row: &PgRow) -> SessionView {
         consent_policy_version: CONSENT_POLICY_VERSION.into(),
         expires_at: row.get("expires_at"),
         remaining_seconds: 360 - row.get::<i32, _>("time_consumed_seconds"),
-        voice_available: false,
+        voice_available: state.controlled_voice_origin.is_some(),
     }
 }
 fn available(row: &PgRow) -> Result<(), ApiError> {
@@ -409,7 +411,17 @@ pub async fn start(
     {
         return Err(ApiError::invalid("Recording consent is required."));
     }
-    // Do not create a provider session or acquire a lease until G1/G2 are integrated.
+    // This opt-in is for controlled tests; ordinary customer Start stays gated.
+    if state.controlled_voice_origin.is_some() {
+        if row.get::<String, _>("state") != "consented"
+            || row.get::<i32, _>("time_consumed_seconds") >= 360
+        {
+            return Err(ApiError::conflict());
+        }
+        return Ok(Json(
+            json!({"ws_url":format!("/api/customer/interviews/{id}/live?expected_revision={}", input.expected_revision)}),
+        ));
+    }
     if state.config.voice_api_key.is_none() {
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,

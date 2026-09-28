@@ -1,9 +1,12 @@
+mod agent_cleanup;
 use std::{env, time::Duration};
+use v0_app::composition_jobs::{self, JobFailure};
+use v0_composition::GatewayClient;
 use v0_evidence::{Error, jobs, provider::AssemblyHistory, storage::LocalPrivateStorage};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    v0_app::config::load_dotenv()?;
     tracing_subscriber::fmt()
         .with_env_filter("v0_worker=info")
         .init();
@@ -21,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    let provider = AssemblyHistory::new(key, hosts)?;
+    let provider = AssemblyHistory::new(key.clone(), hosts)?;
     let storage = LocalPrivateStorage::new(
         env::var("EVIDENCE_STORAGE_DIR").unwrap_or_else(|_| ".local/private-evidence".into()),
     )
@@ -31,27 +34,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into()),
         env::var("EVIDENCE_WORK_DIR").unwrap_or_else(|_| ".local/evidence-jobs".into()),
     );
+    let gateway = env::var("GATEWAY_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|model| GatewayClient::new(key.clone(), model).ok());
     loop {
-        if let Some(job) = jobs::claim(&pool).await? {
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(100),
-                jobs::dispatch_with_media(&pool, &job, &provider, &storage, Some(&validator)),
-            )
-            .await;
-            let code = match outcome {
-                Ok(Ok(())) => {
-                    tracing::info!(job_id = %job.id, "job completed");
-                    continue;
+        let claimed = jobs::claim(&pool).await?;
+        v0_app::workflow::reconcile_failed_support(&pool)
+            .await
+            .map_err(|_| "Could not reconcile job failures")?;
+        if let Some(job) = claimed {
+            let run = async {
+                match job.kind.as_str() {
+                    "generate_draft" | "support_check" => match gateway.as_ref() {
+                        Some(client) => composition_jobs::dispatch(&pool, &job, client).await,
+                        None => Err(JobFailure {
+                            code: "gateway_configuration",
+                            retry_after_secs: 0,
+                            terminal: true,
+                        }),
+                    },
+                    "delete_provider_agent" => agent_cleanup::dispatch(&pool, &job, &key)
+                        .await
+                        .map_err(|_| JobFailure {
+                            code: "provider_agent_cleanup_pending",
+                            retry_after_secs: 60,
+                            terminal: false,
+                        }),
+                    "import_evidence" | "cleanup_objects" => jobs::dispatch_with_media(
+                        &pool,
+                        &job,
+                        &provider,
+                        &storage,
+                        Some(&validator),
+                    )
+                    .await
+                    .map_err(|error| JobFailure {
+                        code: match error {
+                            Error::NotReady => "artifacts_not_ready",
+                            Error::Invalid(_) | Error::Json(_) => "invalid_artifacts",
+                            Error::Http(_) => "provider_unavailable",
+                            Error::Io(_) => "storage_unavailable",
+                            _ => "import_failed",
+                        },
+                        retry_after_secs: 30,
+                        terminal: false,
+                    }),
+                    _ => Err(JobFailure {
+                        code: "unsupported_job",
+                        retry_after_secs: 0,
+                        terminal: true,
+                    }),
                 }
-                Err(_) => "import_timeout",
-                Ok(Err(Error::NotReady)) => "artifacts_not_ready",
-                Ok(Err(Error::Invalid(_))) | Ok(Err(Error::Json(_))) => "invalid_artifacts",
-                Ok(Err(Error::Http(_))) => "provider_unavailable",
-                Ok(Err(Error::Io(_))) => "storage_unavailable",
-                Ok(Err(_)) => "import_failed",
             };
-            jobs::fail(&pool, &job, code).await?;
-            tracing::warn!(job_id = %job.id, error_code = code, "job did not complete");
+            let outcome = {
+                tokio::pin!(run);
+                let deadline = tokio::time::sleep(Duration::from_secs(300));
+                tokio::pin!(deadline);
+                let renew = async {
+                    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+                    loop {
+                        heartbeat.tick().await;
+                        let result = sqlx::query("UPDATE jobs SET lease_until=clock_timestamp()+interval '120 seconds' WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_until>clock_timestamp()")
+                            .bind(job.id).bind(job.token).execute(&pool).await;
+                        if !result.is_ok_and(|r| r.rows_affected() == 1) {
+                            break;
+                        }
+                    }
+                };
+                tokio::pin!(renew);
+                tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                    _ = &mut deadline => Some(Err(JobFailure {code:"job_timeout",retry_after_secs:60,terminal:false})),
+                    _ = &mut renew => None,
+                }
+            };
+            match outcome {
+                Some(Ok(())) => tracing::info!(job_id=%job.id,"job completed"),
+                Some(Err(failure)) => {
+                    tracing::warn!(job_id=%job.id,error_code=failure.code,"job did not complete");
+                    if job.kind == "import_evidence" {
+                        jobs::fail(&pool, &job, failure.code).await?;
+                    } else {
+                        composition_jobs::fail(&pool, &job, failure)
+                            .await
+                            .map_err(|_| "Could not persist job failure")?;
+                    }
+                }
+                None => tracing::warn!(job_id=%job.id,"job lease lost"),
+            }
         } else {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,

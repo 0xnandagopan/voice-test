@@ -57,3 +57,29 @@ test('duplicate Start is rejected while connection is pending',async()=>{
   c.stop(); resolve({stop:()=>{},close:()=>{},sendAudio:()=>{}}); await pending;
   assert.equal(f.counts.mic,0);
 });
+test('greeting received during microphone permission is played once engine is ready',async()=>{
+  const f=fixture(); let resolve;
+  f.deps.getMicrophone=()=>new Promise(r=>resolve=r);
+  const c=new AudioController(f.deps), starting=c.start({consented:true,connect:f.connect});
+  await Promise.resolve(); f.event({type:'reply.audio',data:'AAA='});
+  assert.equal(f.counts.played,0); resolve(f.stream); await starting;
+  assert.equal(f.counts.played,1); c.dispose();
+});
+test('interruption and Stop discard buffered startup audio',async()=>{
+  for (const mode of ['interrupt','stop']) {
+    const f=fixture(); let resolve;
+    f.deps.getMicrophone=()=>new Promise(r=>resolve=r);
+    const c=new AudioController(f.deps), starting=c.start({consented:true,connect:f.connect});
+    await Promise.resolve(); f.event({type:'reply.audio',data:'AAA='});
+    if (mode==='interrupt') f.event({type:'reply.done',status:'interrupted'}); else c.stop();
+    resolve(f.stream); await starting; assert.equal(f.counts.played,0); c.dispose();
+  }
+});
+test('startup playback overflow releases pending microphone and closes connection',async()=>{
+  const f=fixture(); let resolve;
+  f.deps.getMicrophone=()=>new Promise(r=>resolve=r);
+  const c=new AudioController(f.deps), starting=c.start({consented:true,connect:f.connect});
+  await Promise.resolve(); f.event({type:'reply.audio',data:Buffer.alloc(480002).toString('base64')});
+  assert.equal(c.state,'error'); assert.equal(f.counts.terminal,1);
+  resolve(f.stream); await starting; assert.equal(f.counts.stopped,1); assert.equal(f.counts.played,0);
+});

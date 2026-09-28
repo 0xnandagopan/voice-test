@@ -1,4 +1,5 @@
 import { defineConfig } from "@playwright/test";
+const port = process.env.V0_WEB_TEST_PORT ?? "5173";
 export default defineConfig({
   testDir: "./tests",
   testMatch: "*.mock.spec.ts",
@@ -7,7 +8,7 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   use: {
-    baseURL: "http://localhost:5173",
+    baseURL: `http://localhost:${port}`,
     headless: true,
     launchOptions: {
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
@@ -18,8 +19,8 @@ export default defineConfig({
     },
   },
   webServer: {
-    command: "npm run dev -- --port 5173 --strictPort",
-    url: "http://localhost:5173",
+    command: `npm run dev -- --port ${port} --strictPort`,
+    url: `http://localhost:${port}`,
     reuseExistingServer: !process.env.CI,
   },
   outputDir: "test-results",

@@ -15,6 +15,13 @@ import {
   type SessionView,
 } from "./api";
 import { AudioController, browserAudioDependencies } from "./audio";
+import { Review } from "./Review";
+import { OperatorReview, PublicTestimonial } from "./Publication";
+import {
+  connectRelay,
+  type RelayEvent,
+  type RelayTransport,
+} from "./voice-transport";
 
 function useAudioController() {
   const ref = useRef<AudioController | null>(null);
@@ -337,6 +344,12 @@ function Dashboard({ username }: { username: string }) {
                     <strong>{item.customer_label}</strong>
                     <p>{item.project_context}</p>
                     <span className="badge">{item.state}</span>
+                    <Link
+                      className="text-link"
+                      to={`/operator/interviews/${item.id}`}
+                    >
+                      Review testimonial
+                    </Link>
                     <span className="small muted">
                       {" "}
                       Expires {new Date(item.expires_at).toLocaleDateString()}
@@ -488,7 +501,12 @@ function Welcome({ invitationId }: { invitationId?: string }) {
         </section>
         <section className="card consent-card">
           {hasConsent ? (
-            <Readiness session={session.data} />
+            <>
+              <Readiness session={session.data} />
+              <Link className="text-link" to={`/review/${session.data.id}`}>
+                View saved recording and review
+              </Link>
+            </>
           ) : (
             <>
               <span className="card-icon" aria-hidden>
@@ -680,18 +698,93 @@ function Interview() {
   const session = useQuery(sessionQuery);
   const controller = useAudioController();
   const [stopped, setStopped] = useState(false);
+  const [active, setActive] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const [remaining, setRemaining] = useState<number | null>(null);
+  const [captions, setCaptions] = useState<
+    Record<string, Extract<RelayEvent, { type: "caption" }>>
+  >({});
+  const transport = useRef<RelayTransport | null>(null);
+  const connection = useRef<AbortController | null>(null);
+  const pinnedInterview = useRef<string | null>(null);
+  if (!pinnedInterview.current && session.data)
+    pinnedInterview.current = session.data.id;
+  useEffect(
+    () => () => {
+      connection.current?.abort();
+    },
+    [],
+  );
+  function stop() {
+    controller.current?.stop();
+    connection.current?.abort();
+    transport.current = null;
+    setActive(false);
+    setStopped(true);
+  }
   const start = useMutation({
-    mutationFn: () =>
-      api("/customer/start", {
-        interview_id: session.data?.id,
-        expected_revision: session.data?.revision,
-      }),
-    onSuccess: () => {
-      throw new Error(
-        "The live voice connection is not available in this build. No recording has started.",
-      );
+    mutationFn: async () => {
+      if (
+        !session.data?.consented_at ||
+        session.data.id !== pinnedInterview.current
+      )
+        throw new Error(
+          "Open the correct private invitation and confirm recording consent first.",
+        );
+      const attempt = new AbortController();
+      connection.current = attempt;
+      const result = await api<{ ws_url: string }>("/customer/start", {
+        interview_id: pinnedInterview.current,
+        expected_revision: session.data.revision,
+      });
+      if (attempt.signal.aborted) return;
+      if (!result.ws_url)
+        throw new Error(
+          "The live voice connection is not available. No recording has started.",
+        );
+      await controller.current!.start({
+        consented: Boolean(session.data.consented_at),
+        connect: async (onAudio) => {
+          const relay = await connectRelay(
+            result.ws_url,
+            onAudio,
+            (event) => {
+              if (attempt.signal.aborted) return;
+              if (event.type === "ready" || event.type === "state")
+                setRemaining(event.remaining_seconds);
+              if (event.type === "caption")
+                setCaptions((previous) => ({
+                  ...previous,
+                  [event.item_id]: event,
+                }));
+              if (event.type === "ended") {
+                setActive(false);
+                setEnded(true);
+                void session.refetch();
+              }
+              if (event.type === "error") {
+                setActive(false);
+                setEnded(true);
+                setError(
+                  new Error(
+                    "The connection stopped. Your microphone has been released. Check recording recovery before continuing.",
+                  ),
+                );
+              }
+            },
+            attempt.signal,
+          );
+          transport.current = relay;
+          return relay;
+        },
+      });
+      if (!attempt.signal.aborted && controller.current?.state === "active")
+        setActive(true);
     },
   });
+  const scopeMismatch =
+    session.data && pinnedInterview.current !== session.data.id;
   return (
     <Shell>
       <Steps current={3} />
@@ -700,6 +793,14 @@ function Interview() {
           <Pending />
         ) : session.isError ? (
           <AccessError error={session.error} />
+        ) : scopeMismatch ? (
+          <AccessError
+            error={
+              new Error(
+                "Your active invitation changed. Reopen the correct private link.",
+              )
+            }
+          />
         ) : !session.data.consented_at ? (
           <>
             <h1>Consent comes first.</h1>
@@ -718,42 +819,108 @@ function Interview() {
               <span />
               <span />
             </div>
-            <h1>Ready when you are.</h1>
+            <h1>
+              {active
+                ? "Tell us your story."
+                : ended
+                  ? "Review what was recovered."
+                  : "Ready when you are."}
+            </h1>
             <p>
               Three topics. Up to{" "}
-              {Math.ceil(session.data.remaining_seconds / 60)} minutes. Tell us
-              what worked, what changed, and what could have been better.
+              {Math.ceil((remaining ?? session.data.remaining_seconds) / 60)}{" "}
+              minutes remaining. Tell us what worked, what changed, and what
+              could have been better.
             </p>
-            <Notice>
-              Live interviews are not ready in this build. No recording is in
-              progress.
-            </Notice>
+            {!session.data.voice_available && (
+              <Notice>
+                Live interviews are not ready in this build. No recording is in
+                progress.
+              </Notice>
+            )}
+            {active && (
+              <Notice>Recording is active. You can stop at any time.</Notice>
+            )}
             <ErrorNotice error={start.error} />
+            <ErrorNotice error={error} />
             {stopped && (
               <Notice>
                 Stopped locally. No microphone or playback is active.
               </Notice>
             )}
+            {ended && (
+              <Notice>
+                The conversation has ended. Available recordings may still be
+                recovering.
+              </Notice>
+            )}
             <div className="actions">
               <button
-                disabled={start.isPending}
+                disabled={start.isPending || active || ended || stopped}
                 onClick={() => {
+                  setError(null);
                   setStopped(false);
                   start.mutate();
                 }}
               >
-                {start.isPending ? "Checking availability…" : "Start interview"}
+                {start.isPending ? "Connecting…" : "Start interview"}
               </button>
-              <button
-                className="secondary"
-                onClick={() => {
-                  controller.current?.stop();
-                  setStopped(true);
-                }}
-              >
+              <button className="secondary" onClick={stop}>
                 Stop
               </button>
+              {active && (
+                <>
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      try {
+                        transport.current?.control("repeat");
+                      } catch {
+                        stop();
+                      }
+                    }}
+                  >
+                    Repeat question
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      try {
+                        transport.current?.control("skip");
+                      } catch {
+                        stop();
+                      }
+                    }}
+                  >
+                    Skip topic
+                  </button>
+                </>
+              )}
             </div>
+            {Object.keys(captions).length > 0 && (
+              <section
+                className="live-captions"
+                aria-label="Provisional conversation captions"
+              >
+                <h2>Live captions</h2>
+                <p className="small">
+                  Provisional captions are not saved recording evidence.
+                </p>
+                {Object.values(captions).map((caption) => (
+                  <p key={caption.item_id}>
+                    <strong>
+                      {caption.speaker === "customer" ? "You" : "Interviewer"}
+                      :{" "}
+                    </strong>
+                    {caption.text}
+                    {!caption.final && " …"}
+                  </p>
+                ))}
+              </section>
+            )}
+            <Link className="text-link" to={`/review/${session.data.id}`}>
+              View saved recording and review
+            </Link>
             <Link className="text-link" to={`/i/${session.data.id}`}>
               Back to sound check
             </Link>
@@ -763,32 +930,6 @@ function Interview() {
             </p>
           </>
         )}
-      </section>
-    </Shell>
-  );
-}
-function NotReady({ publicPage = false }: { publicPage?: boolean }) {
-  return (
-    <Shell>
-      <section className="card placeholder">
-        <p className="eyebrow">
-          {publicPage ? "PUBLIC TESTIMONIAL" : "PRIVATE REVIEW"}
-        </p>
-        <h1>
-          {publicPage
-            ? "Nothing is published here."
-            : "Your story takes shape here."}
-        </h1>
-        <p>
-          {publicPage
-            ? "This build does not serve published testimonials yet."
-            : "Review becomes available after the interview recording has been recovered and a draft has been checked against it."}
-        </p>
-        <Notice>
-          {publicPage
-            ? "No public snapshot is available."
-            : "Drafting and approval are not available in this build. Nothing has been approved or published."}
-        </Notice>
       </section>
     </Shell>
   );
@@ -812,10 +953,40 @@ export function App() {
     <Routes>
       <Route path="/" element={<Landing />} />
       <Route path="/operator" element={<Operator />} />
+      <Route
+        path="/operator/interviews/:interviewId"
+        element={
+          <Shell operator>
+            <OperatorReview />
+          </Shell>
+        }
+      />
       <Route path="/i/:invitationId" element={<Invitation />} />
       <Route path="/interview" element={<Interview />} />
-      <Route path="/review" element={<NotReady />} />
-      <Route path="/t/:slug" element={<NotReady publicPage />} />
+      <Route
+        path="/review"
+        element={
+          <Shell>
+            <Review />
+          </Shell>
+        }
+      />
+      <Route
+        path="/review/:interviewId"
+        element={
+          <Shell>
+            <Review />
+          </Shell>
+        }
+      />
+      <Route
+        path="/t/:slug"
+        element={
+          <Shell>
+            <PublicTestimonial />
+          </Shell>
+        }
+      />
       <Route path="*" element={<Landing />} />
     </Routes>
   );

@@ -6,6 +6,9 @@ publish.workspace = true
 
 [dependencies]
 v0-evidence = { path = "../evidence" }
+v0-app = { path = "../app" }
+v0-composition = { path = "../composition" }
+reqwest.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true

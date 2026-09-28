@@ -105,7 +105,7 @@ async fn import(
             .cloned()
             .ok_or(Error::Invalid("attempt payload"))?,
     )?;
-    let mapping = sqlx::query("SELECT p.provider_session_id,p.product_end_reason,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now()")
+    let mapping = sqlx::query("SELECT p.provider_session_id,p.product_end_reason,p.incomplete_turn_ids,i.revision FROM provider_attempts p JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.interview_id=$2 AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>now()")
         .bind(attempt).bind(job.interview_id).fetch_optional(pool).await?.ok_or(Error::Stale)?;
     let session: Option<String> = mapping.get("provider_session_id");
     let session = session.ok_or(Error::NotReady)?;
@@ -125,6 +125,17 @@ async fn import(
     )?;
     manifest.provider_close_reason = artifacts.close_reason.clone();
     manifest.product_end_reason = mapping.get("product_end_reason");
+    let trusted: Vec<String> = serde_json::from_value(mapping.get("incomplete_turn_ids"))?;
+    // Live item IDs and history turn IDs are distinct; map only identities from this attempt.
+    for segment in &manifest.segments {
+        if trusted
+            .iter()
+            .any(|id| id == &segment.turn_id || segment.item_id.as_ref() == Some(id))
+            && !manifest.incomplete_turn_ids.contains(&segment.turn_id)
+        {
+            manifest.incomplete_turn_ids.push(segment.turn_id.clone());
+        }
+    }
     if let Some(validator) = validator {
         manifest.media = Some(validator.validate(&artifacts.audio, &manifest).await?);
         manifest.recording_validation = "decoded_bounded_alignment_unverified".into();

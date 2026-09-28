@@ -135,7 +135,11 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
     .bind(json!(source_ids))
     .execute(&mut **tx)
     .await?;
-    store(tx, id, state).await
+    store(tx, id, state).await?;
+    if state.content.is_some() {
+        enqueue_check(tx, id, state).await?;
+    }
+    Ok(())
 }
 async fn actor(tx: &mut Tx<'_>, id: Uuid, token: &str) -> Result<String, ApiError> {
     let row = sqlx::query("SELECT role,interview_id,expires_at FROM sessions WHERE token_hash=$1 AND expires_at>clock_timestamp() FOR SHARE")
@@ -234,6 +238,10 @@ pub async fn execute(
         return Err(ApiError::conflict());
     }
     let mut changed = true;
+    let recheck = matches!(
+        &command.action,
+        WorkflowAction::Save { .. } | WorkflowAction::CorrectTranscript { .. }
+    );
     match command.action {
         WorkflowAction::Save { content } => {
             validate_content(&content)?;
@@ -309,6 +317,9 @@ pub async fn execute(
         state.revisions.workflow += 1;
     }
     store(&mut tx, id, &state).await?;
+    if changed && recheck && state.content.is_some() {
+        enqueue_check(&mut tx, id, &state).await?;
+    }
     sqlx::query("INSERT INTO workflow_receipts(interview_id,actor_hash,request_id,request_hash) VALUES($1,$2,$3,$4)")
         .bind(id).bind(actor_hash).bind(command.request_id).bind(request_hash).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events(interview_id,event) VALUES($1,'workflow_command')")
@@ -340,6 +351,16 @@ pub async fn complete_support(
     job_id: Uuid,
     lease_token: Uuid,
     result: SupportResult,
+) -> Result<(), ApiError> {
+    complete_support_assessed(pool, id, job_id, lease_token, result, None).await
+}
+pub async fn complete_support_assessed(
+    pool: &PgPool,
+    id: Uuid,
+    job_id: Uuid,
+    lease_token: Uuid,
+    result: SupportResult,
+    assessment: Option<Value>,
 ) -> Result<(), ApiError> {
     let mut tx = lock(pool, id).await?;
     let mut state = load(&mut tx, id).await?;
@@ -380,13 +401,17 @@ pub async fn complete_support(
     state.check = result.status;
     state.revisions.workflow += 1;
     store(&mut tx, id, &state).await?;
+    let mut details = encode(&result)?;
+    details["kind"] = json!("support_check");
+    details["assessment"] = assessment.unwrap_or(Value::Null);
     sqlx::query("INSERT INTO workflow_support_results(interview_id,content_revision,evidence_revision,result) VALUES($1,$2,$3,$4) ON CONFLICT (interview_id,content_revision,evidence_revision) DO UPDATE SET result=EXCLUDED.result")
-        .bind(id).bind(result.content_revision).bind(result.evidence_revision).bind(encode(&result)?).execute(&mut *tx).await?;
+        .bind(id).bind(result.content_revision).bind(result.evidence_revision).bind(details).execute(&mut *tx).await?;
     let done=sqlx::query("UPDATE jobs SET status='succeeded',lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp()")
         .bind(job_id).bind(lease_token).execute(&mut *tx).await?;
     if done.rows_affected() != 1 {
         return Err(ApiError::conflict());
     }
+    current_access(&mut tx, id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -407,4 +432,270 @@ pub async fn published(pool: &PgPool, id: Uuid) -> Result<ApprovalSnapshot, ApiE
     current_access(&mut tx, id).await?;
     tx.commit().await?;
     Ok(approval)
+}
+
+async fn enqueue_check(tx: &mut Tx<'_>, id: Uuid, state: &WorkflowView) -> Result<Uuid, ApiError> {
+    let key = format!(
+        "support:{id}:{}:{}",
+        state.revisions.content, state.revisions.evidence
+    );
+    let payload = json!({"content_revision":state.revisions.content,"evidence_revision":state.revisions.evidence,"content_hash":hash_secret(&encode(&state.content)?.to_string())});
+    let job=sqlx::query_scalar("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'support_check',$3,$4,3) ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key=EXCLUDED.dedupe_key RETURNING id").bind(Uuid::new_v4()).bind(id).bind(payload).bind(key).fetch_one(&mut **tx).await?;
+    Ok(job)
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationRequest {
+    pub request_id: Uuid,
+    pub expected: Revisions,
+}
+pub async fn request_generation(
+    pool: &PgPool,
+    token: &str,
+    id: Uuid,
+    request: GenerationRequest,
+) -> Result<(Uuid, WorkflowView), ApiError> {
+    let mut tx = lock(pool, id).await?;
+    actor(&mut tx, id, token).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let key = format!(
+        "generate:{id}:{}:{}",
+        hash_secret(token),
+        request.request_id
+    );
+    let existing = sqlx::query("SELECT id,payload FROM jobs WHERE dedupe_key=$1")
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(row) = existing {
+        let payload: Value = row.get("payload");
+        if payload["expected"] != encode(&request.expected)? {
+            return Err(ApiError::conflict());
+        }
+        tx.commit().await?;
+        return Ok((row.get("id"), state));
+    }
+    if state.revisions != request.expected || state.approval.is_some() || state.declined {
+        return Err(ApiError::conflict());
+    }
+    let imports: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evidence_imports WHERE interview_id=$1)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !imports {
+        return Err(ApiError::invalid(
+            "A saved recording is required before drafting.",
+        ));
+    }
+    let job = Uuid::new_v4();
+    let payload = json!({"expected":request.expected,"content_revision":state.revisions.content,"evidence_revision":state.revisions.evidence,"content_hash":hash_secret(&encode(&state.content)?.to_string())});
+    sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'generate_draft',$3,$4,3)").bind(job).bind(id).bind(payload).bind(key).execute(&mut *tx).await?;
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok((job, state))
+}
+/// Trusted generation completion. A failed/stale worker cannot overwrite an edit.
+pub async fn complete_generation(
+    pool: &PgPool,
+    id: Uuid,
+    job: Uuid,
+    lease: Uuid,
+    text: Option<String>,
+) -> Result<(), ApiError> {
+    complete_generation_assessed(pool, id, job, lease, text, None).await
+}
+pub async fn complete_generation_assessed(
+    pool: &PgPool,
+    id: Uuid,
+    job: Uuid,
+    lease: Uuid,
+    text: Option<String>,
+    assessment: Option<Value>,
+) -> Result<(), ApiError> {
+    let mut tx = lock(pool, id).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let row=sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='generate_draft' AND status='running' AND lease_token=$3 FOR UPDATE").bind(job).bind(id).bind(lease).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    let payload: Value = row.get("payload");
+    if payload["content_revision"] != state.revisions.content
+        || payload["evidence_revision"] != state.revisions.evidence
+        || payload["content_hash"] != hash_secret(&encode(&state.content)?.to_string())
+        || state.approval.is_some()
+        || state.declined
+    {
+        return Err(ApiError::conflict());
+    }
+    let generated = text.is_some();
+    if let Some(text) = text {
+        let attribution: String =
+            sqlx::query_scalar("SELECT customer_label FROM interviews WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let content = Content {
+            text,
+            attribution,
+            clips: vec![],
+        };
+        validate_content(&content)?;
+        state.content = Some(content);
+        state.revisions.content += 1;
+        state.revisions.workflow += 1;
+        invalidate(&mut state);
+        store(&mut tx, id, &state).await?;
+        enqueue_check(&mut tx, id, &state).await?;
+    }
+    if let Some(details) = assessment {
+        sqlx::query("INSERT INTO workflow_support_results(interview_id,content_revision,evidence_revision,result) VALUES($1,$2,$3,$4) ON CONFLICT(interview_id,content_revision,evidence_revision) DO UPDATE SET result=EXCLUDED.result")
+            .bind(id).bind(state.revisions.content).bind(state.revisions.evidence).bind(details).execute(&mut *tx).await?;
+    }
+    let done=sqlx::query("UPDATE jobs SET status='succeeded',last_error=CASE WHEN $3 THEN NULL ELSE 'insufficient_evidence' END,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp()").bind(job).bind(lease).bind(generated).execute(&mut *tx).await?;
+    if done.rows_affected() != 1 {
+        return Err(ApiError::conflict());
+    }
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+pub async fn retry_job(
+    pool: &PgPool,
+    token: &str,
+    request: RetryRequest,
+) -> Result<(Uuid, WorkflowView), ApiError> {
+    let id = request.interview_id;
+    let mut tx = lock(pool, id).await?;
+    actor(&mut tx, id, token).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let payload_hash = hash_secret(&encode(&request)?.to_string());
+    let existing:Option<String>=sqlx::query_scalar("SELECT request_hash FROM workflow_receipts WHERE interview_id=$1 AND actor_hash=$2 AND request_id=$3").bind(id).bind(hash_secret(token)).bind(request.request_id).fetch_optional(&mut *tx).await?;
+    if let Some(h) = existing {
+        if h != payload_hash {
+            return Err(ApiError::conflict());
+        }
+        tx.commit().await?;
+        return Ok((request.job_id, state));
+    }
+    if state.revisions != request.expected {
+        return Err(ApiError::conflict());
+    }
+    let row = sqlx::query(
+        "SELECT kind,payload,status FROM jobs WHERE id=$1 AND interview_id=$2 FOR UPDATE",
+    )
+    .bind(request.job_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(ApiError::unauthorized)?;
+    let kind: String = row.get("kind");
+    let payload: Value = row.get("payload");
+    if row.get::<String, _>("status") != "failed"
+        || !matches!(
+            kind.as_str(),
+            "import_evidence" | "support_check" | "generate_draft"
+        )
+    {
+        return Err(ApiError::conflict());
+    }
+    if kind != "import_evidence"
+        && (payload["content_revision"] != state.revisions.content
+            || payload["evidence_revision"] != state.revisions.evidence)
+    {
+        return Err(ApiError::conflict());
+    }
+    sqlx::query("UPDATE jobs SET status='queued',max_attempts=attempts+3,available_at=clock_timestamp(),last_error=NULL,lease_token=NULL,lease_until=NULL WHERE id=$1").bind(request.job_id).execute(&mut *tx).await?;
+    if kind == "support_check" {
+        state.check = CheckStatus::Pending;
+        state.revisions.workflow += 1;
+        store(&mut tx, id, &state).await?;
+    }
+    sqlx::query("INSERT INTO workflow_receipts(interview_id,actor_hash,request_id,request_hash) VALUES($1,$2,$3,$4)").bind(id).bind(hash_secret(token)).bind(request.request_id).bind(payload_hash).execute(&mut *tx).await?;
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok((request.job_id, state))
+}
+
+/// Snapshot only current authorized job inputs. Original recording transcripts
+/// remain the support source; edited transcript annotations never rewrite them.
+pub async fn composition_input(
+    pool: &PgPool,
+    id: Uuid,
+    job_id: Uuid,
+    lease: Uuid,
+) -> Result<(WorkflowView, Vec<v0_composition::EvidenceSource>), ApiError> {
+    let mut tx = lock(pool, id).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let job=sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind IN ('support_check','generate_draft') AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE").bind(job_id).bind(id).bind(lease).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    let payload: Value = job.get("payload");
+    if payload["content_revision"] != state.revisions.content
+        || payload["evidence_revision"] != state.revisions.evidence
+        || payload["content_hash"] != hash_secret(&encode(&state.content)?.to_string())
+    {
+        return Err(ApiError::conflict());
+    }
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT manifest FROM evidence_imports WHERE interview_id=$1 ORDER BY provider_attempt_id",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut sources = vec![];
+    for value in rows {
+        let m: v0_evidence::manifest::Manifest =
+            serde_json::from_value(value).map_err(|_| ApiError::conflict())?;
+        for segment in &m.segments {
+            let decoded = m.media.as_ref().is_some_and(|m| {
+                m.ranges.iter().any(|r| {
+                    r.source_id == segment.source_id && r.within_recording && r.audible_samples > 0
+                })
+            });
+            if segment.speaker == "customer"
+                && decoded
+                && segment.turn_status == "completed"
+                && !m.incomplete_turn_ids.contains(&segment.turn_id)
+            {
+                sources.push(v0_composition::EvidenceSource {
+                    id: segment.source_id.clone(),
+                    text: segment.text.clone(),
+                });
+            }
+        }
+    }
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok((state, sources))
+}
+
+/// Failure propagation shares the same authority lock and revision protocol as edits.
+pub async fn fail_support_job(pool: &PgPool, id: Uuid, job_id: Uuid) -> Result<(), ApiError> {
+    let mut tx = lock(pool, id).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let payload: Option<Value> = sqlx::query_scalar("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='support_check' AND status='failed' FOR UPDATE")
+        .bind(job_id).bind(id).fetch_optional(&mut *tx).await?;
+    if payload.is_some_and(|p| {
+        p["content_revision"] == state.revisions.content
+            && p["evidence_revision"] == state.revisions.evidence
+    }) && state.check == CheckStatus::Pending
+    {
+        state.check = CheckStatus::Failed;
+        state.revisions.workflow += 1;
+        store(&mut tx, id, &state).await?;
+    }
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Reconcile final-attempt worker crashes through normal authority fencing.
+pub async fn reconcile_failed_support(pool: &PgPool) -> Result<(), ApiError> {
+    let rows = sqlx::query("SELECT j.id,j.interview_id FROM jobs j JOIN workflow_state w ON w.interview_id=j.interview_id JOIN interviews i ON i.id=j.interview_id WHERE j.kind='support_check' AND j.status='failed' AND w.value->>'check'='pending' AND j.payload->'content_revision'=w.value->'revisions'->'content' AND j.payload->'evidence_revision'=w.value->'revisions'->'evidence' AND i.deleted_at IS NULL AND i.state NOT IN ('revoked','deleted') AND i.expires_at>clock_timestamp() ORDER BY j.id LIMIT 30")
+        .fetch_all(pool).await?;
+    for row in rows {
+        let _ = fail_support_job(pool, row.get("interview_id"), row.get("id")).await;
+    }
+    Ok(())
 }

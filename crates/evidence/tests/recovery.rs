@@ -142,6 +142,11 @@ async fn database() -> (PgPool, String, String) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../migrations/0003_voice_answer_ledger.sql"
+    ))
+    .await
+    .unwrap();
     (pool, schema, url)
 }
 async fn seed(pool: &PgPool) -> (Uuid, Uuid) {
@@ -988,5 +993,32 @@ async fn postgres_recovery_distinguishes_terminal_artifact_failure_from_retry() 
         .unwrap();
     assert_eq!(view.attempts.len(), 2);
     assert_eq!(view.recommended_action, "retry_recovery_or_discard");
+    drop_database(pool, schema, url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn interrupted_live_item_is_mapped_only_within_its_provider_attempt() {
+    let (pool, schema, url) = database().await;
+    let (id, attempt) = seed(&pool).await;
+    sqlx::query("UPDATE provider_attempts SET incomplete_turn_ids='[\"item1\",\"unknown-item\"]' WHERE id=$1").bind(attempt).execute(&pool).await.unwrap();
+    jobs::enqueue_import(&pool, id, attempt).await.unwrap();
+    let job = jobs::claim(&pool).await.unwrap().unwrap();
+    let dir = std::env::temp_dir().join(format!("v0-incomplete-{}", Uuid::new_v4()));
+    let storage = LocalPrivateStorage::new(&dir).await.unwrap();
+    jobs::dispatch(&pool, &job, &Fixture, &storage)
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        sqlx::query_scalar("SELECT manifest FROM evidence_imports WHERE provider_attempt_id=$1")
+            .bind(attempt)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let m: manifest::Manifest = serde_json::from_value(value).unwrap();
+    assert!(m.incomplete_turn_ids.contains(&"turn1".into()));
+    assert!(!m.incomplete_turn_ids.contains(&"unknown-item".into()));
+    assert!(!m.approval_eligible);
+    tokio::fs::remove_dir_all(dir).await.unwrap();
     drop_database(pool, schema, url).await;
 }

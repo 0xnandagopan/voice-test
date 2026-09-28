@@ -203,3 +203,115 @@ test("same-browser invitation tabs cannot consent to the wrong interview", async
     await customer.close();
   }
 });
+
+test("real API private review saves edits across reload and reconciles a second tab without approving unverified evidence", async ({
+  browser,
+  page,
+}) => {
+  test.skip(
+    !process.env.TEST_OPERATOR_USERNAME || !process.env.TEST_OPERATOR_PASSWORD,
+    "Set local operator test credentials for the connected review journey.",
+  );
+  await page.goto("/operator");
+  await page
+    .getByLabel("Username", { exact: true })
+    .fill(process.env.TEST_OPERATOR_USERNAME!);
+  await page
+    .getByLabel("Password", { exact: true })
+    .fill(process.env.TEST_OPERATOR_PASSWORD!);
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByLabel("Customer name").fill(`Synthetic review ${Date.now()}`);
+  await page
+    .getByLabel("Project context")
+    .fill(
+      "Synthetic manual draft and conflict regression; no recording or provider request.",
+    );
+  await page.getByRole("button", { name: "Create private invitation" }).click();
+  const invitation = await page
+    .getByLabel("Private invitation link")
+    .inputValue();
+  const context = await browser.newContext();
+  try {
+    const tabA = await context.newPage();
+    await tabA.goto(invitation);
+    await tabA.getByRole("checkbox", { name: /I consent/ }).check();
+    await tabA
+      .getByRole("button", { name: "I agree — check my sound" })
+      .click();
+    await tabA
+      .getByRole("link", { name: "View saved recording and review" })
+      .click();
+    await expect(
+      tabA.getByText("No recorded sources are available yet."),
+    ).toBeVisible();
+    await expect(
+      tabA.getByRole("button", { name: "Prepare provisional draft" }),
+    ).toBeDisabled();
+    await tabA.getByRole("button", { name: "Write my own draft" }).click();
+    const savedText = "A synthetic private draft awaiting recorded support.";
+    await tabA.getByLabel("Testimonial text").fill(savedText);
+    await tabA
+      .getByLabel("Attribution", { exact: true })
+      .fill("Synthetic participant");
+    const save = tabA.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith("/workflow") &&
+        response.request().method() === "POST",
+    );
+    await tabA.getByRole("button", { name: "Save changes" }).click();
+    expect((await save).status()).toBe(200);
+    await tabA.reload();
+    await expect(tabA.getByLabel("Testimonial text")).toHaveValue(savedText);
+    await expect(
+      tabA.getByRole("checkbox", { name: /I approve this exact/ }),
+    ).toBeDisabled();
+    await expect(
+      tabA.getByRole("button", { name: "Approve exact testimonial" }),
+    ).toBeDisabled();
+    const tabB = await context.newPage();
+    await tabB.goto(tabA.url());
+    await expect(tabB.getByLabel("Testimonial text")).toHaveValue(savedText);
+    await tabA
+      .getByLabel("Testimonial text")
+      .fill("My local unsaved version, preserved for reconciliation.");
+    await tabB
+      .getByLabel("Testimonial text")
+      .fill("The other tab saved this version first.");
+    const saveB = tabB.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith("/workflow") &&
+        response.request().method() === "POST",
+    );
+    await tabB.getByRole("button", { name: "Save changes" }).click();
+    expect((await saveB).status()).toBe(200);
+    await tabA.getByRole("button", { name: "Refresh saved status" }).click();
+    await expect(
+      tabA.getByRole("heading", { name: "Latest saved text" }),
+    ).toBeVisible();
+    await expect(tabA.getByLabel("Testimonial text")).toHaveValue(
+      "My local unsaved version, preserved for reconciliation.",
+    );
+    await expect(
+      tabA.getByRole("button", { name: "Save changes" }),
+    ).toBeDisabled();
+    await tabA
+      .getByRole("button", { name: "Keep my edits against latest version" })
+      .click();
+    const reconciled = tabA.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname.endsWith("/workflow") &&
+        response.request().method() === "POST",
+    );
+    await tabA.getByRole("button", { name: "Save changes" }).click();
+    expect((await reconciled).status()).toBe(200);
+    await tabA.reload();
+    await expect(tabA.getByLabel("Testimonial text")).toHaveValue(
+      "My local unsaved version, preserved for reconciliation.",
+    );
+    await expect(
+      tabA.getByRole("button", { name: "Approve exact testimonial" }),
+    ).toBeDisabled();
+  } finally {
+    await context.close();
+  }
+});

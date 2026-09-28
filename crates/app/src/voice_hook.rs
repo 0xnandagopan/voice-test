@@ -1,5 +1,5 @@
-//! Local custom-LLM candidate. AssemblyAI live integration remains gated: no
-//! public URL is provisioned. Credentials are scoped per durable provider attempt.
+//! Fenced custom-LLM callback. Provider history is checked against trusted final
+//! events; message boundaries never determine answer or follow-up counts.
 use crate::{
     AppState,
     auth::{hash_secret, random_secret},
@@ -21,13 +21,13 @@ use v0_voice::{
     pre_speech::{CommittedQuestion, FollowupKind, QuestionPlan},
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -167,8 +167,21 @@ async fn completion(
         .and_then(|v| v.strip_prefix("Bearer "))
         .filter(|s| s.len() == 64)
         .ok_or_else(ApiError::unauthorized)?;
-    let result = complete(&state.pool, attempt, token, input).await?;
-    Ok(result)
+    // The provider's HTTP callback and WebSocket final event are independent
+    // transports. Briefly allow the trusted relay to commit an already-arriving
+    // final without treating callback text as authority or holding a DB lock.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        match complete(&state.pool, attempt, token, input.clone()).await {
+            Err(error)
+                if error.0 == axum::http::StatusCode::CONFLICT
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
 }
 /// Validate auth/history, commit permit and counters, then emit only permit text.
 /// Duplicate user history returns the same completion ID, including after restart.
@@ -209,83 +222,95 @@ pub async fn complete(
     let binding=sqlx::query("SELECT b.*,p.lease_generation FROM voice_hook_bindings b JOIN provider_attempts p ON p.id=b.attempt_id WHERE b.attempt_id=$1 AND b.secret_hash=$2 AND p.state='active' AND p.control_mode='custom' AND b.binding_generation=p.lease_generation")
   .bind(attempt).bind(hash_secret(token)).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::unauthorized)?;
     let consumed = validate(&row, binding.get("lease_generation"))?;
-    let count = users.len() as i32;
-    let processed: i32 = binding.get("processed_user_count");
-    let (permit, plan) = if processed == count {
-        if binding
-            .get::<Option<String>, _>("last_request_hash")
-            .as_deref()
-            != Some(&request_hash)
-        {
-            return Err(ApiError::conflict());
-        }
-        let permit: Uuid = binding
-            .get::<Option<Uuid>, _>("last_permit_id")
-            .ok_or_else(ApiError::conflict)?;
-        let plan: serde_json::Value =
-            sqlx::query_scalar("SELECT plan FROM question_permits WHERE id=$1 AND attempt_id=$2")
-                .bind(permit)
-                .bind(attempt)
-                .fetch_one(&mut *tx)
-                .await?;
-        (
-            permit,
-            serde_json::from_value::<QuestionPlan>(plan).map_err(|_| ApiError::conflict())?,
-        )
-    } else {
-        if (processed < 0 && count != 0) || (processed >= 0 && count != processed + 1) {
-            return Err(ApiError::conflict());
-        }
-        if processed >= 0 {
-            let prefix_hash = hash_secret(
-                &serde_json::to_string(&users[..users.len() - 1])
-                    .map_err(|_| ApiError::conflict())?,
-            );
-            if binding
-                .get::<Option<String>, _>("last_request_hash")
-                .as_deref()
-                != Some(prefix_hash.as_str())
-            {
+    let finals = sqlx::query("SELECT event_id,question_permit_id,trusted_text,response_permit_id FROM voice_answer_permits WHERE attempt_id=$1 ORDER BY ordinal")
+        .bind(attempt).fetch_all(&mut *tx).await?;
+    let trusted: Vec<String> = finals
+        .iter()
+        .map(|f| {
+            f.get::<Option<String>, _>("trusted_text")
+                .ok_or_else(ApiError::conflict)
+        })
+        .collect::<Result<_, _>>()?;
+    let trusted_refs: Vec<&str> = trusted.iter().map(String::as_str).collect();
+    let matched =
+        v0_voice::history::matched_prefix(&users, &trusted_refs).ok_or_else(ApiError::conflict)?;
+    let prior_question: Uuid = binding
+        .get::<Option<Uuid>, _>("last_permit_id")
+        .ok_or_else(ApiError::conflict)?;
+    let delivered: Option<Uuid> = binding.get("delivered_permit_id");
+    let mut next = prior_question;
+    if matched > 0 {
+        let question: Uuid = finals[matched - 1].get("question_permit_id");
+        let response: Option<Uuid> = finals
+            .iter()
+            .filter(|f| f.get::<Uuid, _>("question_permit_id") == question)
+            .find_map(|f| f.get("response_permit_id"));
+        if let Some(response) = response {
+            // Retried or extended speech answering the same delivered question
+            // reuses its successor, even when provider history was merged.
+            if response != prior_question {
+                let control: bool = sqlx::query_scalar("SELECT request_hash LIKE 'control:%' FROM question_permits WHERE id=$1 AND attempt_id=$2")
+                    .bind(prior_question).bind(attempt).fetch_one(&mut *tx).await?;
+                // A committed customer Skip/Repeat can request a new rendering
+                // of unchanged, already consumed history. Unconsumed delayed
+                // speech still follows the delivered-question checks below.
+                if !control {
+                    return Err(ApiError::conflict());
+                }
+            }
+        } else {
+            if delivered != Some(question) || question != prior_question {
                 return Err(ApiError::conflict());
             }
+            let progress = Progress {
+                topic: row.get::<i32, _>("topic_index") as u8,
+                followups: serde_json::from_value(row.get("followup_counts"))
+                    .map_err(|_| ApiError::conflict())?,
+                consumed_millis: consumed,
+            };
+            if progress.topic >= 3 {
+                return Err(ApiError::conflict());
+            }
+            // Classify trusted speech only. Callback system/assistant text and
+            // presentation changes cannot influence which bounded prompt is used.
+            let answer = finals
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.get::<Uuid, _>("question_permit_id") == question)
+                .map(|(i, _)| trusted[i].as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (follow, kind) = classify(&answer);
+            let plan = QuestionPlan::after_answer(progress, follow, kind)
+                .map_err(|_| ApiError::conflict())?;
+            next = Uuid::new_v4();
+            let revision = row.get::<i64, _>("progress_revision") + 1;
+            sqlx::query("INSERT INTO question_permits(id,attempt_id,request_hash,progress_revision,plan) VALUES($1,$2,$3,$4,$5)")
+                .bind(next).bind(attempt).bind(&request_hash).bind(revision).bind(serde_json::to_value(&plan).map_err(|_|ApiError::conflict())?).execute(&mut *tx).await?;
+            sqlx::query("UPDATE interviews SET progress_revision=$2,topic_index=$3,followup_counts=$4,completed_answers=completed_answers+1,incomplete_turn=NULL WHERE id=$1")
+                .bind(id).bind(revision).bind(plan.progress.topic as i32).bind(serde_json::json!(plan.progress.followups)).execute(&mut *tx).await?;
+            sqlx::query("UPDATE voice_hook_bindings SET last_permit_id=$2 WHERE attempt_id=$1")
+                .bind(attempt)
+                .bind(next)
+                .execute(&mut *tx)
+                .await?;
         }
-        let prior_question: Uuid = binding
-            .get::<Option<Uuid>, _>("last_permit_id")
-            .ok_or_else(ApiError::conflict)?;
-        let answer_hash = hash_secret(users.last().ok_or_else(ApiError::conflict)?);
-        let admitted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM voice_answer_permits WHERE attempt_id=$1 AND question_permit_id=$2 AND answer_hash=$3 AND NOT consumed)")
-            .bind(attempt).bind(prior_question).bind(&answer_hash).fetch_one(&mut *tx).await?;
-        if !admitted {
-            return Err(ApiError::conflict());
-        }
-        let progress = Progress {
-            topic: row.get::<i32, _>("topic_index") as u8,
-            followups: serde_json::from_value(row.get("followup_counts"))
-                .map_err(|_| ApiError::conflict())?,
-            consumed_millis: consumed,
-        };
-        if progress.topic >= 3 {
-            return Err(ApiError::conflict());
-        }
-        let plan = if count == 0 {
-            QuestionPlan::initial(progress)
-        } else {
-            let (follow, kind) = classify(users.last().unwrap());
-            QuestionPlan::after_answer(progress, follow, kind)
-        }
-        .map_err(|_| ApiError::conflict())?;
-        let permit = Uuid::new_v4();
-        let revision = row.get::<i64, _>("progress_revision") + 1;
-        sqlx::query("INSERT INTO question_permits(id,attempt_id,request_hash,progress_revision,plan) VALUES($1,$2,$3,$4,$5)")
-    .bind(permit).bind(attempt).bind(&request_hash).bind(revision).bind(serde_json::to_value(&plan).map_err(|_|ApiError::conflict())?).execute(&mut *tx).await?;
-        sqlx::query("UPDATE interviews SET progress_revision=$2,topic_index=$3,followup_counts=$4,completed_answers=completed_answers+$5,incomplete_turn=NULL WHERE id=$1")
-    .bind(id).bind(revision).bind(plan.progress.topic as i32).bind(serde_json::json!(plan.progress.followups)).bind(if count>0{1}else{0}).execute(&mut *tx).await?;
-        sqlx::query("UPDATE voice_hook_bindings SET processed_user_count=$2,last_request_hash=$3,last_permit_id=$4 WHERE attempt_id=$1")
-    .bind(attempt).bind(count).bind(&request_hash).bind(permit).execute(&mut *tx).await?;
-        sqlx::query("UPDATE voice_answer_permits SET consumed=true WHERE attempt_id=$1 AND question_permit_id=$2 AND answer_hash=$3")
-            .bind(attempt).bind(prior_question).bind(answer_hash).execute(&mut *tx).await?;
-        (permit, plan)
-    };
+        sqlx::query("UPDATE voice_answer_permits SET consumed=true,response_permit_id=COALESCE(response_permit_id,$3) WHERE attempt_id=$1 AND question_permit_id=$2")
+            .bind(attempt).bind(question).bind(next).execute(&mut *tx).await?;
+    } else if binding.get::<i32, _>("processed_user_count") > 0 {
+        return Err(ApiError::conflict());
+    }
+    sqlx::query("UPDATE voice_hook_bindings SET processed_user_count=GREATEST(processed_user_count,$2),last_request_hash=$3 WHERE attempt_id=$1")
+        .bind(attempt).bind(matched as i32).bind(request_hash).execute(&mut *tx).await?;
+    let value: serde_json::Value =
+        sqlx::query_scalar("SELECT plan FROM question_permits WHERE id=$1 AND attempt_id=$2")
+            .bind(next)
+            .bind(attempt)
+            .fetch_one(&mut *tx)
+            .await?;
+    let mut plan: QuestionPlan = serde_json::from_value(value).map_err(|_| ApiError::conflict())?;
+    plan.progress.consumed_millis = consumed;
+    let permit = next;
     // Validate output before committing, but never emit it until commit succeeds.
     let output = CommittedQuestion::after_commit(permit.to_string(), plan)
         .map_err(|_| ApiError::conflict())?;
@@ -368,7 +393,7 @@ pub async fn control_question(
     let revision = row.get::<i64, _>("progress_revision") + 1;
     sqlx::query("INSERT INTO question_permits(id,attempt_id,request_hash,progress_revision,plan) VALUES($1,$2,$3,$4,$5)").bind(permit).bind(attempt).bind(format!("control:{}",request.request_id)).bind(revision).bind(serde_json::to_value(&plan).map_err(|_|ApiError::conflict())?).execute(&mut *tx).await?;
     sqlx::query("UPDATE interviews SET progress_revision=$2,topic_index=$3,followup_counts=$4,incomplete_turn=NULL WHERE id=$1").bind(request.interview_id).bind(revision).bind(plan.progress.topic as i32).bind(serde_json::json!(plan.progress.followups)).execute(&mut *tx).await?;
-    sqlx::query("UPDATE voice_hook_bindings SET last_permit_id=$2 WHERE attempt_id=$1")
+    sqlx::query("UPDATE voice_hook_bindings SET last_permit_id=$2,delivered_permit_id=NULL WHERE attempt_id=$1")
         .bind(attempt)
         .bind(permit)
         .execute(&mut *tx)
@@ -379,7 +404,8 @@ pub async fn control_question(
 }
 
 /// Relay-only admission: pin question_id at input.speech.started, then use that
-/// same identity with the final user item. Skip/repeat invalidate old admissions.
+/// same identity with the final user item. Multiple finals may belong to the same
+/// actually delivered question. Skip/repeat invalidate old admissions.
 /// The callback itself never authorizes an answer merely by appending history.
 pub async fn authorize_answer(
     pool: &PgPool,
@@ -403,14 +429,14 @@ pub async fn authorize_answer(
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-    let binding=sqlx::query("SELECT b.last_permit_id,p.lease_generation FROM voice_hook_bindings b JOIN provider_attempts p ON p.id=b.attempt_id WHERE p.id=$1 AND p.state='active' AND p.control_mode='custom' AND b.binding_generation=p.lease_generation").bind(attempt).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    let binding=sqlx::query("SELECT b.last_permit_id,b.delivered_permit_id,p.lease_generation FROM voice_hook_bindings b JOIN provider_attempts p ON p.id=b.attempt_id WHERE p.id=$1 AND p.state='active' AND p.control_mode='custom' AND b.binding_generation=p.lease_generation").bind(attempt).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
     if row.get::<Option<Uuid>, _>("lease_id") != Some(lease_id)
         || binding.get::<i64, _>("lease_generation") != generation
     {
         return Err(ApiError::conflict());
     }
     validate(&row, generation)?;
-    if binding.get::<Option<Uuid>, _>("last_permit_id") != Some(question_id) {
+    if binding.get::<Option<Uuid>, _>("delivered_permit_id") != Some(question_id) {
         return Err(ApiError::conflict());
     }
     let hash = hash_secret(text.trim());
@@ -422,7 +448,15 @@ pub async fn authorize_answer(
             return Err(ApiError::conflict());
         }
     } else {
-        let inserted=sqlx::query("INSERT INTO voice_answer_permits(attempt_id,event_id,question_permit_id,answer_hash) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING").bind(attempt).bind(event_id).bind(question_id).bind(hash).execute(&mut *tx).await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM voice_answer_permits WHERE attempt_id=$1")
+                .bind(attempt)
+                .fetch_one(&mut *tx)
+                .await?;
+        if total >= 100 {
+            return Err(ApiError::conflict());
+        }
+        let inserted=sqlx::query("INSERT INTO voice_answer_permits(attempt_id,event_id,question_permit_id,answer_hash,trusted_text,response_permit_id,consumed) VALUES($1,$2,$3,$4,$5,(SELECT response_permit_id FROM voice_answer_permits WHERE attempt_id=$1 AND question_permit_id=$3 AND response_permit_id IS NOT NULL LIMIT 1),EXISTS(SELECT 1 FROM voice_answer_permits WHERE attempt_id=$1 AND question_permit_id=$3 AND consumed)) ON CONFLICT DO NOTHING").bind(attempt).bind(event_id).bind(question_id).bind(hash).bind(text.trim()).execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
             return Err(ApiError::conflict());
         }
@@ -443,4 +477,57 @@ pub async fn configured_greeting(
     let plan: QuestionPlan =
         serde_json::from_value(row.get("plan")).map_err(|_| ApiError::conflict())?;
     Ok(plan.code.text().to_owned())
+}
+
+/// Server-only delivery checkpoint, invoked for the first audio frame of the
+/// reply pinned at reply.started, before forwarding that frame to the browser.
+/// Offered completion text alone never establishes a question was delivered.
+pub async fn mark_delivered(
+    pool: &PgPool,
+    attempt: Uuid,
+    question: Uuid,
+    lease: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    let id: Uuid = sqlx::query_scalar("SELECT interview_id FROM provider_attempts WHERE id=$1")
+        .bind(attempt)
+        .fetch_one(&mut *tx)
+        .await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    validate(&row, generation)?;
+    if row.get::<Option<Uuid>, _>("lease_id") != Some(lease) {
+        return Err(ApiError::conflict());
+    }
+    let updated=sqlx::query("UPDATE voice_hook_bindings b SET delivered_permit_id=$2 FROM provider_attempts p WHERE b.attempt_id=$1 AND p.id=b.attempt_id AND b.last_permit_id=$2 AND b.binding_generation=$3 AND p.lease_generation=$3 AND p.state='active'")
+        .bind(attempt).bind(question).bind(generation).execute(&mut *tx).await?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::conflict());
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Retrieve server-owned offered/delivered identities for the trusted relay.
+/// Never infer delivery from callback history or client acknowledgement.
+pub async fn questions(
+    pool: &PgPool,
+    attempt: Uuid,
+    lease: Uuid,
+    generation: i64,
+) -> Result<(Uuid, Option<Uuid>), ApiError> {
+    let row=sqlx::query("SELECT i.*,b.last_permit_id,b.delivered_permit_id FROM voice_hook_bindings b JOIN provider_attempts p ON p.id=b.attempt_id JOIN interviews i ON i.id=p.interview_id WHERE p.id=$1 AND p.state='active' AND b.binding_generation=$2 AND p.lease_generation=$2")
+        .bind(attempt).bind(generation).fetch_optional(pool).await?.ok_or_else(ApiError::conflict)?;
+    validate(&row, generation)?;
+    if row.get::<Option<Uuid>, _>("lease_id") != Some(lease) {
+        return Err(ApiError::conflict());
+    }
+    Ok((
+        row.get::<Option<Uuid>, _>("last_permit_id")
+            .ok_or_else(ApiError::conflict)?,
+        row.get("delivered_permit_id"),
+    ))
 }

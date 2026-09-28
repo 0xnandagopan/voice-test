@@ -248,3 +248,63 @@ pub async fn end_attempt(
     tx.commit().await?;
     Ok(())
 }
+
+/// Relay termination is one authority transaction: retain provenance, charge the
+/// consumed allowance, release the lease and enqueue recoverable provider artifacts.
+pub async fn finalize_relay(
+    pool: &PgPool,
+    id: Uuid,
+    lease: Uuid,
+    generation: i64,
+    attempt: Uuid,
+    reason: v0_domain::workflow::AttemptEndReason,
+    incomplete_turn_ids: Vec<String>,
+) -> Result<(), ApiError> {
+    if incomplete_turn_ids.len() > 100
+        || incomplete_turn_ids
+            .iter()
+            .any(|s| s.is_empty() || s.len() > 200)
+    {
+        return Err(ApiError::invalid("Invalid incomplete turn identities."));
+    }
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    if row.get::<i64, _>("lease_generation") != generation
+        || row.get::<Option<Uuid>, _>("lease_id") != Some(lease)
+    {
+        return Err(ApiError::conflict());
+    }
+    let now = Utc::now();
+    let until = row
+        .get::<Option<DateTime<Utc>>, _>("lease_expires_at")
+        .unwrap_or(now)
+        .min(now);
+    let elapsed = row
+        .get::<Option<DateTime<Utc>>, _>("active_since")
+        .map(|s| (((until - s).num_milliseconds().clamp(0, 360000) + 999) / 1000) as i32)
+        .unwrap_or(0);
+    let consumed = (row.get::<i32, _>("time_consumed_seconds") + elapsed).min(360);
+    let encoded = serde_json::to_value(reason).map_err(|_| ApiError::conflict())?;
+    let available = row.get::<Option<DateTime<Utc>>, _>("deleted_at").is_none()
+        && row.get::<DateTime<Utc>, _>("expires_at") > now
+        && !matches!(
+            row.get::<String, _>("state").as_str(),
+            "revoked" | "deleted"
+        );
+    let mapped=sqlx::query("UPDATE provider_attempts SET product_end_reason=COALESCE(product_end_reason,$4),ended_at=COALESCE(ended_at,clock_timestamp()),state='ended',incomplete_turn_ids=$5 WHERE id=$1 AND interview_id=$2 AND lease_generation=$3 RETURNING provider_session_id").bind(attempt).bind(id).bind(generation).bind(encoded.as_str().ok_or_else(ApiError::conflict)?).bind(serde_json::json!(incomplete_turn_ids)).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    sqlx::query("UPDATE interviews SET time_consumed_seconds=$2,active_since=NULL,lease_id=NULL,lease_expires_at=NULL,state=CASE WHEN $3 THEN 'recovering' ELSE state END,revision=revision+1 WHERE id=$1").bind(id).bind(consumed).bind(available).execute(&mut *tx).await?;
+    if available
+        && mapped
+            .get::<Option<String>, _>("provider_session_id")
+            .is_some()
+    {
+        sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key) VALUES($1,$2,'import_evidence',$3,$4) ON CONFLICT(dedupe_key) DO NOTHING").bind(Uuid::new_v4()).bind(id).bind(serde_json::json!({"provider_attempt_id":attempt})).bind(format!("import:{attempt}")).execute(&mut *tx).await?;
+    }
+    sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key) VALUES($1,$2,'delete_provider_agent',$3,$4) ON CONFLICT(dedupe_key) DO UPDATE SET available_at=LEAST(jobs.available_at,clock_timestamp()) WHERE jobs.status='queued'").bind(Uuid::new_v4()).bind(id).bind(serde_json::json!({"attempt_id":attempt})).bind(format!("agent-cleanup:{attempt}")).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}

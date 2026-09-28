@@ -1,9 +1,13 @@
 pub mod auth;
+pub mod composition_jobs;
 pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod leases;
+pub mod live;
 pub mod progress;
+pub mod relay;
+pub mod review;
 pub mod voice_hook;
 pub mod workflow;
 use axum::{
@@ -27,6 +31,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     attempts: Arc<Mutex<Vec<Instant>>>,
+    pub controlled_voice_origin: Option<String>,
 }
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Self {
@@ -34,7 +39,27 @@ impl AppState {
             pool,
             config: Arc::new(config),
             attempts: Arc::new(Mutex::new(Vec::new())),
+            controlled_voice_origin: None,
         }
+    }
+    pub fn with_controlled_voice(mut self, origin: String) -> Result<Self, &'static str> {
+        let url =
+            url::Url::parse(&origin).map_err(|_| "VOICE_PUBLIC_ORIGIN must be an HTTPS origin")?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || self.config.voice_api_key.is_none()
+        {
+            return Err(
+                "Controlled voice requires VOICE_AGENT_API_KEY and an HTTPS VOICE_PUBLIC_ORIGIN",
+            );
+        }
+        self.controlled_voice_origin = Some(origin.trim_end_matches('/').into());
+        Ok(self)
     }
     pub fn limit_auth(&self) -> Result<(), ApiError> {
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
@@ -103,6 +128,46 @@ pub fn router(state: AppState) -> Router {
         .route("/api/customer/session", get(handlers::session))
         .route("/api/customer/consent", post(handlers::consent))
         .route("/api/customer/start", post(handlers::start))
+        .route("/api/customer/interviews/{id}/live", get(live::connect))
+        .route(
+            "/api/customer/interviews/{id}/workflow",
+            get(review::customer_view).post(review::customer_command),
+        )
+        .route(
+            "/api/operator/interviews/{id}/workflow",
+            get(review::operator_view).post(review::operator_command),
+        )
+        .route(
+            "/api/customer/interviews/{id}/evidence",
+            get(review::customer_evidence),
+        )
+        .route(
+            "/api/operator/interviews/{id}/evidence",
+            get(review::operator_evidence),
+        )
+        .route(
+            "/api/customer/interviews/{id}/sources/{source}/audio",
+            get(review::customer_audio),
+        )
+        .route(
+            "/api/operator/interviews/{id}/sources/{source}/audio",
+            get(review::operator_audio),
+        )
+        .route(
+            "/api/customer/interviews/{id}/recovery",
+            get(review::recovery),
+        )
+        .route(
+            "/api/customer/interviews/{id}/recovery/confirm",
+            post(review::confirm_recovery),
+        )
+        .route(
+            "/api/customer/interviews/{id}/generate",
+            post(review::generate),
+        )
+        .route("/api/customer/interviews/{id}/retry", post(review::retry))
+        .route("/api/public/{id}", get(review::public_snapshot))
+        .route("/api/operator/interviews/{id}/export", get(review::export))
         .route(
             "/api/{*path}",
             get(|| async {
@@ -120,7 +185,7 @@ pub fn router(state: AppState) -> Router {
                 )
             }),
         )
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), policy))
         .with_state(state.clone());
     // Machine-authenticated provider callback uses a scoped Bearer token, not

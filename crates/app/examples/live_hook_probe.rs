@@ -316,6 +316,7 @@ async fn live(pool: &PgPool, origin: &str, summary: &mut Value) -> Result<()> {
         // Wait for completed configured greeting before injecting the synthetic answer.
         timeout(Duration::from_secs(12),async {
             loop {let e=client.receive_raw().await.map_err(|_|"greeting_transport")?.ok_or("greeting_closed")?;
+                if e["type"]=="reply.audio" {let permit=current_permit(pool,f.attempt).await?.0;voice_hook::mark_delivered(pool,f.attempt,permit,f.lease.lease_id,f.lease.generation).await.map_err(|_|"greeting_delivery")?;}
                 if e["type"]=="reply.done" {return Ok::<(),String>(());}
                 if e["type"]=="session.error" {summary["provider_error_code"]=json!(provider_code(&e));return Err("greeting_provider_error".into());}
             }
@@ -340,13 +341,13 @@ async fn live(pool: &PgPool, origin: &str, summary: &mut Value) -> Result<()> {
                 let kind=e["type"].as_str().unwrap_or("unknown");*counts.entry(kind.to_string()).or_default()+=1;
                 if !matches!(kind,"reply.audio"|"transcript.user.delta"|"transcript.agent.delta"){events.push(json!({"type":kind,"at_ms":start.elapsed().as_millis()}));}
                 match kind {
-                    "input.speech.started"=>{pinned=Some(current_permit(pool,f.attempt).await?.0);}
+                    "input.speech.started"=>{pinned=voice_hook::questions(pool,f.attempt,f.lease.lease_id,f.lease.generation).await.map_err(|_|"delivered_question")?.1;}
                     "transcript.user"=>{
                         let permit=pinned.ok_or("final_without_speech_start")?;
                         voice_hook::authorize_answer(pool,f.attempt,permit,e["item_id"].as_str().ok_or("missing_final_item_id")?,e["text"].as_str().ok_or("missing_final_text")?,f.lease.lease_id,f.lease.generation).await.map_err(|_|"answer_admission_failed")?;
                         admitted=true;events.push(json!({"type":"answer_admission_committed","at_ms":start.elapsed().as_millis()}));
                     }
-                    "reply.audio"=>{audio_chunks+=1;if current_permit(pool,f.attempt).await?.0==initial {audio_before_permit=true;}}
+                    "reply.audio"=>{audio_chunks+=1;let permit=current_permit(pool,f.attempt).await?.0;if permit==initial {audio_before_permit=true;}voice_hook::mark_delivered(pool,f.attempt,permit,f.lease.lease_id,f.lease.generation).await.map_err(|_|"reply_delivery")?;}
                     "transcript.agent"=>{let current=current_permit(pool,f.attempt).await?;final_text_seen=true;agent_matched=current.0!=initial&&e["text"].as_str().is_some_and(|s|s.trim()==current.1);}
                     "reply.done"=>{if admitted&&final_text_seen {break;}}
                     "session.error"=>{summary["provider_error_code"]=json!(provider_code(&e));terminal_error=Some("provider_session_error");break;}
@@ -472,7 +473,9 @@ fn single_turn_passed(summary: &Value) -> bool {
         && summary["live"]["reply_audio_chunks"]
             .as_u64()
             .is_some_and(|n| n > 0)
-        && summary["live"]["event_counts"]["transcript.user"] == 1
+        && summary["live"]["event_counts"]["transcript.user"]
+            .as_u64()
+            .is_some_and(|n| n >= 1)
         && summary["live"]["completed_answers"] == 1
         && summary["provider_stop_sent"] == true
         && summary["provider_socket_closed"] == true
@@ -529,6 +532,8 @@ mod tests {
         assert!(!single_turn_passed(&conflict));
         let mut split = good.clone();
         split["live"]["event_counts"]["transcript.user"] = json!(2);
+        assert!(single_turn_passed(&split));
+        split["live"]["completed_answers"] = json!(2);
         assert!(!single_turn_passed(&split));
         let mut leaked = good;
         leaked["stored_agent_deleted"] = json!(false);

@@ -71,3 +71,14 @@ impl Config {
         })
     }
 }
+
+/// Fail with a fixed message: dotenv parse errors may include credential values.
+pub fn load_dotenv() -> Result<(), &'static str> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(
+            "Could not load .env. Check assignment syntax and quote values containing spaces; no values were logged.",
+        ),
+    }
+}
