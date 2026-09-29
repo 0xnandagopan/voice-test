@@ -38,7 +38,10 @@ export type Evidence = {
     end_ms: number | null;
     playback_available: boolean;
     alignment_verified: boolean;
+    candidate_range_ms?: [number, number] | null;
+    verified_range_ms?: [number, number] | null;
   }[];
+  clips?: { id: string; sha256: string; source_id: string }[];
   jobs: {
     id: string;
     kind: string;
@@ -55,6 +58,7 @@ export type Evidence = {
     content_revision: number;
     evidence_revision: number;
     assessment: {
+      quality_gate_passed?: boolean;
       claims: {
         text: string;
         sources: { source_id: string; quote: string }[];

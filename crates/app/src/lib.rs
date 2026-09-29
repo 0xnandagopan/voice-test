@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod clips;
 pub mod composition_jobs;
 pub mod config;
 pub mod error;
@@ -122,6 +123,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::list).post(handlers::invite),
         )
         .route(
+            "/api/operator/invitations/{id}/link",
+            get(handlers::invitation_link),
+        )
+        .route(
             "/api/operator/invitations/{id}/revoke",
             post(handlers::revoke),
         )
@@ -167,6 +172,30 @@ pub fn router(state: AppState) -> Router {
             post(review::generate),
         )
         .route("/api/customer/interviews/{id}/retry", post(review::retry))
+        .route(
+            "/api/operator/interviews/{id}/alignment/{source}",
+            get(clips::preview),
+        )
+        .route(
+            "/api/operator/interviews/{id}/alignment/{source}/audio",
+            get(clips::preview_audio),
+        )
+        .route(
+            "/api/operator/interviews/{id}/alignment",
+            post(clips::confirm),
+        )
+        .route(
+            "/api/customer/interviews/{id}/clips/{clip}/audio",
+            get(clips::customer_audio),
+        )
+        .route(
+            "/api/operator/interviews/{id}/clips/{clip}/audio",
+            get(clips::operator_audio),
+        )
+        .route(
+            "/api/public/{id}/clips/{clip}/audio",
+            get(clips::public_audio),
+        )
         .route("/api/public/{id}", get(review::public_snapshot))
         .route("/api/operator/interviews/{id}/export", get(review::export))
         .route(

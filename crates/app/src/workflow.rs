@@ -70,14 +70,24 @@ fn invalidate(state: &mut WorkflowView) {
 }
 /// Refresh the interview-wide evidence version under the same lock as approval.
 /// A caller cannot supply source IDs or an availability flag.
-async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result<(), ApiError> {
+pub(crate) async fn evidence_identity(
+    tx: &mut Tx<'_>,
+    id: Uuid,
+) -> Result<(Vec<Value>, bool, String), ApiError> {
     let manifests: Vec<Value> = sqlx::query_scalar(
         "SELECT manifest FROM evidence_imports WHERE interview_id=$1 ORDER BY provider_attempt_id",
     )
     .bind(id)
     .fetch_all(&mut **tx)
     .await?;
-    let fingerprint = hash_secret(&encode(&manifests)?.to_string());
+    let missing_import: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_attempts p WHERE p.interview_id=$1 AND p.provider_session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM evidence_imports e WHERE e.provider_attempt_id=p.id))")
+        .bind(id).fetch_one(&mut **tx).await?;
+    let fingerprint = hash_secret(&json!([manifests, missing_import]).to_string());
+    Ok((manifests, missing_import, fingerprint))
+}
+
+async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result<(), ApiError> {
+    let (manifests, missing_import, fingerprint) = evidence_identity(tx, id).await?;
     let old: String =
         sqlx::query_scalar("SELECT evidence_fingerprint FROM workflow_state WHERE interview_id=$1")
             .bind(id)
@@ -87,7 +97,7 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
         return Ok(());
     }
     let mut source_ids = vec![];
-    let mut ready = !manifests.is_empty();
+    let mut ready = !manifests.is_empty() && !missing_import;
     for manifest in &manifests {
         ready &= manifest["approval_eligible"] == true;
         let Some(segments) = manifest["segments"].as_array() else {
@@ -98,9 +108,17 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
             if let Some(id) = source["source_id"].as_str().filter(|s| !s.is_empty()) {
                 source_ids.push(id.to_owned());
             }
+            let verified_range = manifest["operator_alignment"]
+                .as_array()
+                .and_then(|proofs| {
+                    proofs
+                        .iter()
+                        .find(|p| p["source_id"] == source["source_id"])
+                        .and_then(|p| p["source_range_ms"].as_array())
+                });
             if let (Some(id), Some(range)) = (
                 source["source_id"].as_str(),
-                source["source_range_ms"].as_array(),
+                verified_range.or_else(|| source["source_range_ms"].as_array()),
             ) {
                 if !id.is_empty()
                     && range.len() == 2
@@ -108,7 +126,14 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
                         .as_u64()
                         .zip(range[1].as_u64())
                         .is_some_and(|(a, b)| {
-                            a < b && b <= manifest["duration_ms"].as_u64().unwrap_or(0)
+                            a < b
+                                && b <= if verified_range.is_some() {
+                                    manifest["media"]["decoded_duration_ms"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                } else {
+                                    manifest["duration_ms"].as_u64().unwrap_or(0)
+                                }
                         })
                 {
                     // Availability additionally requires a validated range.
@@ -725,10 +750,12 @@ pub async fn composition_input(
                     r.source_id == segment.source_id && r.within_recording && r.audible_samples > 0
                 })
             });
+            let listened = v0_evidence::alignment::source_proof(&m, &segment.source_id).is_some();
             if segment.speaker == "customer"
-                && decoded
-                && segment.turn_status == "completed"
-                && !m.incomplete_turn_ids.contains(&segment.turn_id)
+                && (listened
+                    || (decoded
+                        && segment.turn_status == "completed"
+                        && !m.incomplete_turn_ids.contains(&segment.turn_id)))
             {
                 sources.push(v0_composition::EvidenceSource {
                     id: segment.source_id.clone(),
@@ -775,4 +802,67 @@ pub async fn reconcile_failed_support(pool: &PgPool) -> Result<(), ApiError> {
         let _ = fail_support_job(pool, row.get("interview_id"), row.get("id")).await;
     }
     Ok(())
+}
+
+/// Attach listened evidence and its exact bounded clip under the same authority
+/// lock as approvals. No provider/media I/O occurs while this lock is held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_verified_clip(
+    pool: &PgPool,
+    token: &str,
+    id: Uuid,
+    expected: &Revisions,
+    attempt: Uuid,
+    original: &Value,
+    updated: Value,
+    clip_id: Uuid,
+    source: &str,
+    sha256: &str,
+    object_key: &str,
+) -> Result<WorkflowView, ApiError> {
+    let mut tx = lock(pool, id).await?;
+    if actor(&mut tx, id, token).await? != "operator" {
+        return Err(ApiError::unauthorized());
+    }
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    if &state.revisions != expected {
+        return Err(ApiError::conflict());
+    }
+    // A manifest cannot be replaced after import, so matching the entire prior
+    // value also fences another operator's simultaneous listening confirmation.
+    let affected=sqlx::query("UPDATE evidence_imports SET manifest=$4 WHERE interview_id=$1 AND provider_attempt_id=$2 AND manifest=$3")
+        .bind(id).bind(attempt).bind(original).bind(&updated).execute(&mut *tx).await?.rows_affected();
+    if affected != 1 {
+        return Err(ApiError::conflict());
+    }
+    evidence(&mut tx, id, &mut state).await?;
+    // Existing exact proof-bound clips remain selectable as more answers are
+    // verified. Altered/corrected evidence never inherits an unbound clip.
+    let manifests: Vec<Value> =
+        sqlx::query_scalar("SELECT manifest FROM evidence_imports WHERE interview_id=$1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for manifest in manifests {
+        let parsed: v0_evidence::manifest::Manifest =
+            serde_json::from_value(manifest).map_err(|_| ApiError::conflict())?;
+        for segment in &parsed.segments {
+            if let Some(proof) = v0_evidence::alignment::source_proof(&parsed, &segment.source_id) {
+                sqlx::query("UPDATE workflow_clips SET evidence_revision=$4 WHERE interview_id=$1 AND source_id=$2 AND sha256=$3 AND ready")
+                    .bind(id).bind(&proof.source_id).bind(&proof.clip_sha256).bind(state.revisions.evidence).execute(&mut *tx).await?;
+            }
+        }
+    }
+    sqlx::query("UPDATE workflow_clips SET ready=false WHERE interview_id=$1 AND source_id=$2")
+        .bind(id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO workflow_clips(id,interview_id,evidence_revision,sha256,source_id,object_key,ready) VALUES($1,$2,$3,$4,$5,$6,true)")
+        .bind(clip_id).bind(id).bind(state.revisions.evidence).bind(sha256).bind(source).bind(object_key).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO audit_events(interview_id,event) VALUES($1,'operator_verified_recorded_answer')").bind(id).execute(&mut *tx).await?;
+    current_access(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(state)
 }

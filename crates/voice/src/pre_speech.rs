@@ -54,7 +54,7 @@ impl QuestionCode {
             }
             Self::MixedFeedback => "What remained difficult for your team?",
             Self::Complete => {
-                "Thank you. The interview is complete. You can review any available recording-backed draft before deciding whether to approve it."
+                "Thank you. We have covered all three topics. Choose Finish interview to stop recording and review your answers before deciding whether to approve a testimonial."
             }
         }
     }

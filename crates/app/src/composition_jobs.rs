@@ -53,6 +53,8 @@ pub async fn dispatch(pool: &PgPool, job: &Job, client: &GatewayClient) -> Resul
             .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
+        let mut assessment = serde_json::json!(checked);
+        assessment["quality_gate_passed"] = serde_json::json!(quality);
         workflow::complete_support_assessed(
             pool,
             job.interview_id,
@@ -67,7 +69,7 @@ pub async fn dispatch(pool: &PgPool, job: &Job, client: &GatewayClient) -> Resul
                 model: client.model().into(),
                 prompt_version: v0_composition::PROMPT_VERSION.into(),
             },
-            Some(serde_json::json!(checked)),
+            Some(assessment),
         )
         .await
         .map_err(|_| JobFailure::stale())?;

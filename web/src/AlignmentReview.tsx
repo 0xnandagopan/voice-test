@@ -25,6 +25,7 @@ type Confirmation = {
   complete_answer: boolean;
 };
 type Evidence = {
+  assessment?: { assessment: { quality_gate_passed?: boolean } } | null;
   sources: Source[];
   evidence_revision: number;
   content_revision: number;
@@ -121,6 +122,14 @@ export function AlignmentReview({
             unrelated audio just to clear this check.
           </div>
         )}
+      {evidence.data?.assessment?.assessment.quality_gate_passed === false && (
+        <div className="notice error" role="alert">
+          The configured drafting model has not passed the required quality
+          checks. Changing the model in local configuration and validating it is
+          required before customer approval can be enabled. Listening
+          verification alone does not resolve this service requirement.
+        </div>
+      )}
       {state.evidence_available ? (
         <p role="status">
           Recorded evidence is verified. Publication also requires current

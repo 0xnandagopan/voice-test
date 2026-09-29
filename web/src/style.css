@@ -729,3 +729,12 @@ textarea {
     min-height: 44px;
   }
 }
+
+.audio-choice {
+  min-inline-size: 0;
+}
+.audio-choice audio {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+}

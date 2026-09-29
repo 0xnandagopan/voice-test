@@ -268,7 +268,7 @@ async fn unvalidated_model_cannot_support_approval_but_unsupported_is_preserved(
         } else {
             json!(["No recorded revenue evidence."])
         };
-        let result = json!({"verdict":verdict,"claims":[{"text":candidate,"verdict":verdict,"sources":refs,"issues":issues}],"issues":[]});
+        let result = json!({"claims":[{"text":candidate,"verdict":verdict,"sources":refs,"issues":issues}],"issues":[]});
         let envelope =
             json!({"choices":[{"finish_reason":"stop","message":{"content":result.to_string()}}]});
         let app = Router::new().route(
@@ -305,6 +305,7 @@ async fn unvalidated_model_cannot_support_approval_but_unsupported_is_preserved(
         let persisted:Value = sqlx::query_scalar("SELECT result FROM workflow_support_results WHERE interview_id=$1 AND content_revision=$2 AND evidence_revision=$3")
             .bind(db.id).bind(after.revisions.content).bind(after.revisions.evidence).fetch_one(&db.pool).await.unwrap();
         assert_eq!(persisted["kind"], "support_check");
+        assert_eq!(persisted["assessment"]["quality_gate_passed"], false);
         assert_eq!(persisted["assessment"]["claims"][0]["text"], candidate);
         assert!(
             persisted["assessment"]["claims"]

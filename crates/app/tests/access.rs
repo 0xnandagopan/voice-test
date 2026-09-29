@@ -549,3 +549,57 @@ async fn interview_lease_fences_tabs_and_preserves_reconnect_allowance() {
     assert!(leases::acquire(&t.pool, id, 4).await.is_err());
     t.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn invitation_links_remain_copyable_only_by_operator_while_active() {
+    let t = TestApp::new().await;
+    let op = t.login().await;
+    let first = t.invite(&op).await;
+    let _second = t.invite(&op).await;
+    let id = first["invitation"]["id"].as_str().unwrap();
+    let path = format!("/api/operator/invitations/{id}/link");
+    let (status, link, _) = t.request("GET", &path, Some(&op), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(link["private_url"], first["private_url"]);
+    let customer = t.exchange(&first).await;
+    for cookie in [None, Some(customer.as_str())] {
+        assert_eq!(
+            t.request("GET", &path, cookie, json!({})).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // General list never carries the invitation capability.
+    let (_, listing, _) = t
+        .request("GET", "/api/operator/invitations", Some(&op), json!({}))
+        .await;
+    assert!(!listing.to_string().contains("#token="));
+    sqlx::query("UPDATE interviews SET secret_hash='rotated' WHERE id=$1")
+        .bind(Uuid::parse_str(id).unwrap())
+        .execute(&t.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        t.request("GET", &path, Some(&op), json!({})).await.0,
+        StatusCode::CONFLICT
+    );
+    for state in ["revoked", "deleted"] {
+        sqlx::query("UPDATE interviews SET state=$2 WHERE id=$1")
+            .bind(Uuid::parse_str(id).unwrap())
+            .bind(state)
+            .execute(&t.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            t.request("GET", &path, Some(&op), json!({})).await.0,
+            StatusCode::GONE
+        );
+    }
+    sqlx::query("UPDATE interviews SET state='invited',expires_at=clock_timestamp()-interval '1 second' WHERE id=$1")
+        .bind(Uuid::parse_str(id).unwrap()).execute(&t.pool).await.unwrap();
+    assert_eq!(
+        t.request("GET", &path, Some(&op), json!({})).await.0,
+        StatusCode::GONE
+    );
+    t.close().await;
+}

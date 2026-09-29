@@ -292,8 +292,9 @@ function ReviewWorkspace({ id }: { id: string }) {
       )}
       {!state.evidence_available && (
         <Message>
-          Recorded evidence is not yet verified for approval. Available playback
-          is private and may still need alignment review.
+          The operator needs to listen to and verify your recorded answers
+          before approval. You can keep editing and saving your text while that
+          review is pending.
         </Message>
       )}
       {recovery.data && (
@@ -309,6 +310,8 @@ function ReviewWorkspace({ id }: { id: string }) {
           {state.content || manualDraft ? (
             <Editor
               state={state}
+              id={id}
+              evidence={evidence.data}
               busy={busy}
               supportTaskVisible={supportTaskVisible}
               write={async (expected, action) =>
@@ -646,11 +649,15 @@ function RecoveryStatus({
   );
 }
 function Editor({
+  id,
+  evidence,
   state,
   busy,
   supportTaskVisible,
   write,
 }: {
+  id: string;
+  evidence?: Evidence;
   state: WorkflowView;
   busy: boolean;
   supportTaskVisible: boolean;
@@ -707,7 +714,18 @@ function Editor({
     setDraft(next);
     setSaved(false);
   }
+  const availableClips =
+    evidence?.evidence_revision === state.revisions.evidence
+      ? (evidence.clips ?? [])
+      : [];
+  const unavailableSelection = draft.clips.some(
+    (selected) =>
+      !availableClips.some(
+        (clip) => clip.id === selected.id && clip.sha256 === selected.sha256,
+      ),
+  );
   const ready =
+    !unavailableSelection &&
     !busy &&
     !dirty &&
     !stale &&
@@ -785,33 +803,78 @@ function Editor({
         </label>
         <fieldset className="audio-choice">
           <legend>Audio in your testimonial</legend>
-          {draft.clips.length ? (
-            <>
-              <p>
-                {draft.clips.length} previously selected clip(s). This screen
-                cannot preview those approved excerpts yet; remove them to
-                approve text only.
-              </p>
-              <button
-                className="secondary"
-                type="button"
-                disabled={busy}
-                onClick={() => update({ ...draft, clips: [] })}
-              >
-                Exclude all audio clips
-              </button>
-            </>
+          <p className="small">
+            Audio is optional. Listen to each verified answer before selecting
+            it. Your saved selection is part of your exact approval.
+          </p>
+          {availableClips.length ? (
+            availableClips.map((clip, index) => (
+              <div key={clip.id}>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    disabled={busy}
+                    checked={draft.clips.some(
+                      (selected) =>
+                        selected.id === clip.id &&
+                        selected.sha256 === clip.sha256,
+                    )}
+                    onChange={(event) =>
+                      update({
+                        ...draft,
+                        clips: event.target.checked
+                          ? [
+                              ...draft.clips.filter(
+                                (selected) => selected.id !== clip.id,
+                              ),
+                              { id: clip.id, sha256: clip.sha256 },
+                            ]
+                          : draft.clips.filter(
+                              (selected) => selected.id !== clip.id,
+                            ),
+                      })
+                    }
+                  />
+                  <span>Include recorded answer {index + 1}</span>
+                </label>
+                <p>
+                  {
+                    evidence?.sources.find(
+                      (source) => source.source_id === clip.source_id,
+                    )?.text
+                  }
+                </p>
+                <audio
+                  controls
+                  preload="none"
+                  aria-label={`Recorded answer ${index + 1}`}
+                  src={`/api${interviewPath(id)}/clips/${encodeURIComponent(clip.id)}/audio`}
+                />
+              </div>
+            ))
           ) : (
-            <>
-              <label className="checkbox">
-                <input type="checkbox" checked={false} disabled readOnly />
-                <span>Include audio clips</span>
-              </label>
-              <p className="small">
-                Audio is excluded. No verified selectable clips are available on
-                this screen.
-              </p>
-            </>
+            <Message>
+              Audio selection is waiting for the operator to listen to and
+              verify the recorded answers. Writing your own text does not remove
+              that requirement.
+            </Message>
+          )}
+          {unavailableSelection && (
+            <Message error>
+              A previously selected clip is no longer verified for this evidence
+              version. Exclude it or ask the operator to verify the recording
+              again.
+            </Message>
+          )}
+          {draft.clips.length > 0 && (
+            <button
+              className="secondary"
+              type="button"
+              disabled={busy}
+              onClick={() => update({ ...draft, clips: [] })}
+            >
+              Exclude all audio clips
+            </button>
           )}
         </fieldset>
         {dirty ? (
@@ -843,6 +906,15 @@ function Editor({
           {checkMessage}
         </Message>
       )}
+      {evidence?.assessment?.content_revision === state.revisions.content &&
+        evidence.assessment.evidence_revision === state.revisions.evidence &&
+        evidence.assessment.assessment.quality_gate_passed === false && (
+          <Message>
+            The evidence-checking service has not passed its quality checks yet.
+            Your text is saved, but approval is unavailable. The operator needs
+            to complete service validation.
+          </Message>
+        )}
       {state.approval && (
         <Message>
           You approved this saved version. Publication is a separate operator
@@ -855,19 +927,26 @@ function Editor({
           You declined this testimonial. It cannot be published.
         </Message>
       )}
-      <TestimonialPreview content={draft} />
+      <TestimonialPreview
+        content={draft}
+        clipBasePath={`${interviewPath(id)}/clips`}
+      />
       <label className="checkbox">
         <input
           type="checkbox"
           checked={confirmed}
-          disabled={!ready || draft.clips.length > 0}
+          disabled={!ready}
           onChange={(event) => setConfirmed(event.target.checked)}
         />
-        <span>I approve this exact text and attribution for publication.</span>
+        <span>
+          {draft.clips.length
+            ? "I approve this exact text, attribution and selected audio clips for publication."
+            : "I approve this exact text and attribution for publication."}
+        </span>
       </label>
       <div className="actions">
         <button
-          disabled={!ready || !confirmed || draft.clips.length > 0}
+          disabled={!ready || !confirmed}
           onClick={() =>
             void write(state.revisions, { type: "approve" }).catch(() => {})
           }

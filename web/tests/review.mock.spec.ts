@@ -17,7 +17,12 @@ const initial: WorkflowView = {
 };
 async function review(
   page: Page,
-  options: { unverified?: boolean; stale?: boolean; missing?: boolean } = {},
+  options: {
+    unverified?: boolean;
+    stale?: boolean;
+    missing?: boolean;
+    clips?: boolean;
+  } = {},
 ) {
   let state = structuredClone(initial);
   if (options.unverified) state.evidence_available = false;
@@ -102,6 +107,15 @@ async function review(
             assessment?.evidence_revision === state.revisions.evidence
               ? assessment
               : null,
+          clips: options.clips
+            ? [
+                {
+                  id: "verified-clip",
+                  sha256: "a".repeat(64),
+                  source_id: "answer/1",
+                },
+              ]
+            : [],
           sources: [
             {
               source_id: "answer/1",
@@ -198,8 +212,8 @@ test("text-only exact approval requires explicit confirmation and survives reloa
     initial.content!.text,
   );
   await expect(
-    page.getByRole("checkbox", { name: "Include audio clips" }),
-  ).not.toBeChecked();
+    page.getByText(/Audio selection is waiting for the operator/),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
@@ -228,7 +242,7 @@ test("editing saves exact text, waits for support and blocks unsupported claims"
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(page.getByText("Support checking is pending.")).toBeVisible();
+  await expect(page.getByText(/The evidence check is queued;/)).toBeVisible();
   fixture.setCheck("unsupported");
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(
@@ -261,7 +275,7 @@ test("a stale save preserves local input and requires deliberate reconciliation"
     .getByRole("button", { name: "Keep my edits against latest version" })
     .click();
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(page.getByText("Support checking is pending.")).toBeVisible();
+  await expect(page.getByText(/The evidence check is queued;/)).toBeVisible();
   expect(fixture.requests[1].expected.content).toBe(2);
   expect(fixture.requests[1].action.content.text).toBe("My unsaved edit.");
 });
@@ -310,7 +324,9 @@ test("unverified evidence and exhausted recovery stay blocked on mobile", async 
     page.getByText("Some recording artifacts are unavailable."),
   ).toBeVisible();
   await expect(
-    page.getByText("Recorded evidence is not yet verified for approval."),
+    page.getByText(
+      /The operator needs to listen to and verify your recorded answers/,
+    ),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
@@ -717,4 +733,73 @@ test("an old evidence poll cannot attach a failed draft to newer cross-tab conte
   await expect(
     page.getByRole("region", { name: "Draft preparation" }),
   ).toHaveCount(0);
+});
+
+test("a verified clip is opt-in, saved and bound to exact customer approval", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 700 });
+  const fixture = await review(page, { clips: true });
+  await page.goto(`/review/${id}`);
+  const selection = page.getByRole("checkbox", {
+    name: "Include recorded answer 1",
+  });
+  await expect(selection).not.toBeChecked();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(320);
+  await expect(
+    page.getByLabel("Recorded answer 1", { exact: true }),
+  ).toHaveAttribute(
+    "src",
+    `/api/customer/interviews/${id}/clips/verified-clip/audio`,
+  );
+  await selection.check();
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Save changes" }).click();
+  expect(fixture.state.content!.clips).toEqual([
+    { id: "verified-clip", sha256: "a".repeat(64) },
+  ]);
+  fixture.setJobs([]);
+  fixture.setCheck("supported");
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await page
+    .getByRole("checkbox", {
+      name: "I approve this exact text, attribution and selected audio clips for publication.",
+    })
+    .check();
+  await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  expect(fixture.state.approval!.content.clips).toEqual(
+    fixture.state.content!.clips,
+  );
+  await page.reload();
+  await expect(selection).toBeChecked();
+});
+
+test("service quality gate explains blocked approval separately from recorded evidence", async ({
+  page,
+}) => {
+  const fixture = await review(page);
+  fixture.setCheck("ambiguous");
+  fixture.setAssessment({
+    kind: "support_check",
+    model: "test-model",
+    prompt_version: "test",
+    content_revision: 1,
+    evidence_revision: 1,
+    assessment: { quality_gate_passed: false, claims: [], issues: [] },
+  });
+  await page.goto(`/review/${id}`);
+  await expect(
+    page.getByText(
+      /The evidence-checking service has not passed its quality checks yet/,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
+  expect(fixture.state.content!.text).toBe(initial.content!.text);
+  expect(fixture.requests).toHaveLength(0);
 });

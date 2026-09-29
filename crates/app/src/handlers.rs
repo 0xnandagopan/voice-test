@@ -155,6 +155,37 @@ pub async fn list(
         json!({"invitations":rows.iter().map(|r|view(&state,r)).collect::<Vec<_>>()}),
     ))
 }
+/// Return the original invitation only to the authenticated operator. Tokens
+/// stay out of list responses and are never persisted in browser storage.
+pub async fn invitation_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    auth::operator(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT * FROM interviews WHERE id=$1 FOR SHARE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::unauthorized)?;
+    available(&row)?;
+    // Recheck the operator after waiting on a concurrent revocation/delete.
+    let session = auth::cookie(&headers, "operator_session").ok_or_else(ApiError::unauthorized)?;
+    let authorized: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=$1 AND role='operator' AND expires_at>clock_timestamp())")
+        .bind(auth::hash_secret(&session)).fetch_one(&mut *tx).await?;
+    if !authorized {
+        return Err(ApiError::unauthorized());
+    }
+    let token = auth::invitation_secret(&state.config.invitation_signing_key, id);
+    if auth::hash_secret(&token) != row.get::<String, _>("secret_hash") {
+        return Err(ApiError::conflict());
+    }
+    available(&row)?;
+    let result = json!({"private_url":format!("{}/i/{}#token={}",state.config.origin,id,token)});
+    tx.commit().await?;
+    Ok(Json(result))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Invite {

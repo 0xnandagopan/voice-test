@@ -318,7 +318,7 @@ async fn listened_clip_http_fences_roles_revisions_and_publication_lifecycle() {
     stale["confirmation"]["clip_sha256"] = json!("changed");
     assert_eq!(
         f.request("POST", &base, Some(&operator), stale).await.0,
-        StatusCode::BAD_REQUEST
+        StatusCode::CONFLICT
     );
     let (status, result, _) = f
         .request("POST", &base, Some(&operator), confirm.clone())

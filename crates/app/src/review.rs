@@ -95,7 +95,7 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
                 .media
                 .as_ref()
                 .and_then(|m| m.ranges.iter().find(|r| r.source_id == seg.source_id));
-            sources.push(json!({"source_id":seg.source_id,"attempt_id":row.get::<Uuid,_>("provider_attempt_id"),"text":seg.text,"corrected_text":before.transcript_corrections.get(&seg.source_id),"speaker":seg.speaker,"start_ms":seg.source_range_ms.map(|r|r[0]),"end_ms":seg.source_range_ms.map(|r|r[1]),"playback_available":check.is_some_and(|c|c.within_recording && c.audible_samples>0 && c.candidate_source_range_ms.is_some()),"alignment_verified":m.approval_eligible && m.media.as_ref().is_some_and(|m|m.alignment_proven)}));
+            sources.push(json!({"source_id":seg.source_id,"attempt_id":row.get::<Uuid,_>("provider_attempt_id"),"text":seg.text,"corrected_text":before.transcript_corrections.get(&seg.source_id),"speaker":seg.speaker,"start_ms":seg.source_range_ms.map(|r|r[0]),"end_ms":seg.source_range_ms.map(|r|r[1]),"playback_available":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some() || check.is_some_and(|c|c.within_recording && c.audible_samples>0 && c.candidate_source_range_ms.is_some()),"alignment_verified":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some(),"candidate_range_ms":check.and_then(|c|c.candidate_source_range_ms),"verified_range_ms":v0_evidence::alignment::source_proof(&m,&seg.source_id).map(|p|p.source_range_ms)}));
         }
     }
     // Jobs are current user actions, not the historical worker audit log. Keep
@@ -128,8 +128,14 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
     if before.revisions != after.revisions {
         return Err(ApiError::conflict());
     }
+    let clips=sqlx::query("SELECT id,sha256,source_id FROM workflow_clips WHERE interview_id=$1 AND evidence_revision=$2 AND ready ORDER BY source_id,id")
+        .bind(id).bind(after.revisions.evidence).fetch_all(&s.pool).await?.into_iter()
+        .map(|r|json!({"id":r.get::<Uuid,_>("id"),"sha256":r.get::<String,_>("sha256"),"source_id":r.get::<String,_>("source_id")})).collect::<Vec<_>>();
+    if workflow::inspect(&s.pool, &t, id).await?.revisions != after.revisions {
+        return Err(ApiError::conflict());
+    }
     Ok(Json(
-        json!({"sources":sources,"jobs":jobs,"evidence_revision":after.revisions.evidence,"content_revision":after.revisions.content,"assessment":assessment}),
+        json!({"sources":sources,"clips":clips,"jobs":jobs,"evidence_revision":after.revisions.evidence,"content_revision":after.revisions.content,"assessment":assessment}),
     ))
 }
 pub async fn customer_evidence(
@@ -199,10 +205,16 @@ async fn audio(
         std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into()),
         std::env::var("EVIDENCE_WORK_DIR").unwrap_or_else(|_| ".local/evidence-jobs".into()),
     );
-    let clip = validator
-        .candidate_clip(&recording, &manifest, &source)
-        .await
-        .map_err(|_| unavailable_media())?;
+    let clip = if v0_evidence::alignment::source_proof(&manifest, &source).is_some() {
+        validator
+            .verified_clip(&recording, &manifest, &source)
+            .await
+    } else {
+        validator
+            .candidate_clip(&recording, &manifest, &source)
+            .await
+    }
+    .map_err(|_| unavailable_media())?;
     let after = workflow::inspect(&s.pool, &t, id).await?;
     if before.revisions != after.revisions {
         return Err(ApiError::conflict());
@@ -248,11 +260,7 @@ pub async fn public_snapshot(
             "This testimonial is unavailable.",
         )
     })?;
-    // Clip serving is a separate gated representation; never expose source keys.
-    if !a.content.clips.is_empty() {
-        return Err(unavailable_media());
-    }
-    Ok(([("x-robots-tag","noindex, nofollow"),("cache-control","no-store")],Json(json!({"text":a.content.text,"attribution":a.content.attribution,"clips":[],"approved_at":a.approved_at}))).into_response())
+    Ok(([("x-robots-tag","noindex, nofollow"),("cache-control","no-store")],Json(json!({"text":a.content.text,"attribution":a.content.attribution,"clips":a.content.clips,"approved_at":a.approved_at}))).into_response())
 }
 pub async fn export(
     State(s): State<AppState>,
@@ -388,17 +396,7 @@ pub async fn confirm_recovery(
     }
     // Artifact imports lock the interview; compare their immutable manifests with
     // the workflow fingerprint while holding that same lock.
-    let manifests: Vec<Value> = sqlx::query_scalar(
-        "SELECT manifest FROM evidence_imports WHERE interview_id=$1 ORDER BY provider_attempt_id",
-    )
-    .bind(id)
-    .fetch_all(&mut *tx)
-    .await?;
-    let fingerprint_now = auth::hash_secret(
-        &serde_json::to_value(&manifests)
-            .map_err(|_| ApiError::conflict())?
-            .to_string(),
-    );
+    let (_, _, fingerprint_now) = workflow::evidence_identity(&mut tx, id).await?;
     let workflow_row =
         sqlx::query("SELECT evidence_fingerprint,value FROM workflow_state WHERE interview_id=$1")
             .bind(id)
