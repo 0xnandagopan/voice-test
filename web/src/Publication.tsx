@@ -1,10 +1,17 @@
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlignmentReview } from "./AlignmentReview";
 import { api } from "./api";
 import type { Content, WorkflowView } from "./workflow";
 
 /** Shared approved/preview presentation accepts no private source objects. */
-export function TestimonialPreview({ content }: { content: Content }) {
+export function TestimonialPreview({
+  content,
+  clipBasePath,
+}: {
+  content: Content;
+  clipBasePath?: string;
+}) {
   return (
     <section
       className="testimonial-preview"
@@ -15,9 +22,23 @@ export function TestimonialPreview({ content }: { content: Content }) {
       <p>{content.attribution}</p>
       <p className="small">
         {content.clips.length
-          ? `${content.clips.length} audio clip(s) selected. Clip playback is unavailable on this screen.`
+          ? `${content.clips.length} audio clip(s) selected.`
           : "Text only · no audio included"}
       </p>
+      {content.clips.map((clip, index) =>
+        clipBasePath ? (
+          <audio
+            key={`${clip.id}:${clip.sha256}`}
+            aria-label={`Selected audio clip ${index + 1}`}
+            controls
+            preload="none"
+            style={{ width: "100%" }}
+            src={`/api${clipBasePath}/${encodeURIComponent(clip.id)}/audio`}
+          />
+        ) : (
+          <p key={clip.id}>Clip playback is unavailable on this screen.</p>
+        ),
+      )}
     </section>
   );
 }
@@ -38,7 +59,7 @@ export function PublicTestimonial() {
         Loading testimonial…
       </div>
     );
-  if (snapshot.isError || !snapshot.data || snapshot.data.clips.length)
+  if (snapshot.isError || !snapshot.data)
     return (
       <section className="card placeholder">
         <p className="eyebrow">PUBLIC TESTIMONIAL</p>
@@ -53,7 +74,10 @@ export function PublicTestimonial() {
     <section className="card">
       <p className="eyebrow">CUSTOMER-APPROVED TESTIMONIAL</p>
       <h1>In their own words.</h1>
-      <TestimonialPreview content={snapshot.data} />
+      <TestimonialPreview
+        content={snapshot.data}
+        clipBasePath={`/public/${encodeURIComponent(slug)}/clips`}
+      />
     </section>
   );
 }
@@ -105,8 +129,7 @@ export function OperatorReview() {
     approved.evidence_revision === state.revisions.evidence &&
     state.evidence_available &&
     state.check === "supported" &&
-    !state.declined &&
-    !approved.content.clips.length,
+    !state.declined,
   );
   return (
     <section className="card">
@@ -122,7 +145,10 @@ export function OperatorReview() {
         </div>
       )}
       {state.content ? (
-        <TestimonialPreview content={state.content} />
+        <TestimonialPreview
+          content={state.content}
+          clipBasePath={`${path}/clips`}
+        />
       ) : (
         <div className="notice" role="status">
           No draft is available yet.
@@ -131,7 +157,6 @@ export function OperatorReview() {
       {!eligible && (
         <div className="notice" role="status">
           Publication requires current customer approval and verified evidence.
-          Audio publication is unavailable on this screen.
         </div>
       )}
       {state.declined && <p>The customer declined this testimonial.</p>}
@@ -174,6 +199,7 @@ export function OperatorReview() {
           Publish approved testimonial
         </button>
       )}
+      <AlignmentReview interviewId={interviewId} state={state} />
       <p className="small muted">
         Customer approval and operator publication are separate actions. Later
         content edits withdraw the hosted testimonial and require fresh
