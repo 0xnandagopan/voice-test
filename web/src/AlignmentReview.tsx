@@ -56,15 +56,16 @@ export function AlignmentReview({
     evidence.data?.content_revision === state.revisions.content;
   return (
     <section className="card" aria-label="Recording verification">
-      <h2>Verify recorded answers</h2>
+      <h2>Repair recording verification</h2>
       <p>
         Listen to each exact audio preview. Confirm that the original transcript
         matches the customer's complete answer, including qualifications and
         mixed feedback. Adjust its time range if needed.
       </p>
       <p className="small">
-        This verifies recorded evidence only. A support check and the customer's
-        exact approval are still required before publication.
+        This optional recovery tool verifies recorded evidence only. It does not
+        add an operator approval step. Automatic support checks and the
+        customer's exact approval are still required before publication.
       </p>
       {evidence.isPending && <p role="status">Loading recorded answers…</p>}
       {evidence.error && (

@@ -212,7 +212,7 @@ test("text-only exact approval requires explicit confirmation and survives reloa
     initial.content!.text,
   );
   await expect(
-    page.getByText(/Audio selection is waiting for the operator/),
+    page.getByText(/No verified audio clips are available yet/),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
@@ -324,9 +324,7 @@ test("unverified evidence and exhausted recovery stay blocked on mobile", async 
     page.getByText("Some recording artifacts are unavailable."),
   ).toBeVisible();
   await expect(
-    page.getByText(
-      /The operator needs to listen to and verify your recorded answers/,
-    ),
+    page.getByText(/Your recording has not yet been verified for approval/),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
@@ -626,11 +624,11 @@ test("draft failure shows one stable retry action and never implies recording lo
   ]);
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(
-    page.getByText(/account cannot access the selected drafting model/),
+    page.getByText(/automatic drafting service has an account-access problem/),
   ).toBeVisible();
   await expect(
     page.getByRole("button", {
-      name: "Retry after operator update",
+      name: "Retry service check",
       exact: true,
     }),
   ).toHaveCount(1);
@@ -802,4 +800,136 @@ test("service quality gate explains blocked approval separately from recorded ev
   ).toBeDisabled();
   expect(fixture.state.content!.text).toBe(initial.content!.text);
   expect(fixture.requests).toHaveLength(0);
+});
+
+test("automatic recording and text checks let the customer save and approve without operator requests", async ({
+  page,
+}) => {
+  const fixture = await review(page, { unverified: true });
+  const operatorRequests: string[] = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/operator/"))
+      operatorRequests.push(request.url());
+  });
+  fixture.setJobs([
+    {
+      id: "alignment",
+      kind: "align_evidence",
+      status: "running",
+      error_code: null,
+      can_retry: false,
+    },
+  ]);
+  await page.goto(`/review/${id}`);
+  await expect(
+    page.getByRole("region", { name: "Recording check", exact: true }),
+  ).toContainText("automatically checking");
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
+  await page
+    .getByLabel("Testimonial text")
+    .fill("It probably saves two hours in a busy week.");
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(
+    page.getByRole("region", { name: "Evidence check", exact: true }),
+  ).toContainText("queued");
+  fixture.state.evidence_available = true;
+  fixture.setJobs([]);
+  fixture.setCheck("supported");
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeEnabled();
+  await page.getByRole("checkbox", { name: /I approve this exact/ }).check();
+  await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  await expect(
+    page.getByText("You approved this saved version."),
+  ).toBeVisible();
+  expect(fixture.requests.map((request) => request.action.type)).toEqual([
+    "save",
+    "approve",
+  ]);
+  expect(operatorRequests).toEqual([]);
+  expect(fixture.state.published_approval_id).toBeNull();
+});
+
+test("recording validation reports queued, failed and absent work without promising operator draft approval", async ({
+  page,
+}) => {
+  const fixture = await review(page, { unverified: true });
+  fixture.setJobs([
+    {
+      id: "alignment",
+      kind: "align_evidence",
+      status: "queued",
+      error_code: null,
+      can_retry: false,
+    },
+  ]);
+  await page.goto(`/review/${id}`);
+  const recording = page.getByRole("region", {
+    name: "Recording check",
+    exact: true,
+  });
+  await expect(recording).toContainText("automatic recording check is queued");
+  fixture.setJobs([
+    {
+      id: "alignment",
+      kind: "align_evidence",
+      status: "failed",
+      error_code: "alignment_unproven",
+      can_retry: false,
+    },
+  ]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(recording).toContainText(
+    "Your recording could not be verified automatically",
+  );
+  await expect(recording).toContainText("Technical recovery is needed");
+  await expect(recording.getByRole("button")).toHaveCount(0);
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
+  fixture.setJobs([]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(recording).toHaveCount(0);
+  await expect(
+    page.getByText(/Your recording has not yet been verified for approval/),
+  ).toBeVisible();
+  await expect(page.getByText(/We are automatically checking/)).toHaveCount(0);
+});
+
+test("request configuration errors explain a technical service failure rather than editorial approval", async ({
+  page,
+}) => {
+  const fixture = await review(page);
+  fixture.setCheck("failed");
+  fixture.setJobs([
+    {
+      id: "support",
+      kind: "support_check",
+      status: "failed",
+      error_code: "gateway_request_rejected",
+      can_retry: true,
+    },
+  ]);
+  await page.goto(`/review/${id}`);
+  const check = page.getByRole("region", {
+    name: "Evidence check",
+    exact: true,
+  });
+  await expect(check).toContainText("technical configuration problem");
+  await expect(check).toContainText(
+    "This does not require anyone to approve your draft",
+  );
+  await expect(
+    check.getByRole("button", { name: "Retry service check" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(
+    initial.content!.text,
+  );
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
 });

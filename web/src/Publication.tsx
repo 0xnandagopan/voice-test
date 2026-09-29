@@ -199,7 +199,15 @@ export function OperatorReview() {
           Publish approved testimonial
         </button>
       )}
-      <AlignmentReview interviewId={interviewId} state={state} />
+      <details>
+        <summary>Recording troubleshooting</summary>
+        <p>
+          Recording and text checks normally run automatically. Use this repair
+          tool only when a recording cannot be verified. The customer reviews
+          and approves their own testimonial; this is not draft approval.
+        </p>
+        <AlignmentReview interviewId={interviewId} state={state} />
+      </details>
       <p className="small muted">
         Customer approval and operator publication are separate actions. Later
         content edits withdraw the hosted testimonial and require fresh

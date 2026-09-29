@@ -98,7 +98,7 @@ function ReviewWorkspace({ id }: { id: string }) {
           ? {
               ...old,
               assessment: null,
-              jobs: old.jobs.filter((job) => job.kind === "import_evidence"),
+              jobs: old.jobs.filter((job) => isRecordingJob(job)),
             }
           : old,
       );
@@ -232,7 +232,7 @@ function ReviewWorkspace({ id }: { id: string }) {
   // recording recovery visible, but never attach an old task to new text.
   const currentJobs = (evidence.data?.jobs ?? []).filter(
     (job) =>
-      job.kind === "import_evidence" ||
+      isRecordingJob(job) ||
       (evidence.data?.content_revision === state.revisions.content &&
         evidence.data?.evidence_revision === state.revisions.evidence),
   );
@@ -263,7 +263,9 @@ function ReviewWorkspace({ id }: { id: string }) {
           <p className="eyebrow">PRIVATE REVIEW</p>
           <h1>Your story. Your decision.</h1>
           <p>
-            Review the recording, edit your words and choose whether to approve.
+            Review or edit your draft, then save your changes for automatic
+            checks against your recording. You approve the exact testimonial;
+            the operator can publish it afterward.
           </p>
         </div>
         <Link className="text-link" to="/interview">
@@ -290,13 +292,18 @@ function ReviewWorkspace({ id }: { id: string }) {
           draft for later evidence checking.
         </Message>
       )}
-      {!state.evidence_available && (
-        <Message>
-          The operator needs to listen to and verify your recorded answers
-          before approval. You can keep editing and saving your text while that
-          review is pending.
-        </Message>
-      )}
+      {!state.evidence_available &&
+        !currentJobs.some(
+          (job) =>
+            job.kind === "align_evidence" &&
+            ["queued", "running", "failed"].includes(job.status),
+        ) && (
+          <Message>
+            Your recording has not yet been verified for approval. You can keep
+            editing and saving your draft. This is a recording check, not a
+            request for the operator to approve your words.
+          </Message>
+        )}
       {recovery.data && (
         <RecoveryStatus
           recovery={recovery.data}
@@ -323,7 +330,7 @@ function ReviewWorkspace({ id }: { id: string }) {
               <h2>Your draft is not ready yet.</h2>
               <p>
                 We can prepare a provisional draft from available recorded
-                sources. Recording alignment and support checks must pass before
+                sources. Automatic recording and support checks must pass before
                 approval. Nothing has been approved.
               </p>
               {!draftJob || draftJob.status === "succeeded" ? (
@@ -416,7 +423,22 @@ function ReviewWorkspace({ id }: { id: string }) {
   );
 }
 type ProcessingJob = Evidence["jobs"][number];
+function isRecordingJob(job: ProcessingJob) {
+  return job.kind === "import_evidence" || job.kind === "align_evidence";
+}
 function taskCopy(job: ProcessingJob) {
+  if (job.kind === "align_evidence") {
+    return {
+      title: "Recording check",
+      retryLabel: "Retry recording check",
+      text:
+        job.status === "queued"
+          ? "Your automatic recording check is queued. You can keep editing and saving your draft."
+          : job.status === "running"
+            ? "We are automatically checking that the saved transcript matches your recorded answers. You can keep editing and saving your draft."
+            : "Your recording could not be verified automatically. Your saved text is preserved, but approval needs the recording check to pass. Technical recovery is needed; this is not an operator review of your draft.",
+    };
+  }
   const support = job.kind === "support_check";
   const recovery = job.kind === "import_evidence";
   const title = recovery
@@ -455,15 +477,15 @@ function taskCopy(job: ProcessingJob) {
     case "gateway_model_access":
       return {
         title,
-        retryLabel: "Retry after operator update",
-        text: `${preserved} The operator's account cannot access the selected drafting model. The operator needs to enable access or choose an available model before you retry.`,
+        retryLabel: "Retry service check",
+        text: `${preserved} The automatic drafting service has an account-access problem. Technical support needs to restore the service. This does not require anyone to approve your draft; retrying before the repair may fail again.`,
       };
     case "gateway_configuration":
     case "gateway_request_rejected":
       return {
         title,
-        retryLabel: "Retry after operator update",
-        text: `${preserved} The drafting service needs attention from the operator before this can complete. Retrying without an update may fail again.`,
+        retryLabel: "Retry service check",
+        text: `${preserved} The automatic drafting service could not accept this request because of a technical configuration problem. This does not require anyone to approve your draft. You can keep editing; retry after the service is repaired.`,
       };
     case "gateway_rate_limited":
       detail = "The drafting service is busy. Please try again later.";
@@ -854,16 +876,15 @@ function Editor({
             ))
           ) : (
             <Message>
-              Audio selection is waiting for the operator to listen to and
-              verify the recorded answers. Writing your own text does not remove
-              that requirement.
+              No verified audio clips are available yet. Audio is optional; you
+              can approve text only once the recording and text checks pass.
             </Message>
           )}
           {unavailableSelection && (
             <Message error>
               A previously selected clip is no longer verified for this evidence
-              version. Exclude it or ask the operator to verify the recording
-              again.
+              version. Exclude it or wait for the recording check to complete
+              before selecting it again.
             </Message>
           )}
           {draft.clips.length > 0 && (
@@ -911,8 +932,9 @@ function Editor({
         evidence.assessment.assessment.quality_gate_passed === false && (
           <Message>
             The evidence-checking service has not passed its quality checks yet.
-            Your text is saved, but approval is unavailable. The operator needs
-            to complete service validation.
+            Your text is saved, but approval is unavailable until technical
+            service validation is complete. This is not a review of your draft
+            by the operator.
           </Message>
         )}
       {state.approval && (

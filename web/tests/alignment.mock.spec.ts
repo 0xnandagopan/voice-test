@@ -97,6 +97,7 @@ test("verification requires complete playback and two explicit confirmations", a
 }) => {
   const f = await fixture(page);
   await page.goto(`/operator/interviews/${id}`);
+  await page.getByText("Recording troubleshooting", { exact: true }).click();
   await page.getByRole("button", { name: "Prepare audio preview" }).click();
   const matches = page.getByRole("checkbox", {
     name: "The original transcript matches",
@@ -147,6 +148,7 @@ test("adjusting a range or receiving a new revision clears playback and confirma
 }) => {
   const f = await fixture(page);
   await page.goto(`/operator/interviews/${id}`);
+  await page.getByText("Recording troubleshooting", { exact: true }).click();
   await page.getByRole("button", { name: "Prepare audio preview" }).click();
   await playback(page);
   await page
@@ -236,6 +238,7 @@ test("a verified answer can be rechecked with a revised complete range", async (
 }) => {
   const f = await fixture(page, true);
   await page.goto(`/operator/interviews/${id}`);
+  await page.getByText("Recording troubleshooting", { exact: true }).click();
   await expect(
     page.getByText("Recorded answer verified.", { exact: true }),
   ).toBeVisible();
@@ -275,4 +278,22 @@ test("a verified answer can be rechecked with a revised complete range", async (
   ).toBeVisible();
   expect(f.confirmations).toHaveLength(1);
   expect(f.confirmations[0].source_range_ms).toEqual([1000, 4000]);
+});
+
+test("operator recording repair is collapsed troubleshooting rather than a required review step", async ({
+  page,
+}) => {
+  const f = await fixture(page);
+  await page.goto(`/operator/interviews/${id}`);
+  await expect(
+    page.getByRole("button", { name: "Prepare audio preview" }),
+  ).toBeHidden();
+  await page.getByText("Recording troubleshooting", { exact: true }).click();
+  await expect(
+    page.getByText(/Recording and text checks normally run automatically/),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Prepare audio preview" }),
+  ).toBeVisible();
+  expect(f.confirmations).toEqual([]);
 });
