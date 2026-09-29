@@ -85,11 +85,17 @@ pub async fn operator_command(
 async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<Value>, ApiError> {
     let t = token(&s, &h, id, op).await?;
     let before = workflow::inspect(&s.pool, &t, id).await?;
-    let rows=sqlx::query("SELECT provider_attempt_id,manifest FROM evidence_imports WHERE interview_id=$1 ORDER BY created_at,id").bind(id).fetch_all(&s.pool).await?;
+    let rows=sqlx::query("SELECT e.provider_attempt_id,e.manifest FROM evidence_imports e JOIN provider_attempts p ON p.id=e.provider_attempt_id WHERE e.interview_id=$1 ORDER BY p.started_at,p.id").bind(id).fetch_all(&s.pool).await?;
     let mut sources = Vec::new();
     for row in rows {
         let m: Manifest =
             serde_json::from_value(row.get("manifest")).map_err(|_| ApiError::conflict())?;
+        // A verified recovered track describes saved bytes, not whether the
+        // customer finished their last sentence before the connection closed.
+        let recording_interrupted = !matches!(
+            m.product_end_reason.as_deref(),
+            Some("explicit_finish" | "explicit_stop")
+        ) || !m.incomplete_turn_ids.is_empty();
         for seg in m
             .support_segments()
             .iter()
@@ -99,7 +105,7 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
                 .media
                 .as_ref()
                 .and_then(|m| m.ranges.iter().find(|r| r.source_id == seg.source_id));
-            sources.push(json!({"source_id":seg.source_id,"attempt_id":row.get::<Uuid,_>("provider_attempt_id"),"text":seg.text,"corrected_text":before.transcript_corrections.get(&seg.source_id),"speaker":seg.speaker,"start_ms":seg.source_range_ms.map(|r|r[0]),"end_ms":seg.source_range_ms.map(|r|r[1]),"playback_available":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some() || check.is_some_and(|c|c.within_recording && c.audible_samples>0 && c.candidate_source_range_ms.is_some()),"alignment_verified":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some(),"candidate_range_ms":check.and_then(|c|c.candidate_source_range_ms),"verified_range_ms":v0_evidence::alignment::source_proof(&m,&seg.source_id).map(|p|p.source_range_ms)}));
+            sources.push(json!({"recording_interrupted":recording_interrupted,"source_id":seg.source_id,"attempt_id":row.get::<Uuid,_>("provider_attempt_id"),"text":seg.text,"corrected_text":before.transcript_corrections.get(&seg.source_id),"speaker":seg.speaker,"start_ms":seg.source_range_ms.map(|r|r[0]),"end_ms":seg.source_range_ms.map(|r|r[1]),"playback_available":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some() || check.is_some_and(|c|c.within_recording && c.audible_samples>0 && c.candidate_source_range_ms.is_some()),"alignment_verified":v0_evidence::alignment::source_proof(&m,&seg.source_id).is_some(),"candidate_range_ms":check.and_then(|c|c.candidate_source_range_ms),"verified_range_ms":v0_evidence::alignment::source_proof(&m,&seg.source_id).map(|p|p.source_range_ms)}));
         }
     }
     // Jobs are current user actions, not the historical worker audit log. Keep
@@ -133,9 +139,16 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
     if before.revisions != after.revisions {
         return Err(ApiError::conflict());
     }
-    let clips=sqlx::query("SELECT id,sha256,source_id FROM workflow_clips WHERE interview_id=$1 AND evidence_revision=$2 AND ready ORDER BY source_id,id")
+    let mut clips=sqlx::query("SELECT id,sha256,source_id FROM workflow_clips WHERE interview_id=$1 AND evidence_revision=$2 AND ready ORDER BY source_id,id")
         .bind(id).bind(after.revisions.evidence).fetch_all(&s.pool).await?.into_iter()
         .map(|r|json!({"id":r.get::<Uuid,_>("id"),"sha256":r.get::<String,_>("sha256"),"source_id":r.get::<String,_>("source_id")})).collect::<Vec<_>>();
+    // Match the chronological source list even when recovery imports arrive late.
+    clips.sort_by_key(|clip| {
+        sources
+            .iter()
+            .position(|source| source["source_id"] == clip["source_id"])
+            .unwrap_or(usize::MAX)
+    });
     if workflow::inspect(&s.pool, &t, id).await?.revisions != after.revisions {
         return Err(ApiError::conflict());
     }

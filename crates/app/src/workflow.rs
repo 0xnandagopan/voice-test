@@ -760,7 +760,7 @@ pub async fn composition_input(
         return Err(ApiError::conflict());
     }
     let rows: Vec<Value> = sqlx::query_scalar(
-        "SELECT manifest FROM evidence_imports WHERE interview_id=$1 ORDER BY provider_attempt_id",
+        "SELECT e.manifest FROM evidence_imports e JOIN provider_attempts p ON p.id=e.provider_attempt_id WHERE e.interview_id=$1 ORDER BY p.started_at,p.id",
     )
     .bind(id)
     .fetch_all(&mut *tx)

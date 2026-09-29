@@ -824,3 +824,43 @@ async fn generation_receipts_fail_closed_for_malformed_or_other_command_request_
     assert_eq!(count, 0);
     f.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn recovered_sources_keep_attempt_order_and_disclose_interrupted_endings() {
+    let f = Fixture::new().await;
+    f.trusted_fixture_evidence().await;
+    f.trusted_fixture_evidence().await;
+    let attempts: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM provider_attempts WHERE interview_id=$1 ORDER BY id DESC",
+    )
+    .bind(f.id)
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    // Earlier attempt arrives later: neither import arrival nor random UUIDs
+    // determine the order in which the customer told their story.
+    for (index, attempt) in attempts.iter().enumerate() {
+        sqlx::query("UPDATE provider_attempts SET started_at=clock_timestamp()+$2*interval '1 minute' WHERE id=$1")
+            .bind(attempt).bind(index as i32).execute(&f.pool).await.unwrap();
+        sqlx::query("UPDATE evidence_imports SET created_at=clock_timestamp()-$2*interval '1 minute',manifest=jsonb_set(manifest,'{product_end_reason}',$3) WHERE provider_attempt_id=$1")
+            .bind(attempt).bind(index as i32)
+            .bind(json!(if index == 0 { "transport_lost" } else { "explicit_finish" }))
+            .execute(&f.pool).await.unwrap();
+    }
+    let (status, evidence, _) = f
+        .request(
+            "GET",
+            &f.path("evidence"),
+            Some(&f.cookie(false)),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(evidence["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(evidence["sources"][0]["attempt_id"], json!(attempts[0]));
+    assert_eq!(evidence["sources"][1]["attempt_id"], json!(attempts[1]));
+    assert_eq!(evidence["sources"][0]["recording_interrupted"], true);
+    assert_eq!(evidence["sources"][1]["recording_interrupted"], false);
+    f.close().await;
+}
