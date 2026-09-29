@@ -171,6 +171,21 @@ async function review(
             : jobs,
         },
       });
+    if (path.endsWith("/generate")) {
+      const body = route.request().postDataJSON();
+      requests.push(body);
+      expect(body.expected).toEqual(state.revisions);
+      jobs = [
+        {
+          id: "replacement-draft",
+          kind: "generate_draft",
+          status: "queued",
+          error_code: null,
+          can_retry: false,
+        },
+      ];
+      return route.fulfill({ json: { job_id: "replacement-draft", state } });
+    }
     if (path.endsWith("/retry")) {
       const body = route.request().postDataJSON();
       requests.push(body);
@@ -1191,4 +1206,81 @@ test("waiting for recovered recording processing preserves the draft and explain
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeEnabled();
   expect(fixture.requests).toHaveLength(0);
+});
+
+test("replacing a draft is explicit, waits for saved edits and preserves them on generation failure", async ({
+  page,
+}) => {
+  const fixture = await review(page, { resumed: true });
+  await page.goto(`/review/${id}`);
+  const section = page
+    .locator("details")
+    .filter({ has: page.getByText("Prepare another draft", { exact: true }) });
+  await expect(section).not.toHaveAttribute("open");
+  await page.getByText("Prepare another draft", { exact: true }).click();
+  expect(fixture.requests).toHaveLength(0);
+  await expect(section).toContainText(
+    "resets attribution to the name on your invitation, and excludes audio",
+  );
+  const replace = page.getByRole("button", {
+    name: "Replace with a new provisional draft",
+  });
+  await expect(replace).toBeEnabled();
+  await page
+    .getByLabel("Testimonial text")
+    .fill("My own edited testimonial, including a thank-you.");
+  await expect(replace).toBeDisabled();
+  expect(fixture.requests).toHaveLength(0);
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(
+    page.getByText("Saved on the server.", { exact: true }),
+  ).toBeVisible();
+  const saved = structuredClone(fixture.state.content);
+  const expected = structuredClone(fixture.state.revisions);
+  await expect(replace).toBeEnabled();
+  await replace.click();
+  await expect(page.getByText(/Draft preparation is queued/)).toBeVisible();
+  await expect(replace).toBeDisabled();
+  expect(fixture.requests).toHaveLength(2);
+  expect(fixture.requests[1]).toMatchObject({ expected });
+  expect(typeof fixture.requests[1].request_id).toBe("string");
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(saved!.text);
+  fixture.setJobs([
+    {
+      id: "replacement-draft",
+      kind: "generate_draft",
+      status: "failed",
+      error_code: "generation_validation_failed",
+      can_retry: true,
+    },
+  ]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByRole("button", { name: "Retry draft preparation", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(saved!.text);
+  expect(fixture.state.content).toEqual(saved);
+});
+
+test("another draft remains unavailable during recording recovery and after approval", async ({
+  page,
+}) => {
+  const fixture = await review(page, { resumed: true, unverified: true });
+  await page.goto(`/review/${id}`);
+  await page.getByText("Prepare another draft", { exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Replace with a new provisional draft" }),
+  ).toBeDisabled();
+  fixture.state.evidence_available = true;
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByRole("button", { name: "Replace with a new provisional draft" }),
+  ).toBeEnabled();
+  await page.getByRole("checkbox", { name: /I approve this exact/ }).check();
+  await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  await expect(
+    page.getByText("Prepare another draft", { exact: true }),
+  ).toHaveCount(0);
+  expect(fixture.requests).toHaveLength(1);
+  expect(fixture.requests[0].action.type).toBe("approve");
 });

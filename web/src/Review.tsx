@@ -325,6 +325,12 @@ function ReviewWorkspace({ id }: { id: string }) {
               evidence={evidence.data}
               busy={busy}
               supportTaskVisible={supportTaskVisible}
+              generating={currentJobs.some(
+                (job) =>
+                  job.kind === "generate_draft" &&
+                  ["queued", "running"].includes(job.status),
+              )}
+              onGenerate={() => generate.mutate()}
               write={async (expected, action) =>
                 (await write.mutateAsync({ expected, action })).state
               }
@@ -693,6 +699,8 @@ function Editor({
   state,
   busy,
   supportTaskVisible,
+  generating,
+  onGenerate,
   write,
 }: {
   id: string;
@@ -700,6 +708,8 @@ function Editor({
   state: WorkflowView;
   busy: boolean;
   supportTaskVisible: boolean;
+  generating: boolean;
+  onGenerate: () => void;
   write: (expected: Revisions, action: WorkflowAction) => Promise<WorkflowView>;
 }) {
   const [base, setBase] = useState(state);
@@ -1042,6 +1052,32 @@ function Editor({
       <p className="small muted">
         Saving or closing this page does not approve publication.
       </p>
+      {!state.approval && !state.declined && (
+        <details>
+          <summary>Prepare another draft</summary>
+          <p>
+            Prepare a new provisional draft using all recovered recordings. On
+            success, it replaces your saved testimonial text, resets attribution
+            to the name on your invitation, and excludes audio. Your current
+            draft stays saved until the new draft succeeds; if it fails, your
+            current draft is preserved.
+          </p>
+          <button
+            className="secondary"
+            disabled={
+              dirty || stale || busy || generating || !state.evidence_available
+            }
+            onClick={onGenerate}
+          >
+            Replace with a new provisional draft
+          </button>
+          {(dirty || stale) && (
+            <p className="small">
+              Save or reconcile your changes before requesting another draft.
+            </p>
+          )}
+        </details>
+      )}
     </>
   );
 }
