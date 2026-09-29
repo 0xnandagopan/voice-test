@@ -240,7 +240,24 @@ fn tokens(text: &str) -> Vec<String> {
             if !word.is_empty() {
                 out.push(std::mem::take(&mut word));
             }
-            if matches!(c, '+' | '-' | '%' | '$' | '€' | '£' | '¥' | '−') {
+            if matches!(
+                c,
+                '+' | '-'
+                    | '%'
+                    | '$'
+                    | '€'
+                    | '£'
+                    | '¥'
+                    | '−'
+                    | '<'
+                    | '>'
+                    | '='
+                    | '&'
+                    | '@'
+                    | '/'
+                    | '×'
+                    | '÷'
+            ) {
                 out.push(c.to_string());
             }
         }

@@ -96,6 +96,8 @@ fn negations_numbers_qualifiers_symbols_and_extra_audio_words_cannot_disappear()
         "Around $60+ registrations.",
         "Around 60.5+ registrations.",
         "Around 60% registrations.",
+        "Around <60+ registrations.",
+        "Around >60+ registrations.",
     ] {
         let (mut m, t) = fixture();
         let i = usize::from(altered.contains("registrations"));
