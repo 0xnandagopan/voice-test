@@ -198,7 +198,7 @@ pub fn source_proof<'a>(
                             p.verified_by == format!("assemblyai:{}", r.transcript_id)
                         })
                         && p.source_range_ms == source.source_range_ms.unwrap_or([0, 0])
-                        && crate::automatic_alignment::preflight(manifest).is_ok())
+                        && crate::automatic_alignment::recorded_preflight(manifest).is_ok())
                     || (p.method == crate::automatic_alignment::METHOD
                         && manifest.recorded_transcript.is_none()
                         && p.verified_by.starts_with("assemblyai:")

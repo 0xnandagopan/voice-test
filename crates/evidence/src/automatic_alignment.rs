@@ -20,7 +20,7 @@ pub fn prepare_recorded_sources(
     manifest: &mut Manifest,
     transcript: &RecordedTranscript,
 ) -> Result<()> {
-    preflight(manifest)?;
+    recorded_preflight(manifest)?;
     validate_recorded_transcript(manifest, transcript)?;
     if !manifest.operator_alignment.is_empty() {
         return Err(Error::Invalid("automatic alignment proof conflict"));
@@ -129,8 +129,10 @@ pub struct VerifiedRange {
     pub source_id: String,
     pub source_range_ms: [u64; 2],
 }
-/// Reject known missing or uncertain recording tails before making billable calls.
-pub fn preflight(manifest: &Manifest) -> Result<()> {
+/// Validate saved recording bytes before making billable calls. An interrupted
+/// conversation can have a valid finalized recording; this does not establish
+/// that its last answer finished or that speech after disconnection was saved.
+pub fn recorded_preflight(manifest: &Manifest) -> Result<()> {
     let media = manifest
         .media
         .as_ref()
@@ -165,6 +167,17 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
     if sources.len() > 100 || sources.iter().any(|s| s.channel != 0) {
         return Err(Error::Invalid("customer source identity"));
     }
+    Ok(())
+}
+
+/// Legacy turn matching requires complete answers, unlike saved-track STT.
+pub fn preflight(manifest: &Manifest) -> Result<()> {
+    recorded_preflight(manifest)?;
+    let sources: Vec<_> = manifest
+        .segments
+        .iter()
+        .filter(|s| s.speaker == "customer")
+        .collect();
     match manifest.product_end_reason.as_deref() {
         // Voice-agent turn status includes the agent reply. An explicit customer
         // Finish can interrupt that reply after a complete customer answer.
@@ -181,7 +194,7 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 }
 
 pub fn plan(manifest: &Manifest, transcript: &RecordedTranscript) -> Result<Vec<VerifiedRange>> {
-    preflight(manifest)?;
+    recorded_preflight(manifest)?;
     if let Some(recorded) = &manifest.recorded_transcript {
         validate_recorded_transcript(manifest, transcript)?;
         if !valid_recorded_source(manifest)
@@ -195,6 +208,7 @@ pub fn plan(manifest: &Manifest, transcript: &RecordedTranscript) -> Result<Vec<
             source_range_ms: recorded.segments[0].source_range_ms.unwrap(),
         }]);
     }
+    preflight(manifest)?;
     let media = manifest.media.as_ref().unwrap();
     if transcript.id.is_empty()
         || transcript.id.len() > 100

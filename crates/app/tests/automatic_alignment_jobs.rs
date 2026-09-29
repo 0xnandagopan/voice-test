@@ -522,3 +522,190 @@ async fn deleted_interview_and_lost_lease_cannot_attach_automatic_evidence() {
         f.close().await;
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL and FFMPEG_PATH/FFPROBE_PATH"]
+async fn recovered_interrupted_attempt_and_resumed_attempt_both_supply_draft_and_audio() {
+    let f = Fixture::new().await;
+    let mock = Mock::new().await;
+    mock.calls.completed.store(true, Ordering::SeqCst);
+    let row =
+        sqlx::query("SELECT provider_attempt_id,manifest,recording_key FROM evidence_imports")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    let original: Value = row.get("manifest");
+    let mut interrupted = original.clone();
+    interrupted["product_end_reason"] = json!("transport_lost");
+    interrupted["segments"][0]["turn_status"] = json!("incomplete");
+    interrupted["incomplete_turn_ids"] = json!(["answer"]);
+    sqlx::query("UPDATE evidence_imports SET manifest=$1")
+        .bind(&interrupted)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    // Simulate the old, rejected preflight (no provider request was submitted).
+    sqlx::query("UPDATE jobs SET dedupe_key=replace(dedupe_key,'align-v3:','align-v2:'),status='failed',last_error='alignment_recording_incomplete',payload=jsonb_set(payload,'{alignment_version}','2') WHERE kind='align_evidence'").execute(&f.pool).await.unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    let lease_attempt = |pool: PgPool, attempt: Uuid, interview_id: Uuid| async move {
+        let token = Uuid::new_v4();
+        let row = sqlx::query("UPDATE jobs SET status='running',attempts=attempts+1,lease_token=$2,lease_until=clock_timestamp()+interval '120 seconds' WHERE payload->>'provider_attempt_id'=$1 AND kind='align_evidence' AND status='queued' RETURNING id,kind,payload")
+            .bind(attempt.to_string()).bind(token).fetch_one(&pool).await.unwrap();
+        Job {
+            id: row.get("id"),
+            interview_id,
+            kind: row.get("kind"),
+            payload: row.get("payload"),
+            token,
+        }
+    };
+    f.dispatch(
+        &lease_attempt(f.pool.clone(), row.get("provider_attempt_id"), f.id).await,
+        &mock,
+    )
+    .await
+    .unwrap();
+    let saved: Value = sqlx::query_scalar("SELECT manifest FROM evidence_imports")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(saved["incomplete_turn_ids"], json!(["answer"]));
+    assert_eq!(saved["segments"], interrupted["segments"]);
+    assert_eq!(saved["product_end_reason"], "transport_lost");
+    assert_eq!(saved["approval_eligible"], true);
+
+    // A separate resumed provider attempt has its own clock, transcript and clip.
+    let second = Uuid::from_u128(1); // sorts before the earlier random UUID
+    let session = format!("synthetic_{}", second.simple());
+    let mut resumed = original;
+    resumed["provider_session_id"] = json!(session);
+    resumed["segments"][0]["source_id"] = json!(format!("{session}/answer/customer"));
+    sqlx::query("INSERT INTO provider_attempts(id,interview_id,provider_session_id,lease_generation,state,product_end_reason) VALUES($1,$2,$3,2,'ended','explicit_finish')")
+        .bind(second).bind(f.id).bind(&session).execute(&f.pool).await.unwrap();
+    sqlx::query("INSERT INTO evidence_imports(id,interview_id,provider_attempt_id,manifest,recording_key) VALUES($1,$2,$3,$4,$5)")
+        .bind(Uuid::new_v4()).bind(f.id).bind(second).bind(resumed).bind(row.get::<String,_>("recording_key")).execute(&f.pool).await.unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    mock.calls.mismatch.store(true, Ordering::SeqCst);
+    f.dispatch(&lease_attempt(f.pool.clone(), second, f.id).await, &mock)
+        .await
+        .unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    assert_eq!(mock.calls.submits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.count("SELECT count(*) FROM workflow_clips WHERE ready")
+            .await,
+        2
+    );
+    assert_eq!(
+        f.count("SELECT count(DISTINCT source_id) FROM workflow_clips WHERE ready")
+            .await,
+        2
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM jobs WHERE kind='align_evidence'")
+            .await,
+        3
+    ); // one old rejection + two successes
+    f.save("Synthetic answer only. Different answer only.")
+        .await;
+    let job = f.lease("support_check").await;
+    let (state, sources) = workflow::composition_input(&f.pool, f.id, job.id, job.token)
+        .await
+        .unwrap();
+    assert!(state.evidence_available);
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0].text, "Synthetic answer only.");
+    assert_eq!(sources[1].text, "Different answer only.");
+    assert!(sources.iter().any(|s| s.text == "Synthetic answer only."));
+    assert!(sources.iter().any(|s| s.text == "Different answer only."));
+    workflow::complete_support(
+        &f.pool,
+        f.id,
+        job.id,
+        job.token,
+        v0_domain::workflow::SupportResult {
+            content_revision: state.revisions.content,
+            evidence_revision: state.revisions.evidence,
+            status: CheckStatus::Supported,
+            all_substantive_claims_checked: true,
+            source_ids: sources.iter().map(|s| s.id.clone()).collect(),
+            model: "gpt-6-luna".into(),
+            prompt_version: v0_composition::PROMPT_VERSION.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let checked = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    let approved = workflow::execute(
+        &f.pool,
+        &f.customer,
+        WorkflowCommand {
+            interview_id: f.id,
+            request_id: Uuid::new_v4(),
+            expected: checked.revisions,
+            action: WorkflowAction::Approve,
+        },
+    )
+    .await
+    .unwrap()
+    .state;
+    assert!(approved.approval.is_some());
+    assert!(approved.content.unwrap().clips.is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL and FFMPEG_PATH/FFPROBE_PATH"]
+async fn recovery_upgrade_does_not_retry_unrelated_or_billable_work() {
+    let f = Fixture::new().await;
+    sqlx::query("UPDATE jobs SET dedupe_key=replace(dedupe_key,'align-v3:','align-v2:') WHERE kind='align_evidence'").execute(&f.pool).await.unwrap();
+    for (status, error, extra) in [
+        ("queued", "alignment_recording_incomplete", json!({})),
+        ("running", "alignment_recording_incomplete", json!({})),
+        ("failed", "alignment_unverified", json!({})),
+        ("failed", "alignment_transcript_mismatch", json!({})),
+        (
+            "failed",
+            "alignment_recording_incomplete",
+            json!({"submit_started":true}),
+        ),
+        (
+            "failed",
+            "alignment_recording_incomplete",
+            json!({"transcript_id":"existing"}),
+        ),
+    ] {
+        sqlx::query("UPDATE jobs SET status=$1,last_error=$2,payload=(payload-'submit_started'-'transcript_id')||$3 WHERE kind='align_evidence'")
+            .bind(status).bind(error).bind(extra).execute(&f.pool).await.unwrap();
+        alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+        assert_eq!(
+            f.count("SELECT count(*) FROM jobs WHERE kind='align_evidence'")
+                .await,
+            1
+        );
+    }
+    sqlx::query("UPDATE jobs SET status='failed',last_error='alignment_recording_incomplete',payload=payload-'submit_started'-'transcript_id'").execute(&f.pool).await.unwrap();
+    // Actual dropped recording bytes still do not qualify for the upgrade.
+    sqlx::query("UPDATE evidence_imports SET manifest=jsonb_set(manifest,'{dropped_chunks}','1')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    assert_eq!(
+        f.count("SELECT count(*) FROM jobs WHERE kind='align_evidence'")
+            .await,
+        1
+    );
+    sqlx::query("UPDATE evidence_imports SET manifest=jsonb_set(manifest,'{dropped_chunks}','0')")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    alignment_jobs::enqueue_missing(&f.pool).await.unwrap();
+    assert_eq!(
+        f.count("SELECT count(*) FROM jobs WHERE kind='align_evidence'")
+            .await,
+        2
+    );
+    f.close().await;
+}

@@ -285,7 +285,7 @@ fn whole_track_sources_allow_asr_word_estimate_overlap_but_reject_impossible_med
         match fault {
             0 => m.media = None,
             1 => m.dropped_chunks = Some(1),
-            2 => m.product_end_reason = Some("transport_lost".into()),
+            2 => m.media.as_mut().unwrap().channels = 1,
             3 => t.words[0].end = 4001,
             4 => t.audio_duration = 9.0,
             5 => t.words[0].confidence = f64::NAN,
@@ -336,4 +336,25 @@ fn whole_recorded_source_does_not_need_missing_live_captions_and_recovery_keeps_
         "recorded_utterance_automatically_verified"
     );
     assert!(m.segments.is_empty());
+}
+
+#[test]
+fn interrupted_saved_track_is_usable_without_declaring_original_answer_complete() {
+    for end in [None, Some("transport_lost"), Some("explicit_stop")] {
+        let (mut m, t) = fixture();
+        m.product_end_reason = end.map(str::to_owned);
+        m.segments[1].turn_status = "incomplete".into();
+        m.incomplete_turn_ids.push("b".into());
+        let original = serde_json::to_value(&m.segments).unwrap();
+        assert!(preflight(&m).is_err()); // old turn-to-caption proof stays strict
+        automatic_alignment::prepare_recorded_sources(&mut m, &t).unwrap();
+        let c = clips(&m, &t);
+        confirm(&mut m, &t, &c, chrono::Utc::now()).unwrap();
+        assert!(m.approval_eligible);
+        assert!(source_proof(&m, &m.support_segments()[0].source_id).is_some());
+        assert_eq!(m.support_segments()[0].source_range_ms, Some([0, 4000]));
+        assert_eq!(serde_json::to_value(&m.segments).unwrap(), original);
+        assert_eq!(m.incomplete_turn_ids, vec!["b"]);
+        assert_eq!(m.product_end_reason.as_deref(), end);
+    }
 }

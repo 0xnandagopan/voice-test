@@ -42,13 +42,37 @@ fn evidence_error(error: v0_evidence::Error) -> JobFailure {
 /// One durable task per immutable recording, including recordings imported before
 /// automatic alignment existed. Polling is maintenance, never customer activity.
 pub async fn enqueue_missing(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let rows=sqlx::query("SELECT e.interview_id,e.provider_attempt_id,e.manifest->>'recording_sha256' AS hash FROM evidence_imports e JOIN interviews i ON i.id=e.interview_id WHERE i.deleted_at IS NULL AND i.state NOT IN ('deleted','revoked') AND i.expires_at>clock_timestamp() AND e.manifest->'media' IS NOT NULL AND e.manifest->'media'<>'null'::jsonb AND e.manifest->>'approval_eligible'='false' AND COALESCE(jsonb_array_length(e.manifest->'operator_alignment'),0)=0 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='align-v2:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256')) LIMIT 32").fetch_all(pool).await?;
+    // v3 only reopens v2's pre-submission completion rejection. Never resubmit
+    // uncertain billable work, unrelated failures, or a still-running older job.
+    let rows = sqlx::query(r#"
+        SELECT e.interview_id,e.provider_attempt_id,e.manifest,e.manifest->>'recording_sha256' AS hash,
+          EXISTS(SELECT 1 FROM jobs prior WHERE prior.dedupe_key='align-v2:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256')) AS upgrade
+        FROM evidence_imports e JOIN interviews i ON i.id=e.interview_id
+        WHERE i.deleted_at IS NULL AND i.state NOT IN ('deleted','revoked')
+          AND i.expires_at>clock_timestamp()
+          AND e.manifest->'media' IS NOT NULL AND e.manifest->'media'<>'null'::jsonb
+          AND e.manifest->>'approval_eligible'='false'
+          AND COALESCE(jsonb_array_length(e.manifest->'operator_alignment'),0)=0
+          AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='align-v3:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256'))
+          AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='align-v2:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256')
+            AND NOT (j.status='failed' AND COALESCE(j.last_error,'')='alignment_recording_incomplete'
+              AND NOT (j.payload ? 'transcript_id') AND COALESCE(j.payload->>'submit_started','false')='false'))
+        LIMIT 32
+    "#).fetch_all(pool).await?;
     for row in rows {
+        let Ok(manifest) = serde_json::from_value::<Manifest>(row.get("manifest")) else {
+            continue;
+        };
+        if row.get::<bool, _>("upgrade")
+            && automatic_alignment::recorded_preflight(&manifest).is_err()
+        {
+            continue;
+        }
         let attempt: Uuid = row.get("provider_attempt_id");
         let hash: String = row.get("hash");
         sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'align_evidence',$3,$4,40) ON CONFLICT(dedupe_key) DO NOTHING")
-            .bind(Uuid::new_v4()).bind(row.get::<Uuid,_>("interview_id")).bind(json!({"provider_attempt_id":attempt,"recording_sha256":hash,"alignment_version":2}))
-            .bind(format!("align-v2:{attempt}:{hash}")).execute(pool).await?;
+            .bind(Uuid::new_v4()).bind(row.get::<Uuid,_>("interview_id")).bind(json!({"provider_attempt_id":attempt,"recording_sha256":hash,"alignment_version":3}))
+            .bind(format!("align-v3:{attempt}:{hash}")).execute(pool).await?;
     }
     Ok(())
 }
@@ -130,7 +154,7 @@ pub async fn dispatch(
     {
         return Err(failure("alignment_stale", true));
     }
-    automatic_alignment::preflight(&manifest).map_err(evidence_error)?;
+    automatic_alignment::recorded_preflight(&manifest).map_err(evidence_error)?;
     let mut payload = job.payload.clone();
     let transcript_id = if let Some(id) = payload["transcript_id"].as_str() {
         id.to_owned()
