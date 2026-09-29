@@ -67,6 +67,7 @@ async function review(
         state.revisions.content++;
         state.check = "pending";
         state.approval = null;
+        state.published_approval_id = null;
         jobs = [
           {
             id: "current-check",
@@ -237,34 +238,124 @@ test("text-only exact approval requires explicit confirmation and survives reloa
   ).toBeVisible();
   expect(fixture.requests).toHaveLength(1);
 });
-test("editing saves exact text, waits for support and blocks unsupported claims", async ({
+for (const verdict of ["unsupported", "ambiguous"] as const) {
+  test(`customer can approve an exact saved edit with ${verdict} advisory notes`, async ({
+    page,
+  }) => {
+    if (verdict === "unsupported")
+      await page.setViewportSize({ width: 390, height: 844 });
+    const fixture = await review(page);
+    await page.goto(`/review/${id}`);
+    const editedText = `${initial.content!.text} Thank you to the agency for their support.`;
+    await page.getByLabel("Testimonial text").fill(editedText);
+    await expect(
+      page.getByRole("checkbox", { name: /I approve this exact/ }),
+    ).toBeDisabled();
+    await page.getByRole("button", { name: "Save changes" }).click();
+    await expect(
+      page.getByText(/Preparing your draft for approval. Your text is saved/),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("checkbox", { name: /I approve this exact/ }),
+    ).toBeDisabled();
+    fixture.setCheck(verdict);
+    fixture.setJobs([]);
+    fixture.setAssessment({
+      kind: "support_check",
+      model: "test-model",
+      prompt_version: "test",
+      content_revision: fixture.state.revisions.content,
+      evidence_revision: fixture.state.revisions.evidence,
+      assessment: {
+        quality_gate_passed: true,
+        claims: [
+          {
+            text: "Thank you to the agency for their support.",
+            verdict: verdict === "ambiguous" ? "uncertain" : verdict,
+            sources: [],
+            issues: ["This wording was added after the interview."],
+          },
+        ],
+        issues: [],
+      },
+    });
+    await page.getByRole("button", { name: "Refresh saved status" }).click();
+    await expect(
+      page.getByText(/You can edit it or approve this version as written/),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "Draft notes" }),
+    ).toContainText("This wording was added after the interview.");
+    await expect(
+      page.getByRole("heading", { name: "About this draft" }),
+    ).toBeVisible();
+    await expect(page.getByText("Claim 1", { exact: true })).toHaveCount(0);
+    await expect(
+      page.getByRole("checkbox", { name: /I approve this exact/ }),
+    ).toBeEnabled();
+    await expect(
+      page.getByRole("button", { name: "Approve exact testimonial" }),
+    ).toBeDisabled();
+    await page.getByRole("checkbox", { name: /I approve this exact/ }).check();
+    await page
+      .getByRole("button", { name: "Approve exact testimonial" })
+      .click();
+    await expect(
+      page.getByText("You approved this saved version."),
+    ).toBeVisible();
+    expect(fixture.state.approval!.content.text).toBe(editedText);
+    expect(fixture.state.approval!.content_revision).toBe(
+      fixture.state.revisions.content,
+    );
+    expect(fixture.state.check).toBe(verdict);
+    expect(fixture.requests.map((request) => request.action.type)).toEqual([
+      "save",
+      "approve",
+    ]);
+    await expect(page.getByLabel("Play source 1")).not.toBeVisible();
+  });
+}
+
+test("editing a published testimonial withdraws approval and requires fresh exact confirmation", async ({
   page,
 }) => {
   const fixture = await review(page);
+  fixture.state.approval = {
+    id: "previous",
+    content_revision: 1,
+    evidence_revision: 1,
+    content: structuredClone(fixture.state.content!),
+    approved_at: "2026-09-28T01:00:00Z",
+  };
+  fixture.state.published_approval_id = "previous";
   await page.goto(`/review/${id}`);
-  await page
-    .getByLabel("Testimonial text")
-    .fill("It always saves ten hours every week.");
-  await expect(
-    page.getByRole("button", { name: "Approve exact testimonial" }),
-  ).toBeDisabled();
+  const editedText = `${initial.content!.text} Thanks again!`;
+  await page.getByLabel("Testimonial text").fill(editedText);
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(
-    page.getByText(/Preparing your draft for approval. Your text is saved/),
-  ).toBeVisible();
-  fixture.setCheck("unsupported");
-  await page.getByRole("button", { name: "Refresh saved status" }).click();
-  await expect(
-    page.getByText(
-      "This draft contains statements we could not match to your interview.",
-    ),
-  ).toBeVisible();
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
-  expect(fixture.requests[0].action.content.text).toBe(
-    "It always saves ten hours every week.",
-  );
+  expect(fixture.state.approval).toBeNull();
+  expect(fixture.state.published_approval_id).toBeNull();
+  fixture.setCheck("unsupported");
+  fixture.setJobs([]);
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  const confirmation = page.getByRole("checkbox", {
+    name: /I approve this exact/,
+  });
+  await expect(confirmation).toBeEnabled();
+  await expect(confirmation).not.toBeChecked();
+  await expect(
+    page.getByRole("button", { name: "Approve exact testimonial" }),
+  ).toBeDisabled();
+  await confirmation.check();
+  await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  await expect(
+    page.getByText("You approved this saved version."),
+  ).toBeVisible();
+  expect(fixture.state.approval!.content.text).toBe(editedText);
+  expect(fixture.state.approval!.content_revision).toBe(2);
+  expect(fixture.state.published_approval_id).toBeNull();
 });
 test("a stale save preserves local input and requires deliberate reconciliation", async ({
   page,
@@ -405,83 +496,86 @@ test("recovery acknowledgement is explicit and never starts the microphone", asy
   expect(confirmations).toBe(1);
 });
 
-test("operator publishes only exact approval and public view drops withdrawn content", async ({
-  page,
-}) => {
-  const state = structuredClone(initial);
-  state.approval = {
-    id: "approved-version",
-    content_revision: 1,
-    evidence_revision: 1,
-    content: state.content!,
-    approved_at: "2026-09-28T00:00:00Z",
-  };
-  let published = false;
-  const actions: string[] = [];
-  await page.route("**/api/**", async (route) => {
-    const path = new URL(route.request().url()).pathname;
-    if (path === `/api/public/${id}`)
-      return published
-        ? route.fulfill({
-            json: {
-              ...state.content,
-              approved_at: state.approval!.approved_at,
-            },
-          })
-        : route.fulfill({
-            status: 404,
-            json: { error: { code: "unavailable", message: "Unavailable" } },
-          });
-    if (path.endsWith("/workflow")) {
-      if (route.request().method() === "POST") {
-        const request = route.request().postDataJSON();
-        actions.push(request.action.type);
-        expect(request.expected).toEqual(state.revisions);
-        if (request.action.type === "publish") {
-          expect(request.action.approval_id).toBe("approved-version");
-          published = true;
-          state.published_approval_id = "approved-version";
-        } else {
-          published = false;
-          state.published_approval_id = null;
+for (const verdict of ["supported", "unsupported", "ambiguous"] as const) {
+  test(`operator publishes ${verdict} exact approval and public view drops withdrawn content`, async ({
+    page,
+  }) => {
+    const state = structuredClone(initial);
+    state.check = verdict;
+    state.approval = {
+      id: "approved-version",
+      content_revision: 1,
+      evidence_revision: 1,
+      content: state.content!,
+      approved_at: "2026-09-28T00:00:00Z",
+    };
+    let published = false;
+    const actions: string[] = [];
+    await page.route("**/api/**", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === `/api/public/${id}`)
+        return published
+          ? route.fulfill({
+              json: {
+                ...state.content,
+                approved_at: state.approval!.approved_at,
+              },
+            })
+          : route.fulfill({
+              status: 404,
+              json: { error: { code: "unavailable", message: "Unavailable" } },
+            });
+      if (path.endsWith("/workflow")) {
+        if (route.request().method() === "POST") {
+          const request = route.request().postDataJSON();
+          actions.push(request.action.type);
+          expect(request.expected).toEqual(state.revisions);
+          if (request.action.type === "publish") {
+            expect(request.action.approval_id).toBe("approved-version");
+            published = true;
+            state.published_approval_id = "approved-version";
+          } else {
+            published = false;
+            state.published_approval_id = null;
+          }
+          state.revisions.workflow++;
+          return route.fulfill({ json: { state } });
         }
-        state.revisions.workflow++;
-        return route.fulfill({ json: { state } });
+        return route.fulfill({ json: state });
       }
-      return route.fulfill({ json: state });
-    }
-    return route.fulfill({ status: 404, json: {} });
+      return route.fulfill({ status: 404, json: {} });
+    });
+    await page.goto(`/operator/interviews/${id}`);
+    await expect(
+      page.getByRole("button", { name: /Approve exact/ }),
+    ).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Publish approved testimonial" })
+      .click();
+    await page.getByRole("link", { name: "View public testimonial" }).click();
+    await expect(
+      page.getByText(initial.content!.text, { exact: true }),
+    ).toBeVisible();
+    expect(
+      await page.locator('meta[name="robots"]').getAttribute("content"),
+    ).toContain("noindex");
+    await expect(page.locator("audio")).toHaveCount(0);
+    await page.goto(`/operator/interviews/${id}`);
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Unpublish", exact: true }).click();
+    await expect(
+      page.getByRole("button", { name: "Publish approved testimonial" }),
+    ).toBeVisible();
+    await page.goto(`/t/${id}`);
+    await expect(
+      page.getByRole("heading", { name: "Nothing is published here." }),
+    ).toBeVisible();
+    await expect(
+      page.getByText(initial.content!.text, { exact: true }),
+    ).toHaveCount(0);
+    expect(actions).toEqual(["publish", "unpublish"]);
   });
-  await page.goto(`/operator/interviews/${id}`);
-  await expect(page.getByRole("button", { name: /Approve exact/ })).toHaveCount(
-    0,
-  );
-  await page
-    .getByRole("button", { name: "Publish approved testimonial" })
-    .click();
-  await page.getByRole("link", { name: "View public testimonial" }).click();
-  await expect(
-    page.getByText(initial.content!.text, { exact: true }),
-  ).toBeVisible();
-  expect(
-    await page.locator('meta[name="robots"]').getAttribute("content"),
-  ).toContain("noindex");
-  await expect(page.locator("audio")).toHaveCount(0);
-  await page.goto(`/operator/interviews/${id}`);
-  page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("button", { name: "Unpublish", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "Publish approved testimonial" }),
-  ).toBeVisible();
-  await page.goto(`/t/${id}`);
-  await expect(
-    page.getByRole("heading", { name: "Nothing is published here." }),
-  ).toBeVisible();
-  await expect(
-    page.getByText(initial.content!.text, { exact: true }),
-  ).toHaveCount(0);
-  expect(actions).toEqual(["publish", "unpublish"]);
-});
+}
 test("a stale transcript correction retains input until explicitly reconciled", async ({
   page,
 }) => {
@@ -823,6 +917,9 @@ test("service quality gate explains blocked approval separately from recorded ev
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
+  await expect(
+    page.getByText(/You can edit it or approve this version as written/),
+  ).toHaveCount(0);
   expect(fixture.state.content!.text).toBe(initial.content!.text);
   expect(fixture.requests).toHaveLength(0);
 });

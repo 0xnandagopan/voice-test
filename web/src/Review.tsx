@@ -727,9 +727,9 @@ function Editor({
     pending: "Preparing your draft for approval. You can keep editing.",
     supported: "Your saved draft is ready for your approval.",
     unsupported:
-      "This draft contains statements we could not match to your interview. See the notes below, then edit and save your draft.",
+      "Some wording differs from your interview. You can edit it or approve this version as written.",
     ambiguous:
-      "We could not yet confirm that this draft matches your interview. See any notes below. Your text is saved.",
+      "Some wording could not be confidently matched to your interview. You can edit it or approve this version as written.",
     failed:
       "Your draft is saved, but its automatic check did not finish. Retry the check above.",
   }[state.check];
@@ -760,13 +760,18 @@ function Editor({
         (clip) => clip.id === selected.id && clip.sha256 === selected.sha256,
       ),
   );
+  const qualityValidationFailed =
+    evidence?.assessment?.content_revision === state.revisions.content &&
+    evidence.assessment.evidence_revision === state.revisions.evidence &&
+    evidence.assessment.assessment.quality_gate_passed === false;
   const ready =
+    !qualityValidationFailed &&
     !unavailableSelection &&
     !busy &&
     !dirty &&
     !stale &&
     state.evidence_available &&
-    state.check === "supported" &&
+    ["supported", "unsupported", "ambiguous"].includes(state.check) &&
     Boolean(state.content?.text.trim()) &&
     Boolean(state.content?.attribution.trim()) &&
     !state.declined &&
@@ -935,26 +940,19 @@ function Editor({
         </button>
       </form>
       {!dirty &&
+        !qualityValidationFailed &&
         state.evidence_available &&
         !(
           supportTaskVisible && ["pending", "failed"].includes(state.check)
-        ) && (
-          <Message
-            error={["unsupported", "ambiguous", "failed"].includes(state.check)}
-          >
-            {checkMessage}
-          </Message>
-        )}
-      {evidence?.assessment?.content_revision === state.revisions.content &&
-        evidence.assessment.evidence_revision === state.revisions.evidence &&
-        evidence.assessment.assessment.quality_gate_passed === false && (
-          <Message>
-            The evidence-checking service has not passed its quality checks yet.
-            Your text is saved, but approval is unavailable until technical
-            service validation is complete. This is not a review of your draft
-            by the operator.
-          </Message>
-        )}
+        ) && <Message error={state.check === "failed"}>{checkMessage}</Message>}
+      {qualityValidationFailed && (
+        <Message>
+          The evidence-checking service has not passed its quality checks yet.
+          Your text is saved, but approval is unavailable until technical
+          service validation is complete. This is not a review of your draft by
+          the operator.
+        </Message>
+      )}
       {evidence && ["unsupported", "ambiguous"].includes(state.check) && (
         <ClaimReferences evidence={evidence} revisions={state.revisions} />
       )}
@@ -990,8 +988,8 @@ function Editor({
                       ? "Preparing your draft for approval…"
                       : state.check === "failed"
                         ? "The automatic check did not finish. Your draft is saved."
-                        : ["unsupported", "ambiguous"].includes(state.check)
-                          ? "Please address the draft notes above before approving."
+                        : qualityValidationFailed
+                          ? "The checking service needs a technical update before approval is available."
                           : "Saving your changes…"}
         </p>
       )}
@@ -1056,8 +1054,9 @@ function ClaimReferences({
     <section aria-label="Draft notes">
       <h2>Draft notes</h2>
       <p className="small">
-        These notes explain which parts of your saved draft may need an edit.
-        You do not need to replay or confirm each answer.
+        These notes highlight wording that may differ from your interview. You
+        can edit it or approve your saved version as written. You do not need to
+        replay or confirm each answer.
       </p>
       {saved.assessment.issues.length > 0 && (
         <ul>
@@ -1068,10 +1067,20 @@ function ClaimReferences({
       )}
       {saved.assessment.claims.map((claim, index) => (
         <article className="source-record" key={index}>
-          <h3>Claim {index + 1}</h3>
+          <h3>
+            {saved.assessment.claims.length === 1
+              ? "About this draft"
+              : `Draft passage ${index + 1}`}
+          </h3>
           <p className="preserve-lines">{claim.text}</p>
           {claim.verdict && (
-            <p className="small">Suggested support: {claim.verdict}</p>
+            <p className="small">
+              {claim.verdict === "supported"
+                ? "Matches the interview."
+                : claim.verdict === "unsupported"
+                  ? "Some wording was not found in the interview."
+                  : "The comparison with the interview is uncertain."}
+            </p>
           )}
           {claim.issues?.length ? (
             <ul>
@@ -1117,7 +1126,7 @@ function ClaimReferences({
             })
           ) : (
             <p className="small">
-              No recorded support was linked for this claim.
+              No matching recording passage was linked for this wording.
             </p>
           )}
         </article>

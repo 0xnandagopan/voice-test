@@ -128,7 +128,7 @@ export function OperatorReview() {
     approved.content_revision === state.revisions.content &&
     approved.evidence_revision === state.revisions.evidence &&
     state.evidence_available &&
-    state.check === "supported" &&
+    ["supported", "unsupported", "ambiguous"].includes(state.check) &&
     !state.declined,
   );
   return (
@@ -156,7 +156,15 @@ export function OperatorReview() {
       )}
       {!eligible && (
         <div className="notice" role="status">
-          Publication requires current customer approval and verified evidence.
+          Publication requires current customer approval, an available recording
+          and completed automatic checks.
+        </div>
+      )}
+      {["unsupported", "ambiguous"].includes(state.check) && (
+        <div className="notice" role="status">
+          Some wording may differ from the interview. The customer can approve
+          their testimonial as written; the recording does not verify every
+          statement in their edited text.
         </div>
       )}
       {state.declined && <p>The customer declined this testimonial.</p>}
