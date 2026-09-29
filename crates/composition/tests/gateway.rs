@@ -53,9 +53,12 @@ async fn mock(
         .route("/chat/completions", post(handle))
         .with_state(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let client =
-        GatewayClient::for_local_test(&format!("http://{addr}/chat/completions"), deadline)
-            .unwrap();
+    let client = GatewayClient::for_local_test_with_model(
+        &format!("http://{addr}/chat/completions"),
+        deadline,
+        "gemini-2.5-flash-lite",
+    )
+    .unwrap();
     (client, state, server)
 }
 
@@ -76,7 +79,7 @@ fn draft() -> Value {
     json!({"status":"draft","text":"I think it saves roughly two hours a week.","claims":[{"text":"I think it saves roughly two hours a week.","sources":[{"source_id":"s1","quote":"I think it saves roughly two hours a week."}]}],"issues":[]})
 }
 fn check() -> Value {
-    json!({"verdict":"unsupported","claims":[{"text":"It doubled revenue.","verdict":"unsupported","sources":[],"issues":["Revenue change has no recorded support."]}],"issues":[]})
+    json!({"claims":[{"text":"It doubled revenue.","verdict":"unsupported","sources":[],"issues":["Revenue change has no recorded support."]}],"issues":[]})
 }
 
 #[tokio::test]
@@ -95,8 +98,37 @@ async fn generation_and_check_have_disjoint_schemas_and_preserve_input() {
     assert_eq!(result.verdict, Verdict::Unsupported);
     assert_eq!(result.claims[0].text, "It doubled revenue.");
     let inputs = state.input.lock().await;
-    assert_eq!(inputs[0]["model"], "test-model");
-    assert!(inputs[0].get("response_format").is_none());
+    assert_eq!(inputs[0]["model"], "gemini-2.5-flash-lite");
+    assert_eq!(inputs[0]["response_format"]["type"], "json_schema");
+    let generation = &inputs[0]["response_format"]["json_schema"];
+    let checking = &inputs[1]["response_format"]["json_schema"];
+    assert_eq!(generation["strict"], true);
+    assert_eq!(checking["strict"], true);
+    assert_ne!(generation["name"], checking["name"]);
+    assert!(generation["schema"]["properties"].get("text").is_some());
+    assert!(checking["schema"]["properties"].get("text").is_none());
+    assert!(checking["schema"]["properties"].get("verdict").is_none());
+    let spans = &checking["schema"]["properties"]["claims"];
+    assert_eq!(spans["minItems"], 1);
+    assert_eq!(spans["maxItems"], 1);
+    assert_eq!(
+        spans["items"]["properties"]["text"]["enum"],
+        json!(["It doubled revenue."])
+    );
+    for schema in [&generation["schema"], &checking["schema"]] {
+        assert_eq!(schema["additionalProperties"], false);
+        let claim = &schema["properties"]["claims"]["items"];
+        assert_eq!(claim["additionalProperties"], false);
+        assert_eq!(
+            claim["properties"]["sources"]["items"]["additionalProperties"],
+            false
+        );
+    }
+    assert!(
+        inputs
+            .iter()
+            .all(|body| body.get("post_processing_steps").is_none())
+    );
     assert_eq!(inputs[1]["messages"][0]["role"], "system");
     assert!(
         inputs[1]["messages"][0]["content"]
@@ -138,7 +170,7 @@ async fn checker_cannot_rewrite_or_omit_customer_text() {
     let mut replacement_claim = check();
     replacement_claim["claims"][0]["text"] = json!("Revenue might improve.");
     let mut false_verdict = check();
-    false_verdict["verdict"] = json!("supported");
+    false_verdict["claims"][0]["verdict"] = json!("supported");
     for output in [replacement_claim, false_verdict] {
         let (client, _, server) = mock(
             vec![envelope(output)],
@@ -219,7 +251,7 @@ async fn rate_limit_retries_are_bounded_and_never_fallback() {
             .lock()
             .await
             .iter()
-            .all(|v| v["model"] == "test-model" && v.get("fallback_config").is_none())
+            .all(|v| v["model"] == "gemini-2.5-flash-lite" && v.get("fallback_config").is_none())
     );
     server.abort();
     let (client, state, server) = mock(
@@ -474,5 +506,56 @@ async fn account_model_access_rejection_is_actionable_and_keeps_details_private(
     assert!(matches!(error, GatewayError::ModelAccessDenied));
     assert!(!format!("{error:?}: {error}").contains("not for logs"));
     assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn checker_derives_overall_verdict_and_never_upgrades_issues() {
+    let candidate = "I think it saves roughly two hours a week.";
+    let output = json!({"claims":[{"text":candidate,"verdict":"supported","sources":[{"source_id":"s1","quote":candidate}],"issues":[]}],"issues":["The broader context remains uncertain."]});
+    let (client, _, server) = mock(
+        vec![envelope(output)],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    let checked = client.check(candidate, &sources()).await.unwrap();
+    assert_eq!(checked.verdict, Verdict::Uncertain);
+    assert_eq!(checked.claims[0].text, candidate);
+    server.abort();
+
+    let mut injected = check();
+    injected["verdict"] = json!("supported");
+    let (client, _, server) = mock(
+        vec![envelope(injected)],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(matches!(
+        client.check("It doubled revenue.", &sources()).await,
+        Err(GatewayError::InvalidSchema)
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn checker_rejects_splitting_or_rewriting_the_immutable_span() {
+    let output = json!({"claims":[
+        {"text":"Revenue doubled.","verdict":"unsupported","sources":[],"issues":["Not recorded."]},
+        {"text":"Costs halved.","verdict":"unsupported","sources":[],"issues":["Not recorded."]}
+    ],"issues":[]});
+    let (client, _, server) = mock(
+        vec![envelope(output)],
+        Duration::ZERO,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(matches!(
+        client
+            .check("Revenue doubled. Costs halved.", &sources())
+            .await,
+        Err(GatewayError::InvalidOutput)
+    ));
     server.abort();
 }

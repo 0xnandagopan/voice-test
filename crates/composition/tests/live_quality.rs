@@ -16,9 +16,10 @@ fn evidence(values: &[(&str, &str)]) -> Vec<EvidenceSource> {
 #[ignore = "explicit paid synthetic live evaluation; requires authorized environment"]
 async fn synthetic_quality_gate() {
     assert_eq!(std::env::var("VOICE_LIVE_PROBE").ok().as_deref(), Some("1"));
+    let model = std::env::var("GATEWAY_MODEL").expect("model must be supplied");
     let client = GatewayClient::new(
         std::env::var("VOICE_AGENT_API_KEY").expect("key must be supplied"),
-        std::env::var("GATEWAY_MODEL").expect("model must be supplied"),
+        model.clone(),
     )
     .unwrap()
     .with_request_budget(8);
@@ -30,6 +31,7 @@ async fn synthetic_quality_gate() {
         ),
     ]);
     let cases = [
+        ("empty", vec![]),
         ("qualified_mixed", qualified.clone()),
         (
             "vague",
@@ -65,6 +67,7 @@ async fn synthetic_quality_gate() {
     ];
     let mut passed = 0;
     let mut attempted = 0;
+    let mut outcomes = vec![];
     for (id, sources) in cases {
         attempted += 1;
         let result = client.generate(&sources).await;
@@ -113,6 +116,7 @@ async fn synthetic_quality_gate() {
             }
             Err(_) => false,
         };
+        outcomes.push(serde_json::json!({"case":id,"structural_valid":result.is_ok(),"passed":pass,"error":result.as_ref().err().map(|e|e.to_string())}));
         passed += usize::from(pass);
         eprintln!(
             "G3 case={id} structural_valid={} semantic_smoke_pass={pass} error={}",
@@ -121,6 +125,11 @@ async fn synthetic_quality_gate() {
         );
     }
     for (id, candidate, expected) in [
+        (
+            "omitted_mixed_feedback",
+            "I think it saves us roughly two hours a week. The support team was helpful.",
+            Verdict::Unsupported,
+        ),
         (
             "unsupported_edit",
             "It saves us two hours every day and doubled our revenue.",
@@ -134,7 +143,11 @@ async fn synthetic_quality_gate() {
     ] {
         attempted += 1;
         let result = client.check(candidate, &qualified).await;
-        let pass = result.as_ref().is_ok_and(|value| value.verdict == expected);
+        let pass = result.as_ref().is_ok_and(|value| {
+            value.verdict == expected
+                || (id == "omitted_mixed_feedback" && value.verdict == Verdict::Uncertain)
+        });
+        outcomes.push(serde_json::json!({"case":id,"structural_valid":result.is_ok(),"passed":pass,"error":result.as_ref().err().map(|e|e.to_string())}));
         passed += usize::from(pass);
         eprintln!(
             "G3 case={id} structural_valid={} semantic_smoke_pass={pass} error={}",
@@ -143,6 +156,10 @@ async fn synthetic_quality_gate() {
         );
     }
     eprintln!("G3 prompt={PROMPT_VERSION} cases={attempted} passed={passed} http_attempt_cap=8");
+    if let Ok(path) = std::env::var("GATEWAY_QUALITY_SUMMARY") {
+        let summary = serde_json::json!({"synthetic":true,"model":model,"prompt_version":PROMPT_VERSION,"cases":outcomes,"http_attempt_cap":8,"g3_passed":passed==attempted});
+        std::fs::write(path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+    }
     assert_eq!(
         passed, attempted,
         "Synthetic G3 matrix failed; keep model/prompt acceptance gated"

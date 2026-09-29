@@ -86,13 +86,23 @@ impl GatewayClient {
     /// Explicit local mock transport; never accepts remote hosts or redirects.
     /// This constructor has zero pacing so tests do not consume production slots.
     pub fn for_local_test(endpoint: &str, deadline: Duration) -> Result<Self, GatewayError> {
+        Self::for_local_test_with_model(endpoint, deadline, "test-model")
+    }
+
+    /// Exercise documented request capabilities against a local mock without
+    /// making the default mock model eligible for production quality acceptance.
+    pub fn for_local_test_with_model(
+        endpoint: &str,
+        deadline: Duration,
+        model: &str,
+    ) -> Result<Self, GatewayError> {
         let url = Url::parse(endpoint).map_err(|_| GatewayError::Configuration)?;
         if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1") | Some("[::1]")) {
             return Err(GatewayError::Configuration);
         }
         Self::build(
             "test-key".into(),
-            "test-model".into(),
+            model.into(),
             endpoint,
             Duration::ZERO,
             deadline,
@@ -159,7 +169,12 @@ impl GatewayClient {
             });
         }
         let value = self
-            .request(GENERATION_PROMPT, json!({"sources": sources}))
+            .request(
+                GENERATION_PROMPT,
+                "testimonial_draft",
+                generation_schema(),
+                json!({"sources": sources}),
+            )
             .await?;
         validate_generation(&value, sources)?;
         Ok(value)
@@ -186,12 +201,29 @@ impl GatewayClient {
                 issues: vec![],
             });
         }
-        let value = self
+        let assessment: CheckAssessment = self
             .request(
                 CHECK_PROMPT,
+                "testimonial_support_check",
+                check_schema(candidate),
                 json!({"candidate":candidate,"sources":sources}),
             )
             .await?;
+        // The model assesses one immutable span containing every candidate clause.
+        // It cannot silently rewrite the candidate or manufacture an overall status
+        // that disagrees with its claim assessment. Issues only reduce confidence.
+        if assessment.claims.len() != 1 || assessment.claims[0].text != candidate {
+            return Err(GatewayError::InvalidOutput);
+        }
+        let verdict = match assessment.claims[0].verdict {
+            Verdict::Supported if !assessment.issues.is_empty() => Verdict::Uncertain,
+            verdict => verdict,
+        };
+        let value = CheckResult {
+            verdict,
+            claims: assessment.claims,
+            issues: assessment.issues,
+        };
         validate_check(&value, candidate, sources)?;
         Ok(value)
     }
@@ -199,24 +231,36 @@ impl GatewayClient {
     async fn request<T: DeserializeOwned>(
         &self,
         task_prompt: &str,
+        schema_name: &str,
+        schema: Value,
         input: Value,
     ) -> Result<T, GatewayError> {
-        timeout(self.deadline, self.request_inner(task_prompt, input))
-            .await
-            .map_err(|_| GatewayError::Deadline)?
+        timeout(
+            self.deadline,
+            self.request_inner(task_prompt, schema_name, schema, input),
+        )
+        .await
+        .map_err(|_| GatewayError::Deadline)?
     }
 
     async fn request_inner<T: DeserializeOwned>(
         &self,
         task_prompt: &str,
+        schema_name: &str,
+        schema: Value,
         input: Value,
     ) -> Result<T, GatewayError> {
-        // Use prompt-produced JSON across configured models; native schema support
-        // must be checked for each selected model before enabling response_format.
-        // No fallback list or JSON repair: model changes and malformed output fail closed.
-        let body = json!({"model":self.model,"max_tokens":3000,"temperature":0,
-            "messages":[{"role":"system","content":format!("{COMMON_PROMPT}\n{task_prompt}")},
+        // This exact model's native JSON Schema mode is documented by AssemblyAI.
+        // Other configured models keep the explicit schema in the prompt; they must
+        // pass their own quality gate. Never switch models or repair returned JSON.
+        let mut body = json!({"model":self.model,"max_tokens":3000,"temperature":0,
+            "messages":[{"role":"system","content":format!("{COMMON_PROMPT}\n{task_prompt}\nRequired JSON Schema: {schema}")},
             {"role":"user","content":input.to_string()}]});
+        if self.model == "gemini-2.5-flash-lite" {
+            body["response_format"] = json!({"type":"json_schema", "json_schema": {
+                "name":schema_name, "strict":true, "schema":schema
+            }});
+        }
         for attempt in 0..3 {
             // Hold the queue lock through dispatch scheduling, not the network operation.
             // Cancellation may waste a slot but cannot exceed the configured rate.
@@ -357,4 +401,42 @@ impl GatewayClient {
         let mut next = self.next_request.lock().await;
         *next = (*next).max(Instant::now() + delay);
     }
+}
+
+// Keep the schemas disjoint: a support check cannot replace customer text. All
+// properties are required and extras forbidden at every object boundary. The
+// independent Rust validators still enforce source ownership and full coverage.
+fn source_schema() -> Value {
+    json!({"type":"object","properties":{
+        "source_id":{"type":"string"},"quote":{"type":"string"}
+    },"required":["source_id","quote"],"additionalProperties":false})
+}
+fn generation_schema() -> Value {
+    json!({"type":"object","properties":{
+        "status":{"type":"string","enum":["draft","no_draft"]},
+        "text":{"type":"string","description":"Exact concatenation of claims text in order separated by one space; preserve all first-person uncertainty and punctuation."},
+        "claims":{"type":"array","items":{"type":"object","properties":{
+            "text":{"type":"string"},
+            "sources":{"type":"array","items":source_schema()}
+        },"required":["text","sources"],"additionalProperties":false}},
+        "issues":{"type":"array","items":{"type":"string"}}
+    },"required":["status","text","claims","issues"],"additionalProperties":false})
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckAssessment {
+    claims: Vec<CheckedClaim>,
+    issues: Vec<String>,
+}
+
+fn check_schema(candidate: &str) -> Value {
+    let verdict = json!({"type":"string","enum":["supported","unsupported","uncertain"]});
+    json!({"type":"object","properties":{
+        "claims":{"type":"array","minItems":1,"maxItems":1,"items":{"type":"object","properties":{
+            "text":{"type":"string","enum":[candidate]},"verdict":verdict,
+            "sources":{"type":"array","items":source_schema()},
+            "issues":{"type":"array","items":{"type":"string"}}
+        },"required":["text","verdict","sources","issues"],"additionalProperties":false}},
+        "issues":{"type":"array","items":{"type":"string"}}
+    },"required":["claims","issues"],"additionalProperties":false})
 }
