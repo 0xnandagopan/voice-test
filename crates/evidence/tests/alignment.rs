@@ -133,3 +133,39 @@ fn interrupted_agent_reply_does_not_prevent_explicit_whole_answer_verification()
     assert!(confirm(&mut m, &clip, &c));
     assert!(source_proof(&m, &m.segments[1].source_id).is_some());
 }
+
+#[test]
+fn intentional_pause_completed_answer_remains_verifiable_without_waiving_tail_gates() {
+    let mut paused = fixture();
+    paused.product_end_reason = Some("explicit_stop".into());
+    for i in 0..2 {
+        let (clip, c) = candidate(&paused, i, if i == 0 { [0, 900] } else { [1000, 1900] });
+        assert!(confirm(&mut paused, &clip, &c));
+    }
+    assert!(paused.approval_eligible);
+    let (recorded, unresolved) = v0_evidence::recovery::reconstruct(uuid::Uuid::new_v4(), &paused);
+    assert_eq!(recorded.len(), 2);
+    assert!(unresolved.is_empty());
+    assert!(recorded.iter().all(|answer| !answer.needs_alignment_review));
+    for reason in ["transport_lost", "budget_exhausted", "discard"] {
+        let mut m = fixture();
+        m.product_end_reason = Some(reason.into());
+        let (clip, c) = candidate(&m, 1, [1000, 1900]);
+        assert!(!confirm(&mut m, &clip, &c));
+    }
+    for issue in 0..5 {
+        let mut m = fixture();
+        m.product_end_reason = Some("explicit_stop".into());
+        match issue {
+            0 => m.segments[1].turn_status = "interrupted".into(),
+            1 => m.incomplete_turn_ids.push(m.segments[1].turn_id.clone()),
+            2 => m.dropped_chunks = Some(1),
+            3 => m.dropped_chunks = None,
+            _ => m.product_end_reason = None,
+        }
+        let (clip, c) = candidate(&m, 1, [1000, 1900]);
+        assert!(!confirm(&mut m, &clip, &c));
+        assert!(!m.approval_eligible);
+        assert!(m.operator_alignment.is_empty());
+    }
+}

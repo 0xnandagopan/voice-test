@@ -105,9 +105,18 @@ pub fn confirm_operator_alignment(
         return Err(Error::Invalid("verified answer ranges overlap"));
     }
     // An interrupted agent reply does not prove an interrupted customer answer.
-    // Explicit whole-answer listening can verify that answer, but uncertain tail
-    // closure and dropped recording chunks remain independent blocking signals.
+    // An intentional Pause may close after a completed customer turn. Its last
+    // answer remains verifiable through explicit listening if the durable ledger
+    // has no incomplete marker. Transport loss or a partial Pause tail is still
+    // uncertain; a listening checkbox alone cannot override those signals.
+    let completed_pause = manifest.product_end_reason.as_deref() == Some("explicit_stop")
+        && source.turn_status == "completed"
+        && !manifest
+            .incomplete_turn_ids
+            .iter()
+            .any(|id| id == &source.turn_id);
     if manifest.product_end_reason.as_deref() != Some("explicit_finish")
+        && !completed_pause
         && manifest
             .segments
             .iter()
