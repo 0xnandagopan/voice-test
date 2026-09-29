@@ -1037,7 +1037,10 @@ function Interview() {
                 </button>
               )}
               {reviewRequired && !showStop && (
-                <Link className="button" to={`/review/${session.data.id}`}>
+                <Link
+                  className="button"
+                  to={`/review/${session.data.id}${completed || processing ? "" : "#recordings"}`}
+                >
                   {completed || processing
                     ? "Review testimonial"
                     : "Review recording recovery"}

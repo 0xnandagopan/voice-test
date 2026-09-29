@@ -249,7 +249,16 @@ test("real API private review saves edits across reload and reconciles a second 
       .click();
     await expect(
       tabA.getByText("No recorded sources are available yet."),
+    ).toBeHidden();
+    await tabA
+      .getByText("View recording and transcript (optional)", { exact: true })
+      .click();
+    await expect(
+      tabA.getByText("No recorded sources are available yet."),
     ).toBeVisible();
+    await tabA
+      .getByText("View recording and transcript (optional)", { exact: true })
+      .click();
     await expect(
       tabA.getByRole("button", { name: "Prepare provisional draft" }),
     ).toBeDisabled();

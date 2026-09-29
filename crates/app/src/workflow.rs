@@ -100,7 +100,13 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
     let mut ready = !manifests.is_empty() && !missing_import;
     for manifest in &manifests {
         ready &= manifest["approval_eligible"] == true;
-        let Some(segments) = manifest["segments"].as_array() else {
+        let Some(segments) = manifest
+            .get("recorded_transcript")
+            .and_then(|r| r.get("segments"))
+            .filter(|s| !s.is_null())
+            .unwrap_or(&manifest["segments"])
+            .as_array()
+        else {
             ready = false;
             continue;
         };
@@ -713,7 +719,8 @@ pub async fn retry_job(
 }
 
 /// Snapshot only current authorized job inputs. Original recording transcripts
-/// remain the support source; edited transcript annotations never rewrite them.
+/// are preserved; recorded-audio transcription takes precedence over live history.
+/// Edited transcript annotations never rewrite either source artifact.
 pub async fn composition_input(
     pool: &PgPool,
     id: Uuid,
@@ -746,7 +753,7 @@ pub async fn composition_input(
     for value in rows {
         let m: v0_evidence::manifest::Manifest =
             serde_json::from_value(value).map_err(|_| ApiError::conflict())?;
-        for segment in &m.segments {
+        for segment in m.support_segments() {
             let decoded = m.media.as_ref().is_some_and(|m| {
                 m.ranges.iter().any(|r| {
                     r.source_id == segment.source_id && r.within_recording && r.audible_samples > 0
@@ -849,7 +856,7 @@ pub(crate) async fn attach_verified_clip(
     for manifest in manifests {
         let parsed: v0_evidence::manifest::Manifest =
             serde_json::from_value(manifest).map_err(|_| ApiError::conflict())?;
-        for segment in &parsed.segments {
+        for segment in parsed.support_segments() {
             if let Some(proof) = v0_evidence::alignment::source_proof(&parsed, &segment.source_id) {
                 sqlx::query("UPDATE workflow_clips SET evidence_revision=$4 WHERE interview_id=$1 AND source_id=$2 AND sha256=$3 AND ready")
                     .bind(id).bind(&proof.source_id).bind(&proof.clip_sha256).bind(state.revisions.evidence).execute(&mut *tx).await?;
@@ -921,7 +928,7 @@ pub(crate) async fn complete_alignment(
     for manifest in manifests {
         let parsed: v0_evidence::manifest::Manifest =
             serde_json::from_value(manifest).map_err(|_| ApiError::conflict())?;
-        for segment in &parsed.segments {
+        for segment in parsed.support_segments() {
             if let Some(proof) = v0_evidence::alignment::source_proof(&parsed, &segment.source_id) {
                 sqlx::query("UPDATE workflow_clips SET evidence_revision=$4 WHERE interview_id=$1 AND source_id=$2 AND sha256=$3 AND ready")
                     .bind(id).bind(&proof.source_id).bind(&proof.clip_sha256).bind(state.revisions.evidence).execute(&mut *tx).await?;

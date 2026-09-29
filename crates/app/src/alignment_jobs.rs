@@ -42,13 +42,13 @@ fn evidence_error(error: v0_evidence::Error) -> JobFailure {
 /// One durable task per immutable recording, including recordings imported before
 /// automatic alignment existed. Polling is maintenance, never customer activity.
 pub async fn enqueue_missing(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let rows=sqlx::query("SELECT e.interview_id,e.provider_attempt_id,e.manifest->>'recording_sha256' AS hash FROM evidence_imports e JOIN interviews i ON i.id=e.interview_id WHERE i.deleted_at IS NULL AND i.state NOT IN ('deleted','revoked') AND i.expires_at>clock_timestamp() AND e.manifest->'media' IS NOT NULL AND e.manifest->'media'<>'null'::jsonb AND e.manifest->>'approval_eligible'='false' AND COALESCE(jsonb_array_length(e.manifest->'operator_alignment'),0)=0 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='align:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256')) LIMIT 32").fetch_all(pool).await?;
+    let rows=sqlx::query("SELECT e.interview_id,e.provider_attempt_id,e.manifest->>'recording_sha256' AS hash FROM evidence_imports e JOIN interviews i ON i.id=e.interview_id WHERE i.deleted_at IS NULL AND i.state NOT IN ('deleted','revoked') AND i.expires_at>clock_timestamp() AND e.manifest->'media' IS NOT NULL AND e.manifest->'media'<>'null'::jsonb AND e.manifest->>'approval_eligible'='false' AND COALESCE(jsonb_array_length(e.manifest->'operator_alignment'),0)=0 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.dedupe_key='align-v2:'||e.provider_attempt_id::text||':'||(e.manifest->>'recording_sha256')) LIMIT 32").fetch_all(pool).await?;
     for row in rows {
         let attempt: Uuid = row.get("provider_attempt_id");
         let hash: String = row.get("hash");
         sqlx::query("INSERT INTO jobs(id,interview_id,kind,payload,dedupe_key,max_attempts) VALUES($1,$2,'align_evidence',$3,$4,40) ON CONFLICT(dedupe_key) DO NOTHING")
-            .bind(Uuid::new_v4()).bind(row.get::<Uuid,_>("interview_id")).bind(json!({"provider_attempt_id":attempt,"recording_sha256":hash}))
-            .bind(format!("align:{attempt}:{hash}")).execute(pool).await?;
+            .bind(Uuid::new_v4()).bind(row.get::<Uuid,_>("interview_id")).bind(json!({"provider_attempt_id":attempt,"recording_sha256":hash,"alignment_version":2}))
+            .bind(format!("align-v2:{attempt}:{hash}")).execute(pool).await?;
     }
     Ok(())
 }
@@ -186,6 +186,8 @@ pub async fn dispatch(
         TranscriptStatus::Failed => return Err(failure("alignment_transcription_failed", true)),
         TranscriptStatus::Completed(value) => value,
     };
+    automatic_alignment::prepare_recorded_sources(&mut manifest, &transcript)
+        .map_err(evidence_error)?;
     let ranges = automatic_alignment::plan(&manifest, &transcript).map_err(evidence_error)?;
     let audio = storage
         .read(&row.get::<String, _>("recording_key"))

@@ -90,7 +90,11 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
     for row in rows {
         let m: Manifest =
             serde_json::from_value(row.get("manifest")).map_err(|_| ApiError::conflict())?;
-        for seg in m.segments.iter().filter(|s| s.speaker == "customer") {
+        for seg in m
+            .support_segments()
+            .iter()
+            .filter(|s| s.speaker == "customer")
+        {
             let check = m
                 .media
                 .as_ref()
@@ -186,7 +190,7 @@ async fn audio(
     for row in rows {
         let m: Manifest =
             serde_json::from_value(row.get("manifest")).map_err(|_| ApiError::conflict())?;
-        if m.segments
+        if m.support_segments()
             .iter()
             .any(|s| s.source_id == source && s.speaker == "customer")
         {

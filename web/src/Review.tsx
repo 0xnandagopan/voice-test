@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, Navigate, useParams } from "react-router-dom";
+import { Link, Navigate, useLocation, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError, sessionKey, sessionQuery } from "./api";
 import { TestimonialPreview } from "./Publication";
@@ -42,6 +42,7 @@ function unavailable(error: unknown) {
 }
 
 export function Review() {
+  const location = useLocation();
   const { interviewId } = useParams();
   const session = useQuery(sessionQuery);
   if (session.isPending)
@@ -367,7 +368,11 @@ function ReviewWorkspace({ id }: { id: string }) {
             </>
           )}
         </section>
-        <details className="card evidence-panel">
+        <details
+          id="recordings"
+          className="card evidence-panel"
+          open={location.hash === "#recordings" ? true : undefined}
+        >
           <summary>View recording and transcript (optional)</summary>
           <p>
             You do not need to replay or confirm each answer to approve your
