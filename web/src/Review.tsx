@@ -263,9 +263,8 @@ function ReviewWorkspace({ id }: { id: string }) {
           <p className="eyebrow">PRIVATE REVIEW</p>
           <h1>Your story. Your decision.</h1>
           <p>
-            Review or edit your draft, then save your changes for automatic
-            checks against your recording. You approve the exact testimonial;
-            the operator can publish it afterward.
+            Review your draft, make any edits, and approve the version you want
+            to share. The operator can publish it after your approval.
           </p>
         </div>
         <Link className="text-link" to="/interview">
@@ -299,20 +298,23 @@ function ReviewWorkspace({ id }: { id: string }) {
             ["queued", "running", "failed"].includes(job.status),
         ) && (
           <Message>
-            Your recording has not yet been verified for approval. You can keep
-            editing and saving your draft. This is a recording check, not a
-            request for the operator to approve your words.
+            Your recording is not ready yet. Your draft is saved, and you can
+            keep editing while it is prepared.
           </Message>
         )}
-      {recovery.data && (
-        <RecoveryStatus
-          recovery={recovery.data}
-          busy={busy}
-          confirmed={confirmRecovery.isSuccess}
-          onConfirm={() => confirmRecovery.mutate()}
-        />
+      {recovery.data?.attempts.some(
+        (attempt) => attempt.status === "recording_artifacts_unavailable",
+      ) && (
+        <Message error>
+          Some recordings could not be recovered. Your saved draft is preserved.
+          More detail is available under the optional recording and transcript
+          section.
+        </Message>
       )}
-      <div className="review-grid">
+      <div
+        className="review-grid"
+        style={{ gridTemplateColumns: "minmax(0, 1fr)" }}
+      >
         <section className="card">
           {state.content || manualDraft ? (
             <Editor
@@ -329,9 +331,8 @@ function ReviewWorkspace({ id }: { id: string }) {
             <>
               <h2>Your draft is not ready yet.</h2>
               <p>
-                We can prepare a provisional draft from available recorded
-                sources. Automatic recording and support checks must pass before
-                approval. Nothing has been approved.
+                We can prepare a draft from your interview. You can edit it
+                before deciding whether to approve it.
               </p>
               {!draftJob || draftJob.status === "succeeded" ? (
                 <button
@@ -361,17 +362,23 @@ function ReviewWorkspace({ id }: { id: string }) {
                 Write my own draft
               </button>
               <p className="small">
-                Your own draft is also checked against recorded evidence before
-                approval.
+                Write the testimonial you want to share about your interview.
               </p>
             </>
           )}
         </section>
-        <section className="card evidence-panel">
-          {evidence.data && (
-            <ClaimReferences
-              evidence={evidence.data}
-              revisions={state.revisions}
+        <details className="card evidence-panel">
+          <summary>View recording and transcript (optional)</summary>
+          <p>
+            You do not need to replay or confirm each answer to approve your
+            testimonial.
+          </p>
+          {recovery.data && (
+            <RecoveryStatus
+              recovery={recovery.data}
+              busy={busy}
+              confirmed={confirmRecovery.isSuccess}
+              onConfirm={() => confirmRecovery.mutate()}
             />
           )}
           <h2>Your recorded sources</h2>
@@ -407,18 +414,18 @@ function ReviewWorkspace({ id }: { id: string }) {
               />
             ))
           )}
-          <button
-            className="secondary"
-            onClick={() => {
-              void workflow.refetch();
-              void evidence.refetch();
-              void recovery.refetch();
-            }}
-          >
-            Refresh saved status
-          </button>
-        </section>
+        </details>
       </div>
+      <button
+        className="secondary"
+        onClick={() => {
+          void workflow.refetch();
+          void evidence.refetch();
+          void recovery.refetch();
+        }}
+      >
+        Refresh saved status
+      </button>
     </>
   );
 }
@@ -433,16 +440,16 @@ function taskCopy(job: ProcessingJob) {
       retryLabel: "Retry recording check",
       text:
         job.status === "queued"
-          ? "Your automatic recording check is queued. You can keep editing and saving your draft."
+          ? "Preparing your draft for approval. You can keep editing and saving."
           : job.status === "running"
-            ? "We are automatically checking that the saved transcript matches your recorded answers. You can keep editing and saving your draft."
+            ? "Preparing your draft for approval. You can keep editing and saving."
             : job.error_code === "alignment_transcript_mismatch"
-              ? "The saved transcript and the recording check do not fully agree. Your text is saved, but we cannot confirm its recorded support yet. Review the available recording; the transcript needs recovery before approval."
+              ? "We could not finish preparing your recording. Your draft is saved. This needs a technical repair; you do not need to verify each answer."
               : job.error_code === "alignment_recording_incomplete"
                 ? "We could not confirm a complete recording. Your text is saved, but approval is unavailable until recording recovery succeeds."
                 : job.error_code === "alignment_ranges_uncertain"
                   ? "We could not reliably match the recorded answers to playable clips. Your text is saved; approval is unavailable until recording recovery succeeds."
-                  : "Your recording could not be verified automatically. Your saved text is preserved, but approval needs the recording check to pass. Technical recovery is needed; this is not an operator review of your draft.",
+                  : "We could not finish preparing your recording. Your draft is saved. A technical repair is needed before approval becomes available.",
     };
   }
   const support = job.kind === "support_check";
@@ -465,7 +472,7 @@ function taskCopy(job: ProcessingJob) {
       text: recovery
         ? "Waiting for your recording to become available. You can leave this page and return later."
         : support
-          ? `Your text is saved. ${waiting ? "The evidence check is queued" : "We are checking it against your recordings"}; approval will remain unavailable until checks pass.`
+          ? "Preparing your draft for approval. Your text is saved, and you can keep editing."
           : `${waiting ? "Draft preparation is queued" : "We are preparing a draft from your recordings"}. You can leave this page and return later.`,
     };
   }
@@ -603,13 +610,12 @@ function RecoveryStatus({
         </Message>
       ) : (
         <Message>
-          Recovered audio is available for review. Its alignment and
-          completeness must be verified before approval.
+          Your recording is available here if you want to listen.
         </Message>
       )}
       {recovery.unresolved_answers.length > 0 && (
         <>
-          <h3>Answers that need review</h3>
+          <h3>Interrupted answers</h3>
           <ul>
             {recovery.unresolved_answers.map((answer) => (
               <li key={answer.source_id}>
@@ -644,9 +650,8 @@ function RecoveryStatus({
         recovery.requires_customer_confirmation && (
           <>
             <p>
-              Listen to available sources below before continuing. Any missing
-              or incomplete answer may need to be repeated; acknowledging
-              recovery does not verify recording alignment.
+              The connection was interrupted. You can return to the conversation
+              to finish any incomplete answers. Listening here is optional.
             </p>
             <label className="checkbox">
               <input
@@ -714,16 +719,14 @@ function Editor({
     state.check,
   ]);
   const checkMessage = {
-    pending:
-      "Support checking is pending. Approval is unavailable until it passes.",
-    supported:
-      "The saved text passed its support check against the recorded evidence.",
+    pending: "Preparing your draft for approval. You can keep editing.",
+    supported: "Your saved draft is ready for your approval.",
     unsupported:
-      "The saved text contains claims that are not supported. Edit it to match the recording and save for a fresh check.",
+      "This draft contains statements we could not match to your interview. See the notes below, then edit and save your draft.",
     ambiguous:
-      "Support has not been verified for this saved text. Review any claim notes below; approval remains unavailable.",
+      "We could not yet confirm that this draft matches your interview. See any notes below. Your text is saved.",
     failed:
-      "Your text is saved. The evidence check could not finish, so approval remains unavailable.",
+      "Your draft is saved, but its automatic check did not finish. Retry the check above.",
   }[state.check];
   async function save() {
     try {
@@ -832,8 +835,9 @@ function Editor({
         <fieldset className="audio-choice">
           <legend>Audio in your testimonial</legend>
           <p className="small">
-            Audio is optional. Listen to each verified answer before selecting
-            it. Your saved selection is part of your exact approval.
+            Audio is optional. Choose any clips you want to include. You can
+            preview them if you wish; your saved selection is part of your
+            approval.
           </p>
           {availableClips.length ? (
             availableClips.map((clip, index) => (
@@ -863,7 +867,7 @@ function Editor({
                       })
                     }
                   />
-                  <span>Include recorded answer {index + 1}</span>
+                  <span>Include recording {index + 1}</span>
                 </label>
                 <p>
                   {
@@ -875,15 +879,14 @@ function Editor({
                 <audio
                   controls
                   preload="none"
-                  aria-label={`Recorded answer ${index + 1}`}
+                  aria-label={`Recording ${index + 1}`}
                   src={`/api${interviewPath(id)}/clips/${encodeURIComponent(clip.id)}/audio`}
                 />
               </div>
             ))
           ) : (
             <Message>
-              No verified audio clips are available yet. Audio is optional; you
-              can approve text only once the recording and text checks pass.
+              Audio clips are not ready. You can leave audio out.
             </Message>
           )}
           {unavailableSelection && (
@@ -906,7 +909,7 @@ function Editor({
         </fieldset>
         {dirty ? (
           <Message>
-            You have unsaved changes. Save to request a fresh support check.
+            You have unsaved changes. Save your draft before approving it.
           </Message>
         ) : saved ? (
           <Message>Saved on the server.</Message>
@@ -926,13 +929,17 @@ function Editor({
           Save changes
         </button>
       </form>
-      {!(supportTaskVisible && ["pending", "failed"].includes(state.check)) && (
-        <Message
-          error={["unsupported", "ambiguous", "failed"].includes(state.check)}
-        >
-          {checkMessage}
-        </Message>
-      )}
+      {!dirty &&
+        state.evidence_available &&
+        !(
+          supportTaskVisible && ["pending", "failed"].includes(state.check)
+        ) && (
+          <Message
+            error={["unsupported", "ambiguous", "failed"].includes(state.check)}
+          >
+            {checkMessage}
+          </Message>
+        )}
       {evidence?.assessment?.content_revision === state.revisions.content &&
         evidence.assessment.evidence_revision === state.revisions.evidence &&
         evidence.assessment.assessment.quality_gate_passed === false && (
@@ -943,6 +950,9 @@ function Editor({
             by the operator.
           </Message>
         )}
+      {evidence && ["unsupported", "ambiguous"].includes(state.check) && (
+        <ClaimReferences evidence={evidence} revisions={state.revisions} />
+      )}
       {state.approval && (
         <Message>
           You approved this saved version. Publication is a separate operator
@@ -959,6 +969,27 @@ function Editor({
         content={draft}
         clipBasePath={`${interviewPath(id)}/clips`}
       />
+      {!ready && !state.approval && !state.declined && (
+        <p className="small" role="status">
+          {stale
+            ? "Resolve the saved-version change above before approving."
+            : dirty
+              ? "Save your changes before approving this version."
+              : !draft.text.trim() || !draft.attribution.trim()
+                ? "Add your testimonial and attribution, then save."
+                : unavailableSelection
+                  ? "Remove unavailable audio clips or choose another clip, then save."
+                  : !state.evidence_available
+                    ? "Approval will be available when your recording is ready. You do not need to replay your answers."
+                    : state.check === "pending"
+                      ? "Preparing your draft for approval…"
+                      : state.check === "failed"
+                        ? "The automatic check did not finish. Your draft is saved."
+                        : ["unsupported", "ambiguous"].includes(state.check)
+                          ? "Please address the draft notes above before approving."
+                          : "Saving your changes…"}
+        </p>
+      )}
       <label className="checkbox">
         <input
           type="checkbox"
@@ -1017,12 +1048,11 @@ function ClaimReferences({
   )
     return null;
   return (
-    <section aria-label="Provisional claim suggestions">
-      <h2>Provisional claim suggestions</h2>
+    <section aria-label="Draft notes">
+      <h2>Draft notes</h2>
       <p className="small">
-        These model suggestions refer to the saved text. They do not verify
-        recording alignment or grant approval. Listen to each source and check
-        its meaning.
+        These notes explain which parts of your saved draft may need an edit.
+        You do not need to replay or confirm each answer.
       </p>
       {saved.assessment.issues.length > 0 && (
         <ul>
@@ -1059,8 +1089,15 @@ function ClaimReferences({
                     <a
                       className="text-link"
                       href={`#recorded-source-${sourceIndex + 1}`}
+                      onClick={() => {
+                        const details =
+                          document.querySelector<HTMLDetailsElement>(
+                            "details.evidence-panel",
+                          );
+                        if (details) details.open = true;
+                      }}
                     >
-                      Review source {sourceIndex + 1}
+                      View source {sourceIndex + 1}
                       {evidence.sources[sourceIndex].playback_available
                         ? " and recording"
                         : " (playback unavailable)"}
@@ -1118,7 +1155,7 @@ function Source({
     <article className="source-record" id={`recorded-source-${index + 1}`}>
       <h3>
         Source {index + 1} ·{" "}
-        {source.speaker === "customer" ? "Your answer" : "Interviewer"}
+        {source.speaker === "customer" ? "Your recording" : "Interviewer"}
       </h3>
       <p className="small">Original transcript</p>
       <p className="preserve-lines">{source.text}</p>

@@ -212,8 +212,12 @@ test("text-only exact approval requires explicit confirmation and survives reloa
     initial.content!.text,
   );
   await expect(
-    page.getByText(/No verified audio clips are available yet/),
+    page.getByText(/Audio clips are not ready. You can leave audio out./),
   ).toBeVisible();
+  await expect(page.locator("details.evidence-panel")).not.toHaveAttribute(
+    "open",
+  );
+  await expect(page.getByLabel("Play source 1")).not.toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
@@ -223,6 +227,9 @@ test("text-only exact approval requires explicit confirmation and survives reloa
     page.getByText("You approved this saved version."),
   ).toBeVisible();
   expect(fixture.requests[0].action).toEqual({ type: "approve" });
+  await expect(
+    page.getByText("You approved this saved version."),
+  ).toBeVisible();
   expect(fixture.state.approval!.content.clips).toEqual([]);
   await page.reload();
   await expect(
@@ -242,11 +249,15 @@ test("editing saves exact text, waits for support and blocks unsupported claims"
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(page.getByText(/The evidence check is queued;/)).toBeVisible();
+  await expect(
+    page.getByText(/Preparing your draft for approval. Your text is saved/),
+  ).toBeVisible();
   fixture.setCheck("unsupported");
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(
-    page.getByText("The saved text contains claims that are not supported."),
+    page.getByText(
+      "This draft contains statements we could not match to your interview.",
+    ),
   ).toBeVisible();
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
@@ -275,7 +286,9 @@ test("a stale save preserves local input and requires deliberate reconciliation"
     .getByRole("button", { name: "Keep my edits against latest version" })
     .click();
   await page.getByRole("button", { name: "Save changes" }).click();
-  await expect(page.getByText(/The evidence check is queued;/)).toBeVisible();
+  await expect(
+    page.getByText(/Preparing your draft for approval. Your text is saved/),
+  ).toBeVisible();
   expect(fixture.requests[1].expected.content).toBe(2);
   expect(fixture.requests[1].action.content.text).toBe("My unsaved edit.");
 });
@@ -284,6 +297,9 @@ test("transcript corrections stay separate and invalidate support", async ({
 }) => {
   const fixture = await review(page);
   await page.goto(`/review/${id}`);
+  await page
+    .getByText("View recording and transcript (optional)", { exact: true })
+    .click();
   await page.getByText("Correct this transcript", { exact: true }).click();
   await page
     .getByLabel("Correction for source 1")
@@ -321,11 +337,9 @@ test("unverified evidence and exhausted recovery stay blocked on mobile", async 
   await page.setViewportSize({ width: 393, height: 851 });
   await page.goto(`/review/${id}`);
   await expect(
-    page.getByText("Some recording artifacts are unavailable."),
+    page.getByText("Some recordings could not be recovered."),
   ).toBeVisible();
-  await expect(
-    page.getByText(/Your recording has not yet been verified for approval/),
-  ).toBeVisible();
+  await expect(page.getByText(/Your recording is not ready yet/)).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
@@ -364,6 +378,9 @@ test("recovery acknowledgement is explicit and never starts the microphone", asy
     };
   });
   await page.goto(`/review/${id}`);
+  await page
+    .getByText("View recording and transcript (optional)", { exact: true })
+    .click();
   await expect(
     page.getByRole("button", { name: "Confirm recovery", exact: true }),
   ).toBeDisabled();
@@ -470,6 +487,9 @@ test("a stale transcript correction retains input until explicitly reconciled", 
 }) => {
   const fixture = await review(page, { stale: true });
   await page.goto(`/review/${id}`);
+  await page
+    .getByText("View recording and transcript (optional)", { exact: true })
+    .click();
   await page.getByText("Correct this transcript", { exact: true }).click();
   await page
     .getByLabel("Correction for source 1")
@@ -525,10 +545,11 @@ test("provisional claim references link private sources and disappear after cont
       issues: ["Recording alignment still needs review."],
     },
   };
+  fixture.setCheck("ambiguous");
   fixture.setAssessment(assessment);
   await page.goto(`/review/${id}`);
   const suggestions = page.getByRole("region", {
-    name: "Provisional claim suggestions",
+    name: "Draft notes",
   });
   await expect(suggestions).toBeVisible();
   await expect(
@@ -546,10 +567,10 @@ test("provisional claim references link private sources and disappear after cont
     suggestions.getByText("Keep the qualification and check the recording."),
   ).toBeVisible();
   await expect(
-    suggestions.getByRole("link", { name: "Review source 1 and recording" }),
+    suggestions.getByRole("link", { name: "View source 1 and recording" }),
   ).toHaveAttribute("href", "#recorded-source-1");
   await suggestions
-    .getByRole("link", { name: "Review source 1 and recording" })
+    .getByRole("link", { name: "View source 1 and recording" })
     .click();
   await expect(page.locator("#recorded-source-1 audio")).toBeVisible();
   await expect(
@@ -664,7 +685,7 @@ test("manual draft save replaces old draft failures with one current evidence ch
   ).toHaveCount(1);
   await expect(
     page.getByRole("region", { name: "Evidence check" }),
-  ).toContainText("Your text is saved.");
+  ).toContainText("Your text is saved");
   await expect(page.getByRole("button", { name: /Retry draft/ })).toHaveCount(
     0,
   );
@@ -696,7 +717,7 @@ test("manual draft save replaces old draft failures with one current evidence ch
   await page.getByRole("button", { name: "Retry evidence check" }).click();
   await expect(
     page.getByRole("region", { name: "Evidence check" }),
-  ).toContainText("The evidence check is queued");
+  ).toContainText("Preparing your draft for approval");
   await expect(page.getByRole("button", { name: /Retry/ })).toHaveCount(0);
 });
 
@@ -740,15 +761,13 @@ test("a verified clip is opt-in, saved and bound to exact customer approval", as
   const fixture = await review(page, { clips: true });
   await page.goto(`/review/${id}`);
   const selection = page.getByRole("checkbox", {
-    name: "Include recorded answer 1",
+    name: "Include recording 1",
   });
   await expect(selection).not.toBeChecked();
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(320);
-  await expect(
-    page.getByLabel("Recorded answer 1", { exact: true }),
-  ).toHaveAttribute(
+  await expect(page.getByLabel("Recording 1", { exact: true })).toHaveAttribute(
     "src",
     `/api/customer/interviews/${id}/clips/verified-clip/audio`,
   );
@@ -757,6 +776,9 @@ test("a verified clip is opt-in, saved and bound to exact customer approval", as
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
   await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(
+    page.getByText("Saved on the server.", { exact: true }),
+  ).toBeVisible();
   expect(fixture.state.content!.clips).toEqual([
     { id: "verified-clip", sha256: "a".repeat(64) },
   ]);
@@ -769,6 +791,9 @@ test("a verified clip is opt-in, saved and bound to exact customer approval", as
     })
     .check();
   await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  await expect(
+    page.getByText("You approved this saved version."),
+  ).toBeVisible();
   expect(fixture.state.approval!.content.clips).toEqual(
     fixture.state.content!.clips,
   );
@@ -807,7 +832,10 @@ test("automatic recording and text checks let the customer save and approve with
 }) => {
   const fixture = await review(page, { unverified: true });
   const operatorRequests: string[] = [];
+  const mediaRequests: string[] = [];
   page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/audio"))
+      mediaRequests.push(request.url());
     if (new URL(request.url()).pathname.startsWith("/api/operator/"))
       operatorRequests.push(request.url());
   });
@@ -823,7 +851,7 @@ test("automatic recording and text checks let the customer save and approve with
   await page.goto(`/review/${id}`);
   await expect(
     page.getByRole("region", { name: "Recording check", exact: true }),
-  ).toContainText("automatically checking");
+  ).toContainText("Preparing your draft for approval");
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
@@ -833,7 +861,7 @@ test("automatic recording and text checks let the customer save and approve with
   await page.getByRole("button", { name: "Save changes" }).click();
   await expect(
     page.getByRole("region", { name: "Evidence check", exact: true }),
-  ).toContainText("queued");
+  ).toContainText("Preparing your draft for approval");
   fixture.state.evidence_available = true;
   fixture.setJobs([]);
   fixture.setCheck("supported");
@@ -851,6 +879,10 @@ test("automatic recording and text checks let the customer save and approve with
     "approve",
   ]);
   expect(operatorRequests).toEqual([]);
+  expect(mediaRequests).toEqual([]);
+  await expect(page.locator("details.evidence-panel")).not.toHaveAttribute(
+    "open",
+  );
   expect(fixture.state.published_approval_id).toBeNull();
 });
 
@@ -872,7 +904,7 @@ test("recording validation reports queued, failed and absent work without promis
     name: "Recording check",
     exact: true,
   });
-  await expect(recording).toContainText("automatic recording check is queued");
+  await expect(recording).toContainText("Preparing your draft for approval");
   fixture.setJobs([
     {
       id: "alignment",
@@ -884,9 +916,9 @@ test("recording validation reports queued, failed and absent work without promis
   ]);
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(recording).toContainText(
-    "Your recording could not be verified automatically",
+    "We could not finish preparing your recording",
   );
-  await expect(recording).toContainText("Technical recovery is needed");
+  await expect(recording).toContainText("A technical repair is needed");
   await expect(recording.getByRole("button")).toHaveCount(0);
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
@@ -894,7 +926,7 @@ test("recording validation reports queued, failed and absent work without promis
   for (const [error_code, explanation] of [
     [
       "alignment_transcript_mismatch",
-      "The saved transcript and the recording check do not fully agree",
+      "We could not finish preparing your recording",
     ],
     [
       "alignment_recording_incomplete",
@@ -923,9 +955,7 @@ test("recording validation reports queued, failed and absent work without promis
   fixture.setJobs([]);
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(recording).toHaveCount(0);
-  await expect(
-    page.getByText(/Your recording has not yet been verified for approval/),
-  ).toBeVisible();
+  await expect(page.getByText(/Your recording is not ready yet/)).toBeVisible();
   await expect(page.getByText(/We are automatically checking/)).toHaveCount(0);
 });
 
