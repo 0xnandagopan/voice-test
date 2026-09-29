@@ -243,6 +243,78 @@ async fn generation_waiting_on_authority_lock_cannot_overwrite_edit() {
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL and local mock HTTP sockets"]
+async fn validated_model_supports_verified_text_without_approving_for_customer() {
+    let db = Db::new().await;
+    let candidate = "It helped, but setup was hard.";
+    let state = db.save(candidate).await;
+    assert!(state.evidence_available);
+    assert_eq!(state.check, CheckStatus::Pending);
+    let job = db.job("support_check", &state).await;
+    let result = json!({"claims":[{"text":candidate,"verdict":"supported",
+        "sources":[{"source_id":db.source,"quote":candidate}],"issues":[]}],"issues":[]});
+    let envelope =
+        json!({"choices":[{"finish_reason":"stop","message":{"content":result.to_string()}}]});
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let envelope = envelope.clone();
+            async move { Json(envelope) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = GatewayClient::for_local_test_with_model(
+        &format!("http://{addr}/chat/completions"),
+        Duration::from_secs(2),
+        "gpt-6-luna",
+    )
+    .unwrap();
+    assert_eq!(v0_composition::PROMPT_VERSION, "grounded-composition-v6");
+    assert!(
+        composition_jobs::dispatch(&db.pool, &job, &client)
+            .await
+            .is_ok()
+    );
+    server.abort();
+
+    let after = db.state().await;
+    assert_eq!(after.check, CheckStatus::Supported);
+    assert!(after.approval.is_none());
+    assert!(after.published_approval_id.is_none());
+    assert_eq!(after.content.as_ref().unwrap().text, candidate);
+    assert_eq!(after.revisions.content, state.revisions.content);
+    assert_eq!(after.revisions.evidence, state.revisions.evidence);
+    let persisted: Value = sqlx::query_scalar("SELECT result FROM workflow_support_results WHERE interview_id=$1 AND content_revision=$2 AND evidence_revision=$3")
+        .bind(db.id).bind(after.revisions.content).bind(after.revisions.evidence).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(persisted["assessment"]["quality_gate_passed"], true);
+    assert_eq!(persisted["assessment"]["claims"][0]["text"], candidate);
+    assert_eq!(
+        persisted["assessment"]["claims"][0]["sources"][0]["source_id"],
+        db.source
+    );
+
+    // Passing the service checks enables the customer's distinct authority step.
+    let approved = workflow::execute(
+        &db.pool,
+        &db.customer,
+        WorkflowCommand {
+            interview_id: db.id,
+            request_id: Uuid::new_v4(),
+            expected: after.revisions,
+            action: WorkflowAction::Approve,
+        },
+    )
+    .await
+    .unwrap()
+    .state;
+    assert!(approved.approval.is_some());
+    assert!(approved.published_approval_id.is_none());
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL and local mock HTTP sockets"]
 async fn unvalidated_model_cannot_support_approval_but_unsupported_is_preserved() {
     let db = Db::new().await;
     for supported in [true, false] {
