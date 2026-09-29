@@ -38,6 +38,7 @@ export type Evidence = {
     end_ms: number | null;
     playback_available: boolean;
     alignment_verified: boolean;
+    recording_interrupted?: boolean;
     candidate_range_ms?: [number, number] | null;
     verified_range_ms?: [number, number] | null;
   }[];

@@ -22,6 +22,7 @@ async function review(
     stale?: boolean;
     missing?: boolean;
     clips?: boolean;
+    resumed?: boolean;
   } = {},
 ) {
   let state = structuredClone(initial);
@@ -108,15 +109,25 @@ async function review(
             assessment?.evidence_revision === state.revisions.evidence
               ? assessment
               : null,
-          clips: options.clips
-            ? [
-                {
-                  id: "verified-clip",
-                  sha256: "a".repeat(64),
-                  source_id: "answer/1",
-                },
-              ]
-            : [],
+          clips:
+            options.clips || options.resumed
+              ? [
+                  {
+                    id: "verified-clip",
+                    sha256: "a".repeat(64),
+                    source_id: "answer/1",
+                  },
+                  ...(options.resumed
+                    ? [
+                        {
+                          id: "resumed-clip",
+                          sha256: "b".repeat(64),
+                          source_id: "answer/2",
+                        },
+                      ]
+                    : []),
+                ]
+              : [],
           sources: [
             {
               source_id: "answer/1",
@@ -128,7 +139,24 @@ async function review(
               end_ms: 4000,
               playback_available: true,
               alignment_verified: !options.unverified,
+              recording_interrupted: Boolean(options.resumed),
             },
+            ...(options.resumed
+              ? [
+                  {
+                    source_id: "answer/2",
+                    attempt_id: "resumed-attempt",
+                    text: "After reconnecting, I explained that results are still to come.",
+                    corrected_text: null,
+                    speaker: "customer",
+                    start_ms: 0,
+                    end_ms: 6000,
+                    playback_available: true,
+                    alignment_verified: !options.unverified,
+                    recording_interrupted: false,
+                  },
+                ]
+              : []),
           ],
           jobs: options.missing
             ? [
@@ -430,7 +458,9 @@ test("unverified evidence and exhausted recovery stay blocked on mobile", async 
   await expect(
     page.getByText("Some recordings could not be recovered."),
   ).toBeVisible();
-  await expect(page.getByText(/Your recording is not ready yet/)).toBeVisible();
+  await expect(
+    page.getByText(/Your recordings are not ready yet/),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Approve exact testimonial" }),
   ).toBeDisabled();
@@ -1052,7 +1082,9 @@ test("recording validation reports queued, failed and absent work without promis
   fixture.setJobs([]);
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(recording).toHaveCount(0);
-  await expect(page.getByText(/Your recording is not ready yet/)).toBeVisible();
+  await expect(
+    page.getByText(/Your recordings are not ready yet/),
+  ).toBeVisible();
   await expect(page.getByText(/We are automatically checking/)).toHaveCount(0);
 });
 
@@ -1088,4 +1120,75 @@ test("request configuration errors explain a technical service failure rather th
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
+});
+
+test("recovered and resumed recordings stay optional and text-only approval needs no replay", async ({
+  page,
+}) => {
+  const fixture = await review(page, { resumed: true });
+  await page.goto(`/review/${id}`);
+  for (const number of [1, 2]) {
+    const clip = page.getByRole("checkbox", {
+      name: `Include recording ${number}`,
+    });
+    await expect(clip).toBeEnabled();
+    await expect(clip).not.toBeChecked();
+  }
+  await expect(
+    page
+      .getByText(
+        "Saved audio from before the interruption. Its ending may be incomplete. Listening is optional.",
+      )
+      .first(),
+  ).toBeVisible();
+  await page
+    .getByText("View recording and transcript (optional)", { exact: true })
+    .click();
+  await expect(page.locator("#recorded-source-1")).toContainText(
+    "Saved recording verified; this does not mean the spoken answer was finished.",
+  );
+  await expect(page.locator("#recorded-source-2")).toContainText(
+    "Recording alignment verified.",
+  );
+  await expect(page.getByLabel("Play source 1")).toHaveAttribute(
+    "src",
+    /answer%2F1\/audio$/,
+  );
+  await expect(page.getByLabel("Play source 2")).toHaveAttribute(
+    "src",
+    /answer%2F2\/audio$/,
+  );
+  await page.getByRole("checkbox", { name: /I approve this exact/ }).check();
+  await page.getByRole("button", { name: "Approve exact testimonial" }).click();
+  await expect(
+    page.getByText("You approved this saved version."),
+  ).toBeVisible();
+  expect(fixture.state.approval!.content.clips).toEqual([]);
+  expect(fixture.requests.map((request) => request.action.type)).toEqual([
+    "approve",
+  ]);
+});
+
+test("waiting for recovered recording processing preserves the draft and explains approval", async ({
+  page,
+}) => {
+  const fixture = await review(page, { resumed: true, unverified: true });
+  await page.goto(`/review/${id}`);
+  await expect(
+    page.getByText(
+      /Your draft is saved. Approval will be available once all saved recordings/,
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeDisabled();
+  await expect(page.getByLabel("Testimonial text")).toHaveValue(
+    initial.content!.text,
+  );
+  fixture.state.evidence_available = true;
+  await page.getByRole("button", { name: "Refresh saved status" }).click();
+  await expect(
+    page.getByRole("checkbox", { name: /I approve this exact/ }),
+  ).toBeEnabled();
+  expect(fixture.requests).toHaveLength(0);
 });

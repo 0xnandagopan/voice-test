@@ -299,8 +299,9 @@ function ReviewWorkspace({ id }: { id: string }) {
             ["queued", "running", "failed"].includes(job.status),
         ) && (
           <Message>
-            Your recording is not ready yet. Your draft is saved, and you can
-            keep editing while it is prepared.
+            Your recordings are not ready yet. Audio from before and after any
+            reconnect must finish processing. Your draft is saved, and you can
+            keep editing.
           </Message>
         )}
       {recovery.data?.attempts.some(
@@ -886,6 +887,14 @@ function Editor({
                     )?.text
                   }
                 </p>
+                {evidence?.sources.find(
+                  (source) => source.source_id === clip.source_id,
+                )?.recording_interrupted && (
+                  <p className="small">
+                    Saved audio from before the interruption. Its ending may be
+                    incomplete. Listening is optional.
+                  </p>
+                )}
                 <audio
                   controls
                   preload="none"
@@ -983,7 +992,7 @@ function Editor({
                 : unavailableSelection
                   ? "Remove unavailable audio clips or choose another clip, then save."
                   : !state.evidence_available
-                    ? "Approval will be available when your recording is ready. You do not need to replay your answers."
+                    ? "Your draft is saved. Approval will be available once all saved recordings, including audio from before and after any reconnect, finish processing. You do not need to replay or confirm your answers."
                     : state.check === "pending"
                       ? "Preparing your draft for approval…"
                       : state.check === "failed"
@@ -1179,9 +1188,17 @@ function Source({
           <p className="preserve-lines">{current}</p>
         </>
       )}
+      {source.recording_interrupted && (
+        <p className="small">
+          Saved audio from before the interruption. Its ending may be
+          incomplete. Listening is optional.
+        </p>
+      )}
       <p className="small">
         {source.alignment_verified
-          ? "Recording alignment verified."
+          ? source.recording_interrupted
+            ? "Saved recording verified; this does not mean the spoken answer was finished."
+            : "Recording alignment verified."
           : "Alignment is unverified. Playback may include surrounding speech or an incomplete answer."}
       </p>
       {source.playback_available ? (
