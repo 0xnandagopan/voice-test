@@ -1,11 +1,13 @@
 //! Private recording recovery. Imported does not mean aligned or approval eligible.
 pub mod alignment;
+pub mod automatic_alignment;
 pub mod jobs;
 pub mod manifest;
 pub mod media;
 pub mod provider;
 pub mod recovery;
 pub mod storage;
+pub mod stt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -87,7 +87,9 @@ pub fn reconstruct(
                 .map(|p| p.source_range_ms)
                 .or_else(|| check.and_then(|c| c.candidate_source_range_ms)),
             needs_alignment_review: verified.is_none(),
-            status: if verified.is_some() {
+            status: if verified.is_some_and(|p| p.method == crate::automatic_alignment::METHOD) {
+                "recorded_utterance_automatically_verified"
+            } else if verified.is_some() {
                 "recorded_utterance_operator_verified"
             } else if complete {
                 "recorded_utterance_alignment_pending"
@@ -103,7 +105,11 @@ pub fn reconstruct(
                 "recording_unverified"
             }
             .into(),
-            completion_basis: if verified.is_some() {
+            completion_basis: if verified
+                .is_some_and(|p| p.method == crate::automatic_alignment::METHOD)
+            {
+                "independent_customer_stt"
+            } else if verified.is_some() {
                 "operator_whole_answer_listening"
             } else if bounded {
                 "provider_speech_bounds"
@@ -171,7 +177,9 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
             result.unresolved_answers.extend(unresolved);
             result.attempts.push(AttemptRecovery {
                 provider_attempt_id: attempt,
-                status: if manifest.approval_eligible {
+                status: if manifest.approval_eligible && !manifest.automatic_alignment.is_empty() {
+                    "imported_automatic_alignment_verified"
+                } else if manifest.approval_eligible {
                     "imported_operator_alignment_verified"
                 } else if manifest.media.is_some() {
                     "imported_decoded_alignment_pending"
@@ -180,7 +188,7 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
                 }
                 .into(),
                 evidence_revision: row.get("evidence_revision"),
-                incomplete_turn_ids: manifest.incomplete_turn_ids,
+                incomplete_turn_ids: manifest.incomplete_turn_ids.clone(),
                 recommended_action: if manifest.product_end_reason.as_deref()
                     != Some("explicit_finish")
                 {
@@ -202,9 +210,15 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
                                     .iter()
                                     .filter(|s| s.speaker == "customer")
                                     .any(|segment| {
-                                        segment.source_range_ms.is_some_and(|[start, end]| {
-                                            start < group[1] && end > group[0]
-                                        })
+                                        crate::alignment::source_proof(
+                                            &manifest,
+                                            &segment.source_id,
+                                        )
+                                        .map(|p| p.source_range_ms)
+                                        .or(segment.source_range_ms)
+                                        .is_some_and(
+                                            |[start, end]| start < group[1] && end > group[0],
+                                        )
                                     })
                             })
                             .copied()

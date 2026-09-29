@@ -69,6 +69,15 @@ impl FfmpegValidator {
         let pcm = self.decode(audio).await?;
         Ok(check_pcm(&pcm, manifest))
     }
+    /// Full customer-only recording for independent STT, with the original clock.
+    /// Never concatenate activity groups: doing so would invalidate word timestamps.
+    pub async fn customer_wav(&self, audio: &[u8], manifest: &Manifest) -> Result<Vec<u8>> {
+        if crate::manifest::digest(audio) != manifest.recording_sha256 {
+            return Err(Error::Invalid("source recording hash mismatch"));
+        }
+        let pcm = self.decode(audio).await?;
+        Ok(left_channel_wav(&pcm))
+    }
     /// A physically bounded PRIVATE review clip. This does not authorize publication.
     /// The caller must authorize the current interview before and after awaiting it.
     pub async fn candidate_clip(
@@ -123,23 +132,7 @@ impl FfmpegValidator {
         if from >= to || to > pcm.len() / 4 {
             return Err(Error::Invalid("clip range outside decoded recording"));
         }
-        let data_len = ((to - from) * 2) as u32;
-        let mut wav = Vec::with_capacity(data_len as usize + 44);
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(data_len + 36).to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
-        wav.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_len.to_le_bytes());
-        for frame in pcm[from * 4..to * 4].as_chunks::<4>().0 {
-            wav.extend_from_slice(&frame[..2]);
-        }
+        let wav = left_channel_wav(&pcm[from * 4..to * 4]);
         Ok(CandidateClip {
             wav,
             source_id: source_id.into(),
@@ -385,4 +378,25 @@ fn customer_activity_groups(pcm: &[u8]) -> Vec<[u64; 2]> {
         group[1] = (group[1] + 120).min((frames * 1000 / SAMPLE_RATE) as u64);
     }
     groups
+}
+
+fn left_channel_wav(pcm: &[u8]) -> Vec<u8> {
+    let data_len = (pcm.len() / 2) as u32;
+    let mut wav = Vec::with_capacity(data_len as usize + 44);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(data_len + 36).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for frame in pcm.as_chunks::<4>().0 {
+        wav.extend_from_slice(&frame[..2]);
+    }
+    wav
 }

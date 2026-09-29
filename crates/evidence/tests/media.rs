@@ -71,6 +71,16 @@ async fn real_opus_decode_validates_channels_bounds_and_reconstruction_without_a
     assert_eq!(clip.source_range_ms, [0, 1000]);
     assert_eq!(&clip.wav[..4], b"RIFF");
     assert_eq!(clip.wav.len(), 48044);
+    let full_customer_wav = validator.customer_wav(&audio, &manifest).await.unwrap();
+    assert_eq!(full_customer_wav, clip.wav);
+    assert_eq!(&full_customer_wav[22..24], &1u16.to_le_bytes());
+    assert!(
+        validator
+            .customer_wav(b"OggSchanged", &manifest)
+            .await
+            .is_err()
+    );
+
     assert!(
         validator
             .candidate_clip(b"OggSchanged", &manifest, &manifest.segments[0].source_id)

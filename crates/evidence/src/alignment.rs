@@ -137,6 +137,7 @@ pub fn confirm_operator_alignment(
         verified_by: actor.into(),
         verified_at,
     };
+    manifest.automatic_alignment.clear();
     manifest
         .operator_alignment
         .retain(|p| p.source_id != proof.source_id);
@@ -181,14 +182,21 @@ pub fn source_proof<'a>(
         .segments
         .iter()
         .find(|s| s.source_id == source_id && s.speaker == "customer" && s.channel == 0)?;
-    manifest.operator_alignment.iter().find(|p| {
-        p.source_id == source_id
-            && p.recording_sha256 == manifest.recording_sha256
-            && p.timeline_sha256 == manifest.timeline_sha256
-            && p.source_text_sha256 == digest(source.text.as_bytes())
-            && p.source_range_ms[0] < p.source_range_ms[1]
-            && p.source_range_ms[1] <= media.decoded_duration_ms
-            && p.method == "operator_whole_answer_listening_v1"
-            && !p.verified_by.is_empty()
-    })
+    manifest
+        .operator_alignment
+        .iter()
+        .chain(manifest.automatic_alignment.iter())
+        .find(|p| {
+            p.source_id == source_id
+                && p.recording_sha256 == manifest.recording_sha256
+                && p.timeline_sha256 == manifest.timeline_sha256
+                && p.source_text_sha256 == digest(source.text.as_bytes())
+                && p.source_range_ms[0] < p.source_range_ms[1]
+                && p.source_range_ms[1] <= media.decoded_duration_ms
+                && (p.method == "operator_whole_answer_listening_v1"
+                    || (p.method == crate::automatic_alignment::METHOD
+                        && p.verified_by.starts_with("assemblyai:")
+                        && crate::automatic_alignment::preflight(manifest).is_ok()))
+                && !p.verified_by.is_empty()
+        })
 }
