@@ -109,6 +109,18 @@ export function AlignmentReview({
             }}
           />
         ))}
+      {current &&
+        sources.length > 0 &&
+        sources.every((source) => source.alignment_verified) &&
+        !state.evidence_available && (
+          <div className="notice" role="status">
+            The listed answers are verified, but recording completeness or
+            coverage is still unresolved. Review the verified time ranges for
+            missing parts of an answer. Only confirm a range that contains that
+            complete answer and matches its original transcript; do not include
+            unrelated audio just to clear this check.
+          </div>
+        )}
       {state.evidence_available ? (
         <p role="status">
           Recorded evidence is verified. Publication also requires current
@@ -145,6 +157,7 @@ function SourceReview({
   const [end, setEnd] = useState(
     range[1] == null ? "" : String(range[1] / 1000),
   );
+  const [editingVerified, setEditingVerified] = useState(false);
   const [preview, setPreview] = useState<Confirmation | null>(null);
   const [listened, setListened] = useState(false);
   const [matches, setMatches] = useState(false);
@@ -207,16 +220,46 @@ function SourceReview({
         covered >= audio.duration - tolerance,
     );
   }
-  if (source.alignment_verified)
+  if (source.alignment_verified && !editingVerified)
     return (
       <article className="source-record">
         <p className="preserve-lines">{source.text}</p>
         <p role="status">Recorded answer verified.</p>
+        {source.verified_range_ms && (
+          <p className="small">
+            Verified range: {source.verified_range_ms[0] / 1000}–
+            {source.verified_range_ms[1] / 1000} seconds.
+          </p>
+        )}
+        <button className="secondary" onClick={() => setEditingVerified(true)}>
+          Review or change verified range
+        </button>
       </article>
     );
   return (
     <article className="source-record">
       <h3>Original recorded answer</h3>
+      {editingVerified && (
+        <>
+          <p>
+            Changing this verified range requires listening and confirming
+            again. Saving a new verification invalidates existing checks and
+            customer approval.
+          </p>
+          <button
+            className="secondary"
+            disabled={prepare.isPending || verify.isPending}
+            onClick={() => {
+              clear();
+              setStart(range[0] == null ? "" : String(range[0] / 1000));
+              setEnd(range[1] == null ? "" : String(range[1] / 1000));
+              setEditingVerified(false);
+            }}
+          >
+            Keep verified range
+          </button>
+        </>
+      )}
       <p className="preserve-lines">{source.text}</p>
       <div className="actions">
         <label>

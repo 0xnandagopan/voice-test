@@ -16,10 +16,10 @@ const initial: WorkflowView = {
   declined: false,
   transcript_corrections: {},
 };
-async function fixture(page: Page) {
+async function fixture(page: Page, initiallyVerified = false) {
   const state = structuredClone(initial);
   const confirmations: Record<string, unknown>[] = [];
-  let verified = false;
+  let verified = initiallyVerified;
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/workflow"))
@@ -229,4 +229,50 @@ test("operator can publish a current approved snapshot with clips", async ({
     "src",
     `/api/operator/interviews/${id}/clips/clip-id/audio`,
   );
+});
+
+test("a verified answer can be rechecked with a revised complete range", async ({
+  page,
+}) => {
+  const f = await fixture(page, true);
+  await page.goto(`/operator/interviews/${id}`);
+  await expect(
+    page.getByText("Recorded answer verified.", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(
+      "The listed answers are verified, but recording completeness or coverage is still unresolved.",
+      { exact: false },
+    ),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Review or change verified range" })
+    .click();
+  await expect(page.getByLabel("Start time (seconds)")).toHaveValue("1");
+  await expect(page.getByLabel("End time (seconds)")).toHaveValue("3");
+  await page.getByLabel("End time (seconds)").fill("4");
+  await page.getByRole("button", { name: "Keep verified range" }).click();
+  expect(f.confirmations).toHaveLength(0);
+  await page
+    .getByRole("button", { name: "Review or change verified range" })
+    .click();
+  await expect(page.getByLabel("End time (seconds)")).toHaveValue("3");
+  await page.getByLabel("End time (seconds)").fill("4");
+  await page.getByRole("button", { name: "Prepare audio preview" }).click();
+  await expect(
+    page.getByRole("button", { name: "Verify recorded answer" }),
+  ).toBeDisabled();
+  await playback(page);
+  await page
+    .getByRole("checkbox", { name: "The original transcript matches" })
+    .check();
+  await page
+    .getByRole("checkbox", { name: "This is the complete answer" })
+    .check();
+  await page.getByRole("button", { name: "Verify recorded answer" }).click();
+  await expect(
+    page.getByText("Recorded answer verified.", { exact: true }),
+  ).toBeVisible();
+  expect(f.confirmations).toHaveLength(1);
+  expect(f.confirmations[0].source_range_ms).toEqual([1000, 4000]);
 });
