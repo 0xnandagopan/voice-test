@@ -91,6 +91,32 @@ impl FfmpegValidator {
             .and_then(|m| m.ranges.iter().find(|r| r.source_id == segment.source_id))
             .and_then(|r| r.candidate_source_range_ms)
             .ok_or(Error::Invalid("source group unavailable"))?;
+        self.preview_range(audio, manifest, source_id, [start, end])
+            .await
+    }
+
+    /// Private operator preview. The caller authorizes access before and after I/O.
+    /// The range is contiguous, bounded and always uses the customer (left) channel.
+    pub async fn preview_range(
+        &self,
+        audio: &[u8],
+        manifest: &Manifest,
+        source_id: &str,
+        [start, end]: [u64; 2],
+    ) -> Result<CandidateClip> {
+        if crate::manifest::digest(audio) != manifest.recording_sha256 {
+            return Err(Error::Invalid("source recording hash mismatch"));
+        }
+        if !manifest
+            .segments
+            .iter()
+            .any(|s| s.source_id == source_id && s.speaker == "customer" && s.channel == 0)
+        {
+            return Err(Error::Invalid("customer source identity"));
+        }
+        if start >= end || end > 390_000 {
+            return Err(Error::Invalid("clip range outside decoded recording"));
+        }
         let pcm = self.decode(audio).await?;
         let from = (start * SAMPLE_RATE as u64 / 1000) as usize;
         let to = (end * SAMPLE_RATE as u64 / 1000) as usize;
@@ -120,6 +146,23 @@ impl FfmpegValidator {
             source_range_ms: [start, end],
             source_recording_sha256: manifest.recording_sha256.clone(),
         })
+    }
+    /// A verified whole-answer clip; this is still not publication authorization.
+    pub async fn verified_clip(
+        &self,
+        audio: &[u8],
+        manifest: &Manifest,
+        source_id: &str,
+    ) -> Result<CandidateClip> {
+        let proof = crate::alignment::source_proof(manifest, source_id)
+            .ok_or(Error::Invalid("source alignment is unverified"))?;
+        let clip = self
+            .preview_range(audio, manifest, source_id, proof.source_range_ms)
+            .await?;
+        if crate::manifest::digest(&clip.wav) != proof.clip_sha256 {
+            return Err(Error::Invalid("verified clip hash mismatch"));
+        }
+        Ok(clip)
     }
     async fn decode(&self, audio: &[u8]) -> Result<Vec<u8>> {
         if audio.is_empty() || audio.len() > 32 * 1024 * 1024 {

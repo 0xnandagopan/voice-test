@@ -1,4 +1,5 @@
 //! Private recording recovery. Imported does not mean aligned or approval eligible.
+pub mod alignment;
 pub mod jobs;
 pub mod manifest;
 pub mod media;

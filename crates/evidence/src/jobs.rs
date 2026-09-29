@@ -229,7 +229,7 @@ async fn cleanup(pool: &PgPool, job: &Job, storage: &dyn PrivateStorage) -> Resu
         if !owns_lease {
             return Err(Error::Stale);
         }
-        let referenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evidence_imports WHERE recording_key=$1 OR manifest->>'timeline_key'=$1 OR manifest->>'metadata_key'=$1)").bind(&key).fetch_one(pool).await?;
+        let referenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evidence_imports WHERE recording_key=$1 OR manifest->>'timeline_key'=$1 OR manifest->>'metadata_key'=$1) OR EXISTS(SELECT 1 FROM workflow_clips WHERE object_key=$1)").bind(&key).fetch_one(pool).await?;
         if !referenced {
             storage.delete(&key).await?;
         }

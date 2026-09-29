@@ -73,7 +73,9 @@ pub fn reconstruct(
                 .incomplete_turn_ids
                 .iter()
                 .any(|id| id == &segment.turn_id);
-        let complete = available && clean && bounded && !uncertain_tail && !interrupted;
+        let verified = crate::alignment::source_proof(manifest, &segment.source_id);
+        let complete = verified.is_some()
+            || (available && clean && bounded && !uncertain_tail && !interrupted);
         let item = RecoveredAnswer {
             source_id: segment.source_id.clone(),
             provider_attempt_id: attempt,
@@ -81,9 +83,13 @@ pub fn reconstruct(
             turn_id: segment.turn_id.clone(),
             text: segment.text.clone(),
             source_range_ms: segment.source_range_ms,
-            candidate_source_range_ms: check.and_then(|c| c.candidate_source_range_ms),
-            needs_alignment_review: true,
-            status: if complete {
+            candidate_source_range_ms: verified
+                .map(|p| p.source_range_ms)
+                .or_else(|| check.and_then(|c| c.candidate_source_range_ms)),
+            needs_alignment_review: verified.is_none(),
+            status: if verified.is_some() {
+                "recorded_utterance_operator_verified"
+            } else if complete {
                 "recorded_utterance_alignment_pending"
             } else if interrupted {
                 "interrupted_turn_requires_confirmation"
@@ -97,7 +103,9 @@ pub fn reconstruct(
                 "recording_unverified"
             }
             .into(),
-            completion_basis: if bounded {
+            completion_basis: if verified.is_some() {
+                "operator_whole_answer_listening"
+            } else if bounded {
                 "provider_speech_bounds"
             } else {
                 "no_complete_provider_speech_bounds"
@@ -163,7 +171,9 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
             result.unresolved_answers.extend(unresolved);
             result.attempts.push(AttemptRecovery {
                 provider_attempt_id: attempt,
-                status: if manifest.media.is_some() {
+                status: if manifest.approval_eligible {
+                    "imported_operator_alignment_verified"
+                } else if manifest.media.is_some() {
                     "imported_decoded_alignment_pending"
                 } else {
                     "imported_unverified"

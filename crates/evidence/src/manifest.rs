@@ -69,6 +69,8 @@ pub struct Manifest {
     pub recording_validation: String,
     pub approval_eligible: bool,
     #[serde(default)]
+    pub operator_alignment: Vec<crate::alignment::OperatorAlignmentProof>,
+    #[serde(default)]
     pub media: Option<crate::media::MediaReport>,
 }
 
@@ -176,6 +178,7 @@ pub fn build(
         // Header + metadata validation is deliberately not decoded-media validation.
         recording_validation: "header_and_metadata_only".into(),
         approval_eligible: false,
+        operator_alignment: vec![],
         media: None,
     })
 }

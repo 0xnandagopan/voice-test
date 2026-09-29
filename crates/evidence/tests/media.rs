@@ -189,3 +189,72 @@ async fn inspect_downloaded_synthetic_recording_ranges() {
     );
     assert!(!manifest.approval_eligible);
 }
+
+#[tokio::test]
+#[ignore = "requires FFMPEG_PATH and FFPROBE_PATH"]
+async fn verified_clip_requires_listening_proof_and_extracts_only_customer_channel() {
+    use v0_evidence::alignment::{OperatorAlignmentConfirmation, confirm_operator_alignment};
+    let (ffmpeg, ffprobe) = tools();
+    let dir = std::env::temp_dir().join(format!("v0-verified-clip-{}", Uuid::new_v4()));
+    tokio::fs::create_dir(&dir).await.unwrap();
+    let source = dir.join("source.ogg");
+    let status = tokio::process::Command::new(&ffmpeg)
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.25*sin(2*PI*440*t)|0:s=24000:d=1",
+            "-c:a",
+            "libopus",
+        ])
+        .arg(&source)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    let audio = tokio::fs::read(source).await.unwrap();
+    let mut m = manifest::build("s", &audio,
+        &serde_json::to_vec(&json!({"session_id":"s","started_at_unix_ms":0,"turns":[{"turn_id":"t","status":"completed","user_transcript":"Synthetic answer","user_speech_started_at_ms":100,"user_speech_ended_at_ms":900}]})).unwrap(),
+        &serde_json::to_vec(&json!({"session_id":"s","started_at":"1970-01-01T00:00:00Z","ended_at":"1970-01-01T00:00:01Z","format":"ogg/opus","channels":2,"channel_layout":"stereo (left=user, right=agent)","sample_rate":24000,"file":"a.ogg","dropped_chunks":0,"uploaded_chunks":1})).unwrap()).unwrap();
+    m.product_end_reason = Some("explicit_finish".into());
+    let validator = FfmpegValidator::new(ffmpeg, ffprobe, dir.join("work"));
+    m.media = Some(validator.validate(&audio, &m).await.unwrap());
+    let id = m.segments[0].source_id.clone();
+    assert!(validator.verified_clip(&audio, &m, &id).await.is_err());
+    assert!(
+        validator
+            .preview_range(&audio, &m, &id, [0, u64::MAX])
+            .await
+            .is_err()
+    );
+    let clip = validator
+        .preview_range(&audio, &m, &id, [0, 1000])
+        .await
+        .unwrap();
+    let c = OperatorAlignmentConfirmation {
+        recording_sha256: m.recording_sha256.clone(),
+        timeline_sha256: m.timeline_sha256.clone(),
+        source_id: id.clone(),
+        source_text_sha256: manifest::digest(m.segments[0].text.as_bytes()),
+        source_range_ms: [0, 1000],
+        clip_sha256: manifest::digest(&clip.wav),
+        listened: true,
+        transcript_matches: true,
+        complete_answer: true,
+    };
+    confirm_operator_alignment(&mut m, &clip, &c, "test-operator", chrono::Utc::now()).unwrap();
+    let verified = validator.verified_clip(&audio, &m, &id).await.unwrap();
+    assert_eq!(verified.wav, clip.wav);
+    assert_eq!(
+        u16::from_le_bytes(verified.wav[22..24].try_into().unwrap()),
+        1
+    );
+    assert_eq!(verified.wav.len(), 48044);
+    m.operator_alignment[0].clip_sha256 = "wrong".into();
+    assert!(validator.verified_clip(&audio, &m, &id).await.is_err());
+    tokio::fs::remove_dir_all(dir).await.unwrap();
+}
