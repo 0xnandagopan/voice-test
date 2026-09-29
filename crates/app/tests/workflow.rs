@@ -1,5 +1,11 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use tower::ServiceExt;
 use uuid::Uuid;
 use v0_app::{auth::hash_secret, leases, progress, workflow};
 use v0_domain::workflow::*;
@@ -44,8 +50,8 @@ impl Db {
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO interviews(id,customer_label,project_context,secret_hash,idempotency_key,request_hash,expires_at,consented_at,state) VALUES($1,'Synthetic','Test only',$2,$3,'hash',now()+interval '14 days',now(),'consented')")
       .bind(id).bind(id.to_string()).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
-        let customer = Uuid::new_v4().to_string();
-        let operator = Uuid::new_v4().to_string();
+        let customer = v0_app::auth::random_secret();
+        let operator = v0_app::auth::random_secret();
         sqlx::query("INSERT INTO sessions(token_hash,role,interview_id,expires_at) VALUES($1,'customer',$2,now()+interval '1 day'),($3,'operator',NULL,now()+interval '1 day')").bind(hash_secret(&customer)).bind(id).bind(hash_secret(&operator)).execute(&pool).await.unwrap();
         Self {
             pool,
@@ -129,12 +135,39 @@ impl Db {
             },
         )
     }
-    async fn supported(&self) {
+    async fn checked(&self, status: CheckStatus) {
         let state = self.state().await;
-        let (job, lease, result) = self.job(&state).await;
+        let (job, lease, mut result) = self.job(&state).await;
+        result.status = status;
         workflow::complete_support(&self.pool, self.id, job, lease, result)
             .await
             .unwrap();
+    }
+    async fn supported(&self) {
+        self.checked(CheckStatus::Supported).await;
+    }
+    async fn http_get(&self, path: &str, operator: bool) -> (StatusCode, String) {
+        let config = v0_app::config::Config {
+            origin: "http://localhost:3000".into(),
+            agency_name: "Synthetic agency".into(),
+            operator_username: "fixture".into(),
+            operator_password_hash: String::new(),
+            invitation_signing_key: "x".repeat(32),
+            secure_cookie: false,
+            voice_api_key: None,
+        };
+        let app = v0_app::router(v0_app::AppState::new(self.pool.clone(), config));
+        let mut request = Request::builder().uri(path);
+        if operator {
+            request = request.header("Cookie", format!("operator_session={}", self.operator));
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
     }
     async fn approve(&self) -> WorkflowView {
         workflow::execute(
@@ -368,7 +401,7 @@ async fn selected_clips_block_but_text_only_does_not_wait_for_unused_clips() {
     )
     .await
     .unwrap();
-    d.supported().await;
+    d.checked(CheckStatus::Unsupported).await;
     assert!(
         workflow::execute(
             &d.pool,
@@ -1618,5 +1651,266 @@ async fn finish_requires_current_revisions_scope_lease_and_no_provisional_items(
         .await
         .is_err()
     );
+    d.close().await;
+}
+
+/// A completed semantic warning is advisory. Authority, exact revision binding,
+/// public withdrawal, and actual recorded-evidence requirements remain enforced.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn completed_disparity_allows_exact_customer_approval_and_publication_after_edit() {
+    for status in [CheckStatus::Unsupported, CheckStatus::Ambiguous] {
+        let d = Db::new().await;
+        d.evidence(true).await;
+        d.save().await;
+        d.supported().await;
+        d.approve().await;
+        d.publish().await;
+        let stale_approve = d.command(WorkflowAction::Approve).await;
+        let stale_publish = d
+            .command(WorkflowAction::Publish {
+                approval_id: d.state().await.approval.unwrap().id,
+            })
+            .await;
+        let mut edited = content();
+        edited
+            .text
+            .push_str(" Thank you to the agency for your support.");
+        workflow::execute(
+            &d.pool,
+            &d.customer,
+            d.command(WorkflowAction::Save {
+                content: edited.clone(),
+            })
+            .await,
+        )
+        .await
+        .unwrap();
+        assert!(workflow::published(&d.pool, d.id).await.is_err());
+        assert!(
+            workflow::execute(
+                &d.pool,
+                &d.customer,
+                d.command(WorkflowAction::Approve).await
+            )
+            .await
+            .is_err()
+        );
+        let state = d.state().await;
+        let (job, lease, mut result) = d.job(&state).await;
+        result.status = status;
+        // No matching source is a valid semantic warning, not an authority failure.
+        result.source_ids.clear();
+        workflow::complete_support(&d.pool, d.id, job, lease, result)
+            .await
+            .unwrap();
+        let checked = d.state().await;
+        assert_eq!(checked.check, status);
+        assert!(checked.approval.is_none());
+        assert!(
+            workflow::execute(
+                &d.pool,
+                &d.operator,
+                d.command(WorkflowAction::Approve).await
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            workflow::execute(&d.pool, &d.customer, stale_approve)
+                .await
+                .is_err()
+        );
+        assert!(
+            workflow::execute(&d.pool, &d.operator, stale_publish)
+                .await
+                .is_err()
+        );
+        let approve_command = d.command(WorkflowAction::Approve).await;
+        let approved = workflow::execute(&d.pool, &d.customer, approve_command.clone())
+            .await
+            .unwrap()
+            .state;
+        assert!(
+            workflow::execute(&d.pool, &d.customer, approve_command)
+                .await
+                .unwrap()
+                .replayed
+        );
+        let approvals_with_notes: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE interview_id=$1 AND event='customer_approved_with_interview_difference_notes'")
+            .bind(d.id).fetch_one(&d.pool).await.unwrap();
+        assert_eq!(approvals_with_notes, 1);
+        assert_eq!(
+            approved.check, status,
+            "approval must not relabel the warning as supported"
+        );
+        assert_eq!(approved.approval.as_ref().unwrap().content, edited);
+        assert!(approved.published_approval_id.is_none());
+        assert!(
+            workflow::execute(
+                &d.pool,
+                &d.customer,
+                d.command(WorkflowAction::Publish {
+                    approval_id: approved.approval.unwrap().id
+                })
+                .await
+            )
+            .await
+            .is_err()
+        );
+        d.publish().await;
+        assert_eq!(
+            workflow::published(&d.pool, d.id).await.unwrap().content,
+            edited
+        );
+        let public_path = format!("/api/public/{}", d.id);
+        let export_path = format!("/api/operator/interviews/{}/export", d.id);
+        let (code, public) = d.http_get(&public_path, false).await;
+        assert_eq!(code, StatusCode::OK);
+        let public: Value = serde_json::from_str(&public).unwrap();
+        assert_eq!(public["text"], edited.text);
+        assert_eq!(public["attribution"], edited.attribution);
+        let (code, export) = d.http_get(&export_path, true).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            export,
+            format!("{}\n\n— {}\n", edited.text, edited.attribution)
+        );
+        let mut later = edited;
+        later.attribution = "Changed attribution".into();
+        workflow::execute(
+            &d.pool,
+            &d.customer,
+            d.command(WorkflowAction::Save { content: later }).await,
+        )
+        .await
+        .unwrap();
+        let state = d.state().await;
+        assert!(state.approval.is_none());
+        assert_eq!(state.check, CheckStatus::Pending);
+        assert_eq!(
+            d.http_get(&public_path, false).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(d.http_get(&export_path, true).await.0, StatusCode::OK);
+        d.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn advisory_semantics_do_not_bypass_incomplete_failed_or_invalid_evidence_checks() {
+    let d = Db::new().await;
+    d.evidence(true).await;
+    d.save().await;
+    for status in [CheckStatus::Unsupported, CheckStatus::Ambiguous] {
+        let state = d.state().await;
+        let (job, lease, mut result) = d.job(&state).await;
+        result.status = status;
+        result.all_substantive_claims_checked = false;
+        assert!(
+            workflow::complete_support(&d.pool, d.id, job, lease, result.clone())
+                .await
+                .is_err()
+        );
+        result.all_substantive_claims_checked = true;
+        result.source_ids = vec!["foreign-interview-source".into()];
+        assert!(
+            workflow::complete_support(&d.pool, d.id, job, lease, result)
+                .await
+                .is_err()
+        );
+        assert!(d.state().await.approval.is_none());
+    }
+    for status in [CheckStatus::Pending, CheckStatus::Failed] {
+        let (job, lease, mut result) = d.job(&d.state().await).await;
+        result.status = status;
+        assert!(
+            workflow::complete_support(&d.pool, d.id, job, lease, result)
+                .await
+                .is_err()
+        );
+        assert!(
+            workflow::execute(
+                &d.pool,
+                &d.customer,
+                d.command(WorkflowAction::Approve).await
+            )
+            .await
+            .is_err()
+        );
+    }
+    // A terminal worker failure is a technical failure, not a completed warning.
+    let (job_id, token, _) = d.job(&d.state().await).await;
+    let payload: Value = sqlx::query_scalar("SELECT payload FROM jobs WHERE id=$1")
+        .bind(job_id)
+        .fetch_one(&d.pool)
+        .await
+        .unwrap();
+    v0_app::composition_jobs::fail(
+        &d.pool,
+        &v0_evidence::jobs::Job {
+            id: job_id,
+            token,
+            interview_id: d.id,
+            kind: "support_check".into(),
+            payload,
+        },
+        v0_app::composition_jobs::JobFailure {
+            code: "gateway_unavailable",
+            retry_after_secs: 0,
+            terminal: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.state().await.check, CheckStatus::Failed);
+    assert!(
+        workflow::execute(
+            &d.pool,
+            &d.customer,
+            d.command(WorkflowAction::Approve).await
+        )
+        .await
+        .is_err()
+    );
+    d.close().await;
+
+    let d = Db::new().await;
+    d.evidence(false).await;
+    d.save().await;
+    d.checked(CheckStatus::Unsupported).await;
+    assert!(!d.state().await.evidence_available);
+    assert!(
+        workflow::execute(
+            &d.pool,
+            &d.customer,
+            d.command(WorkflowAction::Approve).await
+        )
+        .await
+        .is_err()
+    );
+    d.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn unvalidated_checker_cannot_turn_service_failure_into_approvable_advice() {
+    let d = Db::new().await;
+    d.evidence(true).await;
+    d.save().await;
+    d.checked(CheckStatus::Ambiguous).await;
+    sqlx::query("UPDATE workflow_support_results SET result=jsonb_set(result,'{assessment}','{\"quality_gate_passed\":false}'::jsonb) WHERE interview_id=$1")
+        .bind(d.id).execute(&d.pool).await.unwrap();
+    assert!(
+        workflow::execute(
+            &d.pool,
+            &d.customer,
+            d.command(WorkflowAction::Approve).await
+        )
+        .await
+        .is_err()
+    );
+    assert!(d.state().await.approval.is_none());
     d.close().await;
 }

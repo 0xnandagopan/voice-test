@@ -361,11 +361,25 @@ async fn recorded_transcript_replaces_provisional_words_and_customer_can_approve
         0
     );
 
-    // Editing remains direct; a genuinely unsupported new claim still cannot be approved.
+    // Editing remains direct. A completed disparity is advisory; pending checks still block.
     f.save("The agency doubled our revenue.").await;
     let edited = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
     assert!(edited.approval.is_none());
     assert_eq!(edited.check, CheckStatus::Pending);
+    assert!(
+        workflow::execute(
+            &f.pool,
+            &f.customer,
+            WorkflowCommand {
+                interview_id: f.id,
+                request_id: Uuid::new_v4(),
+                expected: edited.revisions,
+                action: WorkflowAction::Approve,
+            }
+        )
+        .await
+        .is_err()
+    );
     check_saved_text(
         &f,
         &recorded_source,
@@ -379,20 +393,25 @@ async fn recorded_transcript_replaces_provisional_words_and_customer_can_approve
         unsupported.content.as_ref().unwrap().text,
         "The agency doubled our revenue."
     );
-    assert!(
-        workflow::execute(
-            &f.pool,
-            &f.customer,
-            WorkflowCommand {
-                interview_id: f.id,
-                request_id: Uuid::new_v4(),
-                expected: unsupported.revisions,
-                action: WorkflowAction::Approve,
-            }
-        )
-        .await
-        .is_err()
+    let approved = workflow::execute(
+        &f.pool,
+        &f.customer,
+        WorkflowCommand {
+            interview_id: f.id,
+            request_id: Uuid::new_v4(),
+            expected: unsupported.revisions,
+            action: WorkflowAction::Approve,
+        },
+    )
+    .await
+    .unwrap()
+    .state;
+    assert_eq!(approved.check, CheckStatus::Unsupported);
+    assert_eq!(
+        approved.approval.unwrap().content.text,
+        "The agency doubled our revenue."
     );
+    assert!(approved.published_approval_id.is_none());
     f.dispatch(&f.lease("delete_alignment_transcript").await, &mock)
         .await
         .unwrap();
