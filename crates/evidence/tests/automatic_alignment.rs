@@ -211,3 +211,35 @@ fn session_clock_offset_is_diagnostic_but_missing_words_or_audio_still_fail() {
     assert!(preflight(&m).is_err());
     assert!(source_proof(&m, &m.segments[0].source_id).is_none());
 }
+
+#[test]
+fn ordered_word_overlaps_inside_one_answer_preserve_whole_answer_verification() {
+    let (mut m, mut transcript) = fixture();
+    // The provider may estimate adjacent words over a shared acoustic boundary.
+    transcript.words[1].start = 280;
+    assert!(transcript.words[1].start < transcript.words[0].end);
+    let ranges = plan(&m, &transcript).unwrap();
+    assert_eq!(ranges[0].source_range_ms, [100, 1500]);
+    let candidate_clips = clips(&m, &transcript);
+    confirm(&mut m, &transcript, &candidate_clips, chrono::Utc::now()).unwrap();
+    assert!(m.approval_eligible);
+}
+#[test]
+fn decreasing_word_starts_or_ends_and_cross_answer_overlap_stay_rejected() {
+    for issue in 0..3 {
+        let (m, mut transcript) = fixture();
+        match issue {
+            0 => transcript.words[1].start = 100,
+            1 => {
+                transcript.words[1].start = 210;
+                transcript.words[1].end = 290;
+            }
+            _ => {
+                transcript.words[4].end = 2350;
+            }
+        }
+        // Last case preserves nondecreasing starts and ends but crosses the
+        // original answer boundary; overlapping answer clips cannot be approved.
+        assert!(plan(&m, &transcript).is_err());
+    }
+}

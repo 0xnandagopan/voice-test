@@ -82,9 +82,14 @@ pub fn plan(manifest: &Manifest, transcript: &RecordedTranscript) -> Result<Vec<
         return Err(Error::Invalid("transcription identity or duration"));
     }
     let mut observed = Vec::new();
+    // Word-level ASR estimates can overlap inside an answer. Only whole-answer
+    // clips are extracted, so require ordered starts AND ends rather than invented
+    // disjoint word intervals. Final answer ranges must still never overlap.
+    let mut previous_start = 0;
     let mut previous_end = 0;
     for (index, word) in transcript.words.iter().enumerate() {
-        if word.start < previous_end
+        if word.start < previous_start
+            || word.end < previous_end
             || word.start >= word.end
             || word.end > media.decoded_duration_ms
             || !word.confidence.is_finite()
@@ -93,6 +98,7 @@ pub fn plan(manifest: &Manifest, transcript: &RecordedTranscript) -> Result<Vec<
         {
             return Err(Error::Invalid("transcription word timing"));
         }
+        previous_start = word.start;
         previous_end = word.end;
         let word_tokens = tokens(&word.text);
         if word_tokens.is_empty() {
