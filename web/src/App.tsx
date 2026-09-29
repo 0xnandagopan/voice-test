@@ -181,6 +181,64 @@ function Operator() {
     );
   return <Dashboard username={auth.data.username} />;
 }
+function InvitationCopy({ item }: { item: SessionView }) {
+  const [copied, setCopied] = useState(false);
+  const [fallbackUrl, setFallbackUrl] = useState("");
+  const copy = useMutation({
+    mutationFn: async () => {
+      setCopied(false);
+      setFallbackUrl("");
+      const { private_url } = await api<{ private_url: string }>(
+        `/operator/invitations/${item.id}/link`,
+      );
+      try {
+        await navigator.clipboard.writeText(private_url);
+        setCopied(true);
+      } catch {
+        // Keep a selectable fallback in this mounted row, never browser storage.
+        setFallbackUrl(private_url);
+      }
+    },
+  });
+  return (
+    <div className="invitation-copy">
+      <button
+        className="secondary"
+        aria-label={`Copy invitation link for ${item.customer_label}`}
+        disabled={copy.isPending}
+        onClick={() => copy.mutate()}
+      >
+        {copy.isPending
+          ? "Getting link…"
+          : copied
+            ? "Link copied"
+            : "Copy link"}
+      </button>
+      {copied && (
+        <span role="status" className="small">
+          Private link copied.
+        </span>
+      )}
+      <ErrorNotice error={copy.error} />
+      {fallbackUrl && (
+        <>
+          <label>
+            Private invitation link for {item.customer_label}
+            <input
+              readOnly
+              value={fallbackUrl}
+              onFocus={(e) => e.currentTarget.select()}
+            />
+          </label>
+          <p role="status" className="small">
+            Clipboard is unavailable. Select and copy this private link, then
+            share it directly with your customer.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
 function Dashboard({ username }: { username: string }) {
   const client = useQueryClient();
   const invitations = useQuery({
@@ -340,7 +398,7 @@ function Dashboard({ username }: { username: string }) {
             <ul className="invitation-list">
               {invitations.data.invitations.map((item) => (
                 <li key={item.id}>
-                  <div>
+                  <div className="invitation-details">
                     <strong>{item.customer_label}</strong>
                     <p>{item.project_context}</p>
                     <span className="badge">{item.state}</span>
@@ -354,6 +412,10 @@ function Dashboard({ username }: { username: string }) {
                       {" "}
                       Expires {new Date(item.expires_at).toLocaleDateString()}
                     </span>
+                    {!["revoked", "deleted"].includes(item.state) &&
+                      Date.parse(item.expires_at) > Date.now() && (
+                        <InvitationCopy item={item} />
+                      )}
                   </div>
                   {!["revoked", "deleted"].includes(item.state) && (
                     <button
@@ -772,7 +834,7 @@ function Interview() {
                 setFinishing(false);
                 setError(
                   new Error(
-                    "That control was not applied because the conversation changed. Check the current question and try again. You can still Stop at any time.",
+                    "That control was not applied because the conversation changed. Check the current question and try again. You can still pause at any time.",
                   ),
                 );
               }
@@ -901,13 +963,18 @@ function Interview() {
               </Notice>
             )}
             {active && (
-              <Notice>Recording is active. You can stop at any time.</Notice>
+              <Notice>
+                Recording is active. Pause stops your microphone and playback;
+                Finish ends the interview.
+              </Notice>
             )}
             <ErrorNotice error={start.error} />
             <ErrorNotice error={error} />
             {stopped && (
               <Notice>
-                Stopped locally. No microphone or playback is active.
+                Paused locally. No microphone or playback is active. Review
+                recording recovery before resuming; your used time and question
+                counts are preserved.
               </Notice>
             )}
             {ended && (
@@ -921,8 +988,8 @@ function Interview() {
             )}
             {requiresRecovery && !ended && (
               <Notice>
-                Review and acknowledge recording recovery before starting again.
-                Your used time and question counts are preserved.
+                Review and acknowledge recording recovery before resuming. Your
+                used time and question counts are preserved.
               </Notice>
             )}
             {existingSession && (
@@ -938,7 +1005,11 @@ function Interview() {
                 starts automatically.
               </Notice>
             )}
-            <div className="actions">
+            <div
+              className={`conversation-controls ${showStop || reviewRequired ? "persistent-controls" : ""}`}
+              role="group"
+              aria-label="Conversation controls"
+            >
               {canOfferStart && (
                 <button
                   disabled={
@@ -956,13 +1027,13 @@ function Interview() {
                   {connecting
                     ? "Connecting…"
                     : continuing
-                      ? "Continue interview"
+                      ? "Resume interview"
                       : "Start interview"}
                 </button>
               )}
               {showStop && (
                 <button className="secondary" onClick={stop}>
-                  Stop
+                  Pause interview
                 </button>
               )}
               {reviewRequired && !showStop && (
@@ -1017,7 +1088,7 @@ function Interview() {
                           reason instanceof Error
                             ? reason
                             : new Error(
-                                "Finish could not be requested. You can still Stop at any time.",
+                                "Finish could not be requested. You can still pause at any time.",
                               ),
                         );
                       }

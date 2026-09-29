@@ -127,7 +127,7 @@ async function fixture(page: Page, initialState = "consented") {
     async start() {
       await page.goto("/interview");
       await page
-        .getByRole("button", { name: /^(Start|Continue) interview$/ })
+        .getByRole("button", { name: /^(Start|Resume) interview$/ })
         .click();
       await expect.poll(() => Boolean(socket)).toBe(true);
       this.send({
@@ -184,7 +184,7 @@ test("Finish requires fresh server permission; stale rejection preserves recordi
     page.getByRole("button", { name: "Finishing…", exact: true }),
   ).toBeDisabled();
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toBeEnabled();
   f.send({ type: "control_rejected", code: "stale_revision" });
   f.send({
@@ -202,7 +202,9 @@ test("Finish requires fresh server permission; stale rejection preserves recordi
   ).toBeDisabled();
   await expect(page.getByText("Recording is active.")).toBeVisible();
   expect(await tracksEnded(page)).toBe(false);
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Pause interview", exact: true })
+    .click();
   expect(await tracksEnded(page)).toBe(true);
 });
 
@@ -232,10 +234,10 @@ test("only acknowledged Finish reports completion and releases microphone", asyn
   ).toBeVisible();
   expect(await tracksEnded(page)).toBe(true);
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("link", { name: "Review testimonial", exact: true }),
@@ -243,7 +245,7 @@ test("only acknowledged Finish reports completion and releases microphone", asyn
   await expect(page.getByText(/minutes remaining/)).toHaveCount(0);
   await page.reload();
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toHaveCount(0);
   expect(await micCalls(page)).toBe(0);
 });
@@ -260,7 +262,7 @@ test("connection loss releases capture; reload and recovery acknowledgement neve
   expect(await tracksEnded(page)).toBe(true);
   await page.reload();
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toHaveCount(0);
   expect(await micCalls(page)).toBe(0);
   await page
@@ -279,7 +281,7 @@ test("connection loss releases capture; reload and recovery acknowledgement neve
   expect(await micCalls(page)).toBe(0);
   await page.getByRole("link", { name: "Continue to conversation" }).click();
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toBeEnabled();
   expect(await micCalls(page)).toBe(0);
   expect(f.starts()).toBe(1);
@@ -307,7 +309,7 @@ test("budget exhaustion ends capture without claiming user completion", async ({
   ).toBeVisible();
   await expect(page.getByText("Your interview is complete.")).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toHaveCount(0);
 });
 
@@ -318,10 +320,10 @@ test("idle conversation offers separated navigation and no redundant Stop", asyn
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/interview");
   await expect(
-    page.getByRole("button", { name: "Continue interview", exact: true }),
+    page.getByRole("button", { name: "Resume interview", exact: true }),
   ).toBeEnabled();
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
   const review = page.getByRole("link", {
     name: "View saved recording and review",
@@ -335,7 +337,10 @@ test("idle conversation offers separated navigation and no redundant Stop", asyn
   await expect(sound).toBeVisible();
   const reviewBox = (await review.boundingBox())!;
   const soundBox = (await sound.boundingBox())!;
-  expect(soundBox.x - reviewBox.x - reviewBox.width).toBeGreaterThanOrEqual(10);
+  expect(
+    soundBox.y >= reviewBox.y + reviewBox.height + 10 ||
+      soundBox.x >= reviewBox.x + reviewBox.width + 10,
+  ).toBe(true);
   expect(await micCalls(page)).toBe(0);
 });
 
@@ -345,15 +350,17 @@ test("Stop offers recovery and keeps refreshing until server finalization settle
   const f = await fixture(page);
   await f.start();
   f.setState("interviewing");
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Pause interview", exact: true })
+    .click();
   await expect(
-    page.getByText("Stopped locally.", { exact: false }),
+    page.getByText("Paused locally.", { exact: false }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: /^(Start|Continue) interview$/ }),
+    page.getByRole("button", { name: /^(Start|Resume) interview$/ }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("link", { name: "Review recording recovery", exact: true }),
@@ -375,3 +382,68 @@ test("Stop offers recovery and keeps refreshing until server finalization settle
   ).toHaveCount(0);
   expect(await tracksEnded(page)).toBe(true);
 });
+
+for (const width of [320, 390, 768]) {
+  test(`conversation controls remain reachable below long captions at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 740 });
+    const f = await fixture(page);
+    await f.start();
+    for (let i = 0; i < 25; i++) {
+      f.send({
+        type: "caption",
+        speaker: "customer",
+        item_id: `turn-${i}`,
+        text: `Synthetic answer ${i}. We worked together and discussed the project in detail.`,
+        final: true,
+      });
+    }
+    f.send({
+      type: "state",
+      revision: 4,
+      progress_revision: 2,
+      remaining_seconds: 120,
+      can_finish: true,
+    });
+    await expect(
+      page.getByText("Synthetic answer 24.", { exact: false }),
+    ).toBeVisible();
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    for (const name of [
+      "Pause interview",
+      "Repeat question",
+      "Skip topic",
+      "Finish interview",
+    ]) {
+      const button = page.getByRole("button", { name, exact: true });
+      await expect(button).toBeInViewport();
+      const box = (await button.boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(width);
+      expect(box.height).toBeGreaterThanOrEqual(44);
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await page
+      .getByRole("button", { name: "Finish interview", exact: true })
+      .click();
+    await expect
+      .poll(() => f.commands.some((command) => command.action === "finish"))
+      .toBe(true);
+    f.setState("completed");
+    f.send({
+      type: "ended",
+      reason: "explicit_finish",
+      recovery_required: true,
+    });
+    await expect(
+      page.getByRole("button", { name: "Pause interview" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("link", { name: "Review testimonial", exact: true }),
+    ).toBeInViewport();
+    expect(await tracksEnded(page)).toBe(true);
+  });
+}

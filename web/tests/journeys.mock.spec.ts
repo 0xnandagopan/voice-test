@@ -132,7 +132,7 @@ test("customer consent gates microphone; fragment removed; denial retries with s
     ),
   ).toBe(2);
   await expect(
-    page.getByRole("button", { name: "Stop", exact: true }),
+    page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
 });
 test("failed consent does not unlock readiness or ask for microphone", async ({
@@ -254,5 +254,141 @@ test("mobile welcome fits viewport and never fabricates published content", asyn
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: /Approve|Publish/ }),
+  ).toHaveCount(0);
+});
+
+test("operator retrieves each older invitation after reload without persisting secrets", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const second = {
+    ...fixture,
+    id: "cba88a77-3355-4242-8181-882233445566",
+    customer_label: "Second customer",
+  };
+  const expired = {
+    ...fixture,
+    id: "expired",
+    customer_label: "Expired customer",
+    expires_at: "2020-01-01T00:00:00Z",
+  };
+  const revoked = {
+    ...fixture,
+    id: "revoked",
+    customer_label: "Revoked customer",
+    state: "revoked",
+  };
+  const linkReads: string[] = [];
+  await page.route("**/api/operator/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/me"))
+      return route.fulfill({ json: { username: "operator" } });
+    if (path.endsWith("/link")) {
+      linkReads.push(path);
+      return route.fulfill({
+        json: {
+          private_url: `https://example.test/i/${path.split("/").at(-2)}#token=synthetic-token`,
+        },
+      });
+    }
+    return route.fulfill({
+      json: { invitations: [second, fixture, expired, revoked] },
+    });
+  });
+  await page.setViewportSize({ width: 320, height: 740 });
+  await page.goto("/operator");
+  await expect(
+    page.getByRole("button", {
+      name: "Copy invitation link for Alex",
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect(linkReads).toHaveLength(0);
+  await page.reload();
+  for (const item of [fixture, second]) {
+    await page
+      .getByRole("button", {
+        name: `Copy invitation link for ${item.customer_label}`,
+        exact: true,
+      })
+      .click();
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toContain(`/i/${item.id}#token=synthetic-token`);
+  }
+  expect(linkReads).toHaveLength(2);
+  await expect(
+    page.getByRole("button", {
+      name: /Copy invitation link for (Expired|Revoked)/,
+    }),
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      JSON.stringify({ ...localStorage, ...sessionStorage }),
+    ),
+  ).not.toContain("synthetic-token");
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(320);
+});
+
+test("invitation copy offers manual fallback and reports retrieval denial without stale URL", async ({
+  page,
+}) => {
+  let unavailable = false;
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: async () => {
+          throw new Error("clipboard denied");
+        },
+      },
+    });
+  });
+  await page.route("**/api/operator/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/me"))
+      return route.fulfill({ json: { username: "operator" } });
+    if (path.endsWith("/link"))
+      return route.fulfill(
+        unavailable
+          ? {
+              status: 410,
+              json: {
+                error: {
+                  code: "unavailable",
+                  message: "Invitation is unavailable.",
+                },
+              },
+            }
+          : {
+              json: {
+                private_url:
+                  "https://example.test/i/synthetic#token=private-synthetic",
+              },
+            },
+      );
+    return route.fulfill({ json: { invitations: [fixture] } });
+  });
+  await page.goto("/operator");
+  const copy = page.getByRole("button", {
+    name: "Copy invitation link for Alex",
+    exact: true,
+  });
+  await copy.click();
+  await expect(
+    page.getByLabel("Private invitation link for Alex", { exact: true }),
+  ).toHaveValue("https://example.test/i/synthetic#token=private-synthetic");
+  await expect(
+    page.getByText("Clipboard is unavailable.", { exact: false }),
+  ).toBeVisible();
+  unavailable = true;
+  await copy.click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Invitation is unavailable.",
+  );
+  await expect(
+    page.getByLabel("Private invitation link for Alex", { exact: true }),
   ).toHaveCount(0);
 });

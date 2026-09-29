@@ -90,8 +90,12 @@ test("relay readiness gates capture; controls use server revisions; Stop release
     expected_revision: 3,
     expected_progress_revision: 1,
   });
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
-  await expect(page.getByText("Stopped locally.")).toBeVisible();
+  await page
+    .getByRole("button", { name: "Pause interview", exact: true })
+    .click();
+  await expect(
+    page.getByText("Paused locally.", { exact: false }),
+  ).toBeVisible();
   expect(
     await page.evaluate(() =>
       (window as unknown as { tracks: MediaStreamTrack[] }).tracks.every(
@@ -139,7 +143,9 @@ test("Stop while relay is connecting prevents subsequent microphone capture", as
     .getByRole("button", { name: "Start interview", exact: true })
     .click();
   await expect.poll(() => Boolean(socket)).toBe(true);
-  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Pause interview", exact: true })
+    .click();
   socket!.send(
     JSON.stringify({
       type: "ready",
@@ -148,7 +154,9 @@ test("Stop while relay is connecting prevents subsequent microphone capture", as
       remaining_seconds: 350,
     }),
   );
-  await expect(page.getByText("Stopped locally.")).toBeVisible();
+  await expect(
+    page.getByText("Paused locally.", { exact: false }),
+  ).toBeVisible();
   expect(
     await page.evaluate(
       () => (window as unknown as { micCalls: number }).micCalls,

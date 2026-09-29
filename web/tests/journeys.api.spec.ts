@@ -102,7 +102,7 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
     ),
   ).toBe(1);
   await expect(
-    customerPage.getByRole("button", { name: "Stop", exact: true }),
+    customerPage.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
   await customerPage.getByRole("link", { name: "Back to sound check" }).click();
   await page.reload();
