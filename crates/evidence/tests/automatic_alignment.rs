@@ -158,7 +158,7 @@ fn preflight_rejects_loss_drops_and_partial_pause_but_allows_completed_pause() {
                 m.product_end_reason = Some("explicit_stop".into());
                 m.incomplete_turn_ids.push("b".into())
             }
-            _ => m.media.as_mut().unwrap().metadata_duration_delta_ms = 2000,
+            _ => m.media.as_mut().unwrap().decoded_duration_ms = 0,
         };
         assert!(preflight(&m).is_err());
     }
@@ -180,4 +180,34 @@ fn confirmation_is_atomic_and_rejects_wrong_clips_or_replaced_recordings() {
         assert!(m.automatic_alignment.is_empty());
         assert!(!m.approval_eligible);
     }
+}
+
+#[test]
+fn session_clock_offset_is_diagnostic_but_missing_words_or_audio_still_fail() {
+    let (mut m, transcript) = fixture();
+    m.duration_ms = 6200;
+    m.media.as_mut().unwrap().metadata_duration_delta_ms = -2200;
+    preflight(&m).unwrap();
+    let candidate_clips = clips(&m, &transcript);
+    confirm(&mut m, &transcript, &candidate_clips, chrono::Utc::now()).unwrap();
+    assert!(m.approval_eligible);
+    assert_eq!(m.media.as_ref().unwrap().metadata_duration_delta_ms, -2200);
+    assert!(source_proof(&m, &m.segments[0].source_id).is_some());
+    // A wall-clock offset cannot excuse missing original answer content.
+    let mut truncated = transcript.clone();
+    truncated.words.truncate(5);
+    truncated.text = "It helped, but not always.".into();
+    assert!(plan(&m, &truncated).is_err());
+    let mut wrong_file_duration = transcript.clone();
+    wrong_file_duration.audio_duration = 6.2;
+    assert!(plan(&m, &wrong_file_duration).is_err());
+    m.media
+        .as_mut()
+        .unwrap()
+        .customer_activity_groups_ms
+        .push([3500, 3900]);
+    assert!(plan(&m, &transcript).is_err());
+    m.dropped_chunks = Some(1);
+    assert!(preflight(&m).is_err());
+    assert!(source_proof(&m, &m.segments[0].source_id).is_none());
 }

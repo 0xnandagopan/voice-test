@@ -172,10 +172,7 @@ pub fn source_proof<'a>(
     source_id: &str,
 ) -> Option<&'a OperatorAlignmentProof> {
     let media = manifest.media.as_ref()?;
-    if manifest.dropped_chunks != Some(0)
-        || media.channels != 2
-        || media.metadata_duration_delta_ms.unsigned_abs() > 1500
-    {
+    if manifest.dropped_chunks != Some(0) || media.channels != 2 {
         return None;
     }
     let source = manifest
@@ -193,7 +190,8 @@ pub fn source_proof<'a>(
                 && p.source_text_sha256 == digest(source.text.as_bytes())
                 && p.source_range_ms[0] < p.source_range_ms[1]
                 && p.source_range_ms[1] <= media.decoded_duration_ms
-                && (p.method == "operator_whole_answer_listening_v1"
+                && ((p.method == "operator_whole_answer_listening_v1"
+                    && media.metadata_duration_delta_ms.unsigned_abs() <= 1500)
                     || (p.method == crate::automatic_alignment::METHOD
                         && p.verified_by.starts_with("assemblyai:")
                         && crate::automatic_alignment::preflight(manifest).is_ok()))

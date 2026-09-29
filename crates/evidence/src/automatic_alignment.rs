@@ -25,13 +25,17 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
         .ok_or(Error::Invalid("decoded recording required"))?;
     if manifest.dropped_chunks != Some(0)
         || media.channels != 2
-        || media.metadata_duration_delta_ms.unsigned_abs() > 1500
         || media.decoded_duration_ms == 0
         || media.decoded_duration_ms > 390_000
         || media.customer_activity_groups_ms.is_empty()
     {
         return Err(Error::Invalid("recording completeness unverified"));
     }
+    // Session wall-clock timestamps are not a documented sample-clock contract:
+    // https://www.assemblyai.com/docs/voice-agents/voice-agent-api/session-history
+    // Keep metadata_duration_delta_ms as diagnostic rather than treating an
+    // arbitrary tolerance as missing speech. plan() instead checks the independent
+    // transcript against the entire decoded customer WAV and every original word.
     let sources: Vec<_> = manifest
         .segments
         .iter()
