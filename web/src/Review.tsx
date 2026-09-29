@@ -436,7 +436,13 @@ function taskCopy(job: ProcessingJob) {
           ? "Your automatic recording check is queued. You can keep editing and saving your draft."
           : job.status === "running"
             ? "We are automatically checking that the saved transcript matches your recorded answers. You can keep editing and saving your draft."
-            : "Your recording could not be verified automatically. Your saved text is preserved, but approval needs the recording check to pass. Technical recovery is needed; this is not an operator review of your draft.",
+            : job.error_code === "alignment_transcript_mismatch"
+              ? "The saved transcript and the recording check do not fully agree. Your text is saved, but we cannot confirm its recorded support yet. Review the available recording; the transcript needs recovery before approval."
+              : job.error_code === "alignment_recording_incomplete"
+                ? "We could not confirm a complete recording. Your text is saved, but approval is unavailable until recording recovery succeeds."
+                : job.error_code === "alignment_ranges_uncertain"
+                  ? "We could not reliably match the recorded answers to playable clips. Your text is saved; approval is unavailable until recording recovery succeeds."
+                  : "Your recording could not be verified automatically. Your saved text is preserved, but approval needs the recording check to pass. Technical recovery is needed; this is not an operator review of your draft.",
     };
   }
   const support = job.kind === "support_check";

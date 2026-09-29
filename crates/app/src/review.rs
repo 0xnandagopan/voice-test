@@ -103,11 +103,12 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
     let jobs = sqlx::query(r#"
         SELECT DISTINCT ON (kind, task_scope) id,kind,status,last_error
         FROM (
-            SELECT j.*, CASE WHEN j.kind='import_evidence' THEN j.payload->>'provider_attempt_id' ELSE j.kind END AS task_scope
+            SELECT j.*, CASE WHEN j.kind IN ('import_evidence','align_evidence') THEN j.payload->>'provider_attempt_id' ELSE j.kind END AS task_scope
             FROM jobs j WHERE j.interview_id=$1 AND j.status<>'cancelled' AND (
                 (j.kind IN ('generate_draft','support_check')
                     AND j.payload->'content_revision'=$2 AND j.payload->'evidence_revision'=$3
                     AND j.payload->>'content_hash'=$4)
+                OR (j.kind='align_evidence' AND EXISTS (SELECT 1 FROM evidence_imports e WHERE e.interview_id=j.interview_id AND e.provider_attempt_id::text=j.payload->>'provider_attempt_id' AND e.manifest->>'approval_eligible'='false'))
                 OR (j.kind='import_evidence' AND EXISTS (
                     SELECT 1 FROM provider_attempts p WHERE p.interview_id=j.interview_id
                         AND p.id::text=j.payload->>'provider_attempt_id'
@@ -119,7 +120,7 @@ async fn evidence(s: AppState, id: Uuid, h: HeaderMap, op: bool) -> Result<Json<
         .fetch_all(&s.pool).await?.into_iter().map(|r| {
             let kind: String = r.get("kind");
             let status: String = r.get("status");
-            let can_retry = status == "failed" && (kind == "import_evidence" || (before.approval.is_none() && !before.declined));
+            let can_retry = kind != "align_evidence" && status == "failed" && (kind == "import_evidence" || (before.approval.is_none() && !before.declined));
             json!({"id":r.get::<Uuid,_>("id"),"kind":kind,"status":status,"error_code":r.get::<Option<String>,_>("last_error"),"can_retry":can_retry})
         }).collect::<Vec<_>>();
     let assessment:Option<Value> = sqlx::query_scalar("SELECT result || jsonb_build_object('content_revision',content_revision,'evidence_revision',evidence_revision) FROM workflow_support_results WHERE interview_id=$1 AND content_revision=$2 AND evidence_revision=$3 AND result->'assessment' IS NOT NULL AND result->'assessment'<>'null'::jsonb")

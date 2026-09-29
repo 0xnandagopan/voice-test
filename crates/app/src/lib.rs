@@ -1,3 +1,4 @@
+pub mod alignment_jobs;
 pub mod auth;
 pub mod clips;
 pub mod composition_jobs;

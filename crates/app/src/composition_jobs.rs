@@ -6,7 +6,8 @@ use v0_domain::workflow::{CheckStatus, SupportResult};
 use v0_evidence::jobs::Job;
 
 /// Add entries only with a recorded passing G3 evaluation for this exact pair.
-const VALIDATED_MODEL_PROMPTS: &[(&str, &str)] = &[];
+// 2026-09-29: all nine fixed live G3 cases passed (eight synthetic HTTP requests).
+const VALIDATED_MODEL_PROMPTS: &[(&str, &str)] = &[("gpt-6-luna", "grounded-composition-v6")];
 pub async fn dispatch(pool: &PgPool, job: &Job, client: &GatewayClient) -> Result<(), JobFailure> {
     let (state, sources) = workflow::composition_input(pool, job.interview_id, job.id, job.token)
         .await

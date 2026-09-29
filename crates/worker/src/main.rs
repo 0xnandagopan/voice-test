@@ -1,5 +1,6 @@
 mod agent_cleanup;
 use std::{env, time::Duration};
+use v0_app::alignment_jobs;
 use v0_app::composition_jobs::{self, JobFailure};
 use v0_composition::GatewayClient;
 use v0_evidence::{Error, jobs, provider::AssemblyHistory, storage::LocalPrivateStorage};
@@ -50,11 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into()),
         env::var("EVIDENCE_WORK_DIR").unwrap_or_else(|_| ".local/evidence-jobs".into()),
     );
+    let transcriber = v0_evidence::stt::AssemblyAiTranscriber::new(key.clone())?;
     let gateway = env::var("GATEWAY_MODEL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .and_then(|model| GatewayClient::new(key.clone(), model).ok());
     loop {
+        alignment_jobs::enqueue_missing(&pool).await?;
         let claimed = jobs::claim(&pool).await?;
         v0_app::workflow::reconcile_failed_support(&pool)
             .await
@@ -62,6 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(job) = claimed {
             let run = async {
                 match job.kind.as_str() {
+                    "align_evidence" | "delete_alignment_transcript" => {
+                        alignment_jobs::dispatch(&pool, &job, &transcriber, &storage, &validator)
+                            .await
+                    }
                     "generate_draft" | "support_check" => match gateway.as_ref() {
                         Some(client) => composition_jobs::dispatch(&pool, &job, client).await,
                         None => Err(JobFailure {

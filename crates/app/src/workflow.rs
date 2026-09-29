@@ -108,13 +108,15 @@ async fn evidence(tx: &mut Tx<'_>, id: Uuid, state: &mut WorkflowView) -> Result
             if let Some(id) = source["source_id"].as_str().filter(|s| !s.is_empty()) {
                 source_ids.push(id.to_owned());
             }
-            let verified_range = manifest["operator_alignment"]
-                .as_array()
-                .and_then(|proofs| {
-                    proofs
-                        .iter()
-                        .find(|p| p["source_id"] == source["source_id"])
-                        .and_then(|p| p["source_range_ms"].as_array())
+            let verified_range = ["operator_alignment", "automatic_alignment"]
+                .iter()
+                .find_map(|field| {
+                    manifest[*field].as_array().and_then(|proofs| {
+                        proofs
+                            .iter()
+                            .find(|p| p["source_id"] == source["source_id"])
+                            .and_then(|p| p["source_range_ms"].as_array())
+                    })
                 });
             if let (Some(id), Some(range)) = (
                 source["source_id"].as_str(),
@@ -865,4 +867,82 @@ pub(crate) async fn attach_verified_clip(
     current_access(&mut tx, id).await?;
     tx.commit().await?;
     Ok(state)
+}
+
+pub(crate) struct AlignedClip {
+    pub id: Uuid,
+    pub source_id: String,
+    pub sha256: String,
+    pub object_key: String,
+}
+/// Only the current leased alignment job may attach independently checked media.
+/// Content edits during transcription are preserved and checked at their newest revision.
+pub(crate) async fn complete_alignment(
+    pool: &PgPool,
+    job: &v0_evidence::jobs::Job,
+    attempt: Uuid,
+    original: &Value,
+    updated: Value,
+    clips: &[AlignedClip],
+) -> Result<(), ApiError> {
+    let id = job.interview_id;
+    let mut tx = lock(pool, id).await?;
+    let mut state = load(&mut tx, id).await?;
+    evidence(&mut tx, id, &mut state).await?;
+    let payload:Value=sqlx::query_scalar("SELECT payload FROM jobs WHERE id=$1 AND interview_id=$2 AND kind='align_evidence' AND lease_token=$3 AND status='running' AND lease_until>clock_timestamp() FOR UPDATE")
+        .bind(job.id).bind(id).bind(job.token).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::conflict)?;
+    if payload["provider_attempt_id"] != json!(attempt)
+        || payload["recording_sha256"] != original["recording_sha256"]
+    {
+        return Err(ApiError::conflict());
+    }
+    let parsed: v0_evidence::manifest::Manifest =
+        serde_json::from_value(updated.clone()).map_err(|_| ApiError::conflict())?;
+    if !parsed.approval_eligible || clips.is_empty() || clips.len() > 64 {
+        return Err(ApiError::conflict());
+    }
+    for clip in clips {
+        let proof = v0_evidence::alignment::source_proof(&parsed, &clip.source_id)
+            .ok_or_else(ApiError::conflict)?;
+        if proof.clip_sha256 != clip.sha256 {
+            return Err(ApiError::conflict());
+        }
+    }
+    if sqlx::query("UPDATE evidence_imports SET manifest=$4 WHERE interview_id=$1 AND provider_attempt_id=$2 AND manifest=$3")
+        .bind(id).bind(attempt).bind(original).bind(updated).execute(&mut *tx).await?.rows_affected()!=1{return Err(ApiError::conflict());}
+    evidence(&mut tx, id, &mut state).await?;
+    // Whole-interview revisions include other attempts. Carry forward only clips
+    // still bound to their original recorded-source proof, never arbitrary IDs.
+    let manifests: Vec<Value> =
+        sqlx::query_scalar("SELECT manifest FROM evidence_imports WHERE interview_id=$1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for manifest in manifests {
+        let parsed: v0_evidence::manifest::Manifest =
+            serde_json::from_value(manifest).map_err(|_| ApiError::conflict())?;
+        for segment in &parsed.segments {
+            if let Some(proof) = v0_evidence::alignment::source_proof(&parsed, &segment.source_id) {
+                sqlx::query("UPDATE workflow_clips SET evidence_revision=$4 WHERE interview_id=$1 AND source_id=$2 AND sha256=$3 AND ready")
+                    .bind(id).bind(&proof.source_id).bind(&proof.clip_sha256).bind(state.revisions.evidence).execute(&mut *tx).await?;
+            }
+        }
+    }
+    for clip in clips {
+        sqlx::query("UPDATE workflow_clips SET ready=false WHERE interview_id=$1 AND source_id=$2")
+            .bind(id)
+            .bind(&clip.source_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO workflow_clips(id,interview_id,evidence_revision,sha256,source_id,object_key,ready) VALUES($1,$2,$3,$4,$5,$6,true)")
+            .bind(clip.id).bind(id).bind(state.revisions.evidence).bind(&clip.sha256).bind(&clip.source_id).bind(&clip.object_key).execute(&mut *tx).await?;
+    }
+    current_access(&mut tx, id).await?;
+    let changed=sqlx::query("UPDATE jobs SET status='succeeded',last_error=NULL,lease_token=NULL,lease_until=NULL,payload=payload-'upload_url' WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp() AND status='running'").bind(job.id).bind(job.token).execute(&mut *tx).await?.rows_affected();
+    if changed != 1 {
+        return Err(ApiError::conflict());
+    }
+    sqlx::query("INSERT INTO audit_events(interview_id,event) VALUES($1,'recording_automatically_verified')").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
 }

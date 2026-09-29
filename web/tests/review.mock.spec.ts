@@ -891,6 +891,35 @@ test("recording validation reports queued, failed and absent work without promis
   await expect(
     page.getByRole("checkbox", { name: /I approve this exact/ }),
   ).toBeDisabled();
+  for (const [error_code, explanation] of [
+    [
+      "alignment_transcript_mismatch",
+      "The saved transcript and the recording check do not fully agree",
+    ],
+    [
+      "alignment_recording_incomplete",
+      "We could not confirm a complete recording",
+    ],
+    [
+      "alignment_ranges_uncertain",
+      "We could not reliably match the recorded answers",
+    ],
+  ]) {
+    fixture.setJobs([
+      {
+        id: "alignment",
+        kind: "align_evidence",
+        status: "failed",
+        error_code,
+        can_retry: false,
+      },
+    ]);
+    await page.getByRole("button", { name: "Refresh saved status" }).click();
+    await expect(recording).toContainText(explanation);
+    await expect(
+      page.getByRole("checkbox", { name: /I approve this exact/ }),
+    ).toBeDisabled();
+  }
   fixture.setJobs([]);
   await page.getByRole("button", { name: "Refresh saved status" }).click();
   await expect(recording).toHaveCount(0);
