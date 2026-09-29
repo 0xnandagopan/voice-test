@@ -187,9 +187,18 @@ async fn actor(tx: &mut Tx<'_>, id: Uuid, token: &str) -> Result<String, ApiErro
     Ok(role)
 }
 async fn eligible(tx: &mut Tx<'_>, id: Uuid, state: &WorkflowView) -> Result<(), ApiError> {
-    if !state.evidence_available || state.check != CheckStatus::Supported || state.declined {
+    if !state.evidence_available || !state.check.allows_customer_approval() || state.declined {
         return Err(ApiError::invalid(
-            "Current evidence and complete support checks are required.",
+            "The recording and automatic draft comparison must be ready before approval.",
+        ));
+    }
+    // Semantic differences are advisory. An explicit model validation failure
+    // remains a separate technical condition, not a negative content verdict.
+    let service_unvalidated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workflow_support_results WHERE interview_id=$1 AND content_revision=$2 AND evidence_revision=$3 AND result->'assessment'->'quality_gate_passed'='false'::jsonb)")
+        .bind(id).bind(state.revisions.content).bind(state.revisions.evidence).fetch_one(&mut **tx).await?;
+    if service_unvalidated {
+        return Err(ApiError::invalid(
+            "The draft comparison service needs validation before approval is available.",
         ));
     }
     let content = state
@@ -292,6 +301,13 @@ pub async fn execute(
             if state.approval.is_some() {
                 changed = false;
             } else {
+                if matches!(
+                    state.check,
+                    CheckStatus::Unsupported | CheckStatus::Ambiguous
+                ) {
+                    sqlx::query("INSERT INTO audit_events(interview_id,event) VALUES($1,'customer_approved_with_interview_difference_notes')")
+                        .bind(id).execute(&mut *tx).await?;
+                }
                 state.approval = Some(ApprovalSnapshot {
                     id: Uuid::new_v4(),
                     content_revision: state.revisions.content,
@@ -420,17 +436,17 @@ pub async fn complete_support_assessed(
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-    if result.status == CheckStatus::Supported
-        && (!state.evidence_available
-            || !result.all_substantive_claims_checked
-            || result.source_ids.is_empty()
-            || result
-                .source_ids
-                .iter()
-                .any(|id| !sources.as_array().is_some_and(|a| a.contains(&json!(id)))))
+    if !result.status.allows_customer_approval()
+        || !result.all_substantive_claims_checked
+        || result
+            .source_ids
+            .iter()
+            .any(|id| !sources.as_array().is_some_and(|a| a.contains(&json!(id))))
+        || (result.status == CheckStatus::Supported
+            && (!state.evidence_available || result.source_ids.is_empty()))
     {
         return Err(ApiError::invalid(
-            "Support checks require complete coverage and existing source IDs.",
+            "Draft comparisons require complete coverage and valid source references.",
         ));
     }
     invalidate(&mut state);

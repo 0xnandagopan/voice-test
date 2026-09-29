@@ -26,6 +26,13 @@ pub enum CheckStatus {
     Ambiguous,
     Failed,
 }
+impl CheckStatus {
+    /// Completed comparison results inform the customer's decision; differences
+    /// are advisory. Pending/failed processing has not produced usable notes.
+    pub fn allows_customer_approval(&self) -> bool {
+        matches!(self, Self::Supported | Self::Unsupported | Self::Ambiguous)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Revisions {

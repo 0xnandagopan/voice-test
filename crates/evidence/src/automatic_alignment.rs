@@ -174,10 +174,7 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
                 && sources.iter().all(|s| {
                     s.turn_status == "completed"
                         && !manifest.incomplete_turn_ids.contains(&s.turn_id)
-                }) =>
-        {
-            ()
-        }
+                }) => {}
         _ => return Err(Error::Invalid("recording completion unresolved")),
     }
     Ok(())
