@@ -20,6 +20,31 @@ use tokio::{
 const ENDPOINT: &str = "https://llm-gateway.assemblyai.com/v1/chat/completions";
 const MAX_RESPONSE_BYTES: usize = 128 * 1024;
 
+#[derive(Clone, Copy, Default)]
+struct ModelCapabilities {
+    temperature: bool,
+    json_schema: bool,
+}
+
+fn model_capabilities(model: &str) -> ModelCapabilities {
+    // Exact IDs verified against AssemblyAI's available-models documentation:
+    // https://www.assemblyai.com/docs/llm-gateway/available-models (2026-09-29).
+    // Optional parameters are opt-in: a new model must not inherit another
+    // model's request options. This does not grant model quality acceptance.
+    match model {
+        "gemini-2.5-flash-lite" => ModelCapabilities {
+            temperature: true,
+            json_schema: true,
+        },
+        "gpt-oss-20b" => ModelCapabilities {
+            temperature: true,
+            json_schema: false,
+        },
+        "gpt-6-luna" | "gpt-6-sol" | "gpt-6-astra" => ModelCapabilities::default(),
+        _ => ModelCapabilities::default(),
+    }
+}
+
 /// Deliberately excludes URLs, provider bodies, credentials and testimonial text.
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -250,13 +275,17 @@ impl GatewayClient {
         schema: Value,
         input: Value,
     ) -> Result<T, GatewayError> {
-        // This exact model's native JSON Schema mode is documented by AssemblyAI.
-        // Other configured models keep the explicit schema in the prompt; they must
-        // pass their own quality gate. Never switch models or repair returned JSON.
-        let mut body = json!({"model":self.model,"max_tokens":3000,"temperature":0,
+        // Every model retains the explicit schema in its prompt and strict local
+        // validation, whether or not its API offers native schema constraints.
+        // Never switch models, retry with different options, or repair JSON.
+        let capabilities = model_capabilities(&self.model);
+        let mut body = json!({"model":self.model,"max_tokens":3000,
             "messages":[{"role":"system","content":format!("{COMMON_PROMPT}\n{task_prompt}\nRequired JSON Schema: {schema}")},
             {"role":"user","content":input.to_string()}]});
-        if self.model == "gemini-2.5-flash-lite" {
+        if capabilities.temperature {
+            body["temperature"] = json!(0);
+        }
+        if capabilities.json_schema {
             body["response_format"] = json!({"type":"json_schema", "json_schema": {
                 "name":schema_name, "strict":true, "schema":schema
             }});

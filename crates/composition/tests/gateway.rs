@@ -41,6 +41,15 @@ async fn mock(
     delay: Duration,
     deadline: Duration,
 ) -> (GatewayClient, Arc<Mock>, tokio::task::JoinHandle<()>) {
+    mock_model(replies, delay, deadline, "gemini-2.5-flash-lite").await
+}
+
+async fn mock_model(
+    replies: Vec<Reply>,
+    delay: Duration,
+    deadline: Duration,
+    model: &str,
+) -> (GatewayClient, Arc<Mock>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(Mock {
         replies: Mutex::new(replies.into()),
         calls: AtomicUsize::new(0),
@@ -56,10 +65,62 @@ async fn mock(
     let client = GatewayClient::for_local_test_with_model(
         &format!("http://{addr}/chat/completions"),
         deadline,
-        "gemini-2.5-flash-lite",
+        model,
     )
     .unwrap();
     (client, state, server)
+}
+
+#[tokio::test]
+async fn model_request_options_follow_explicit_capabilities_without_changing_model() {
+    for (model, temperature, schema) in [
+        ("gemini-2.5-flash-lite", true, true),
+        ("gpt-oss-20b", true, false),
+        ("gpt-6-luna", false, false),
+        ("gpt-6-sol", false, false),
+        ("gpt-6-astra", false, false),
+        ("future-unverified-model", false, false),
+    ] {
+        let (client, state, server) = mock_model(
+            vec![envelope(draft())],
+            Duration::ZERO,
+            Duration::from_secs(2),
+            model,
+        )
+        .await;
+        assert!(client.generate(&sources()).await.is_ok());
+        let inputs = state.input.lock().await;
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["model"], model);
+        assert_eq!(inputs[0].get("temperature").is_some(), temperature);
+        assert_eq!(inputs[0].get("response_format").is_some(), schema);
+        assert!(
+            inputs[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Required JSON Schema:")
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn prompt_only_model_retains_strict_local_source_validation() {
+    let mut forged = draft();
+    forged["claims"][0]["sources"][0]["source_id"] = json!("unknown-source");
+    let (client, state, server) = mock_model(
+        vec![envelope(forged)],
+        Duration::ZERO,
+        Duration::from_secs(2),
+        "gpt-6-luna",
+    )
+    .await;
+    assert!(matches!(
+        client.generate(&sources()).await,
+        Err(GatewayError::InvalidOutput)
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 fn envelope(value: Value) -> Reply {
