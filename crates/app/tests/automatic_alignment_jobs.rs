@@ -11,9 +11,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 use uuid::Uuid;
-use v0_app::{alignment_jobs, auth::hash_secret, workflow};
+use v0_app::{alignment_jobs, auth::hash_secret, composition_jobs, workflow};
+use v0_composition::GatewayClient;
 use v0_domain::workflow::{CheckStatus, Content, WorkflowAction, WorkflowCommand};
 use v0_evidence::{
     jobs::Job,
@@ -287,33 +289,166 @@ async fn pending_poll_resumes_once_and_checks_current_customer_edit_then_cleans_
 
 #[tokio::test]
 #[ignore = "requires isolated TEST_DATABASE_URL and FFMPEG_PATH/FFPROBE_PATH"]
-async fn mismatched_transcript_never_attaches_clips_and_retains_cleanup() {
+async fn recorded_transcript_replaces_provisional_words_and_customer_can_approve_without_listening()
+{
     let f = Fixture::new().await;
     let mock = Mock::new().await;
     mock.calls.completed.store(true, Ordering::SeqCst);
     mock.calls.mismatch.store(true, Ordering::SeqCst);
-    let failure = f
-        .dispatch(&f.lease("align_evidence").await, &mock)
+    f.dispatch(&f.lease("align_evidence").await, &mock)
         .await
-        .unwrap_err();
-    assert_eq!(failure, "alignment_transcript_mismatch");
-    assert_eq!(f.count("SELECT count(*) FROM workflow_clips").await, 0);
+        .unwrap();
     assert_eq!(
-        f.count("SELECT count(*) FROM jobs WHERE kind='delete_alignment_transcript'")
+        f.count("SELECT count(*) FROM workflow_clips WHERE ready")
             .await,
         1
     );
-    assert!(
-        !workflow::inspect(&f.pool, &f.customer, f.id)
-            .await
-            .unwrap()
-            .evidence_available
+    let manifest: Value = sqlx::query_scalar("SELECT manifest FROM evidence_imports")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    // Preserve live-caption provenance, but it does not control saved-recording support.
+    assert_eq!(manifest["segments"][0]["text"], "Synthetic answer only.");
+    assert_eq!(
+        manifest["recorded_transcript"]["segments"][0]["text"],
+        "Different answer only."
     );
-    sqlx::query("UPDATE jobs SET status='failed',lease_token=NULL,lease_until=NULL WHERE kind='align_evidence'").execute(&f.pool).await.unwrap();
+    assert_eq!(
+        manifest["recorded_transcript"]["recording_sha256"],
+        manifest["recording_sha256"]
+    );
+    let recorded_source = manifest["recorded_transcript"]["segments"][0]["source_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(recorded_source.ends_with("/recorded/synthetic-transcript/customer"));
+    assert!(
+        manifest["operator_alignment"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    f.save("Different answer only.").await;
+    let state = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    assert!(state.evidence_available);
+    assert_eq!(state.check, CheckStatus::Pending);
+    // The request-body assertion is the regression: original live words must never
+    // be used by the support checker once saved-recording transcription exists.
+    check_saved_text(&f, &recorded_source, "Different answer only.", true).await;
+    let checked = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    assert_eq!(checked.check, CheckStatus::Supported);
+    assert!(checked.approval.is_none());
+    let approved = workflow::execute(
+        &f.pool,
+        &f.customer,
+        WorkflowCommand {
+            interview_id: f.id,
+            request_id: Uuid::new_v4(),
+            expected: checked.revisions,
+            action: WorkflowAction::Approve,
+        },
+    )
+    .await
+    .unwrap()
+    .state;
+    assert!(approved.approval.is_some());
+    assert!(approved.content.as_ref().unwrap().clips.is_empty());
+    assert!(approved.published_approval_id.is_none());
+    assert_eq!(
+        f.count("SELECT count(*) FROM sessions WHERE role='operator'")
+            .await,
+        0
+    );
+
+    // Editing remains direct; a genuinely unsupported new claim still cannot be approved.
+    f.save("The agency doubled our revenue.").await;
+    let edited = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    assert!(edited.approval.is_none());
+    assert_eq!(edited.check, CheckStatus::Pending);
+    check_saved_text(
+        &f,
+        &recorded_source,
+        "The agency doubled our revenue.",
+        false,
+    )
+    .await;
+    let unsupported = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    assert_eq!(unsupported.check, CheckStatus::Unsupported);
+    assert_eq!(
+        unsupported.content.as_ref().unwrap().text,
+        "The agency doubled our revenue."
+    );
+    assert!(
+        workflow::execute(
+            &f.pool,
+            &f.customer,
+            WorkflowCommand {
+                interview_id: f.id,
+                request_id: Uuid::new_v4(),
+                expected: unsupported.revisions,
+                action: WorkflowAction::Approve,
+            }
+        )
+        .await
+        .is_err()
+    );
     f.dispatch(&f.lease("delete_alignment_transcript").await, &mock)
         .await
         .unwrap();
+    assert_eq!(mock.calls.deletes.load(Ordering::SeqCst), 1);
     f.close().await;
+}
+
+async fn check_saved_text(f: &Fixture, source: &str, candidate: &str, supported: bool) {
+    let state = workflow::inspect(&f.pool, &f.customer, f.id).await.unwrap();
+    let token = Uuid::new_v4();
+    let row = sqlx::query("UPDATE jobs SET status='running',attempts=attempts+1,lease_token=$2,lease_until=clock_timestamp()+interval '120 seconds' WHERE interview_id=$1 AND kind='support_check' AND status='queued' AND (payload->>'content_revision')::bigint=$3 AND (payload->>'evidence_revision')::bigint=$4 RETURNING id,kind,payload")
+        .bind(f.id).bind(token).bind(state.revisions.content).bind(state.revisions.evidence)
+        .fetch_one(&f.pool).await.unwrap();
+    let job = Job {
+        id: row.get("id"),
+        interview_id: f.id,
+        kind: row.get("kind"),
+        payload: row.get("payload"),
+        token,
+    };
+    let candidate = candidate.to_owned();
+    let source = source.to_owned();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let app = Router::new().route("/chat/completions", post(move |Json(body): Json<Value>| {
+        let candidate = candidate.clone(); let source = source.clone(); let calls = calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(body["model"], "gpt-6-luna");
+            let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(input["candidate"], candidate);
+            assert_eq!(input["sources"], json!([{"id": source, "text": "Different answer only."}]));
+            let result = json!({"claims":[{
+                "text": candidate, "verdict": if supported {"supported"} else {"unsupported"},
+                "sources": if supported {json!([{"source_id":source,"quote":"Different answer only."}])} else {json!([])},
+                "issues": if supported {json!([])} else {json!(["The recording contains no revenue claim."])}
+            }],"issues":[]});
+            Json(json!({"choices":[{"finish_reason":"stop","message":{"content":result.to_string()}}]}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = GatewayClient::for_local_test_with_model(
+        &format!("http://{addr}/chat/completions"),
+        Duration::from_secs(2),
+        "gpt-6-luna",
+    )
+    .unwrap();
+    assert_eq!(v0_composition::PROMPT_VERSION, "grounded-composition-v6");
+    composition_jobs::dispatch(&f.pool, &job, &client)
+        .await
+        .map_err(|e| e.code)
+        .unwrap();
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[tokio::test]
