@@ -47,6 +47,18 @@ pub struct Segment {
     pub source_range_ms: Option<[u64; 2]>,
     pub alignment: String,
 }
+/// A separate transcript of the decoded customer recording, never a rewrite of
+/// the provider timeline. A whole-track source avoids claiming word/answer timing
+/// precision that the two independent provider clocks cannot establish.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordedSourceTranscript {
+    pub recording_sha256: String,
+    pub transcript_id: String,
+    pub model: String,
+    pub transcript_sha256: String,
+    pub segments: Vec<Segment>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -65,6 +77,8 @@ pub struct Manifest {
     pub dropped_chunks: Option<u64>,
     pub uploaded_chunks: Option<u64>,
     pub segments: Vec<Segment>,
+    #[serde(default)]
+    pub recorded_transcript: Option<RecordedSourceTranscript>,
     pub incomplete_turn_ids: Vec<String>,
     pub recording_validation: String,
     pub approval_eligible: bool,
@@ -74,6 +88,15 @@ pub struct Manifest {
     pub automatic_alignment: Vec<crate::alignment::OperatorAlignmentProof>,
     #[serde(default)]
     pub media: Option<crate::media::MediaReport>,
+}
+
+impl Manifest {
+    pub fn support_segments(&self) -> &[Segment] {
+        self.recorded_transcript
+            .as_ref()
+            .map(|r| r.segments.as_slice())
+            .unwrap_or(&self.segments)
+    }
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -176,6 +199,7 @@ pub fn build(
         dropped_chunks: meta.dropped_chunks,
         uploaded_chunks: meta.uploaded_chunks,
         segments,
+        recorded_transcript: None,
         incomplete_turn_ids: incomplete,
         // Header + metadata validation is deliberately not decoded-media validation.
         recording_validation: "header_and_metadata_only".into(),

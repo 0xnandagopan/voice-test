@@ -90,7 +90,7 @@ impl FfmpegValidator {
             return Err(Error::Invalid("source recording hash mismatch"));
         }
         let segment = manifest
-            .segments
+            .support_segments()
             .iter()
             .find(|s| s.source_id == source_id && s.speaker == "customer")
             .ok_or(Error::Invalid("customer source identity"))?;
@@ -117,7 +117,7 @@ impl FfmpegValidator {
             return Err(Error::Invalid("source recording hash mismatch"));
         }
         if !manifest
-            .segments
+            .support_segments()
             .iter()
             .any(|s| s.source_id == source_id && s.speaker == "customer" && s.channel == 0)
         {
@@ -272,7 +272,7 @@ pub fn check_pcm(pcm: &[u8], manifest: &Manifest) -> MediaReport {
     let duration = (frames * 1000 / SAMPLE_RATE) as u64;
     let activity = customer_activity_groups(pcm);
     let ranges = manifest
-        .segments
+        .support_segments()
         .iter()
         .map(|segment| {
             let Some([start, end]) = segment.source_range_ms else {

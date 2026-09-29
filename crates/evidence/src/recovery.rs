@@ -51,12 +51,16 @@ pub fn reconstruct(
     let mut recorded = vec![];
     let mut unresolved = vec![];
     let last_customer = manifest
-        .segments
+        .support_segments()
         .iter()
         .rev()
         .find(|s| s.speaker == "customer")
         .map(|s| s.source_id.as_str());
-    for segment in manifest.segments.iter().filter(|s| s.speaker == "customer") {
+    for segment in manifest
+        .support_segments()
+        .iter()
+        .filter(|s| s.speaker == "customer")
+    {
         let check = manifest.media.as_ref().and_then(|media| {
             media
                 .ranges
@@ -87,7 +91,13 @@ pub fn reconstruct(
                 .map(|p| p.source_range_ms)
                 .or_else(|| check.and_then(|c| c.candidate_source_range_ms)),
             needs_alignment_review: verified.is_none(),
-            status: if verified.is_some_and(|p| p.method == crate::automatic_alignment::METHOD) {
+            status: if verified.is_some_and(|p| {
+                matches!(
+                    p.method.as_str(),
+                    crate::automatic_alignment::METHOD
+                        | crate::automatic_alignment::RECORDED_METHOD
+                )
+            }) {
                 "recorded_utterance_automatically_verified"
             } else if verified.is_some() {
                 "recorded_utterance_operator_verified"
@@ -105,9 +115,13 @@ pub fn reconstruct(
                 "recording_unverified"
             }
             .into(),
-            completion_basis: if verified
-                .is_some_and(|p| p.method == crate::automatic_alignment::METHOD)
-            {
+            completion_basis: if verified.is_some_and(|p| {
+                matches!(
+                    p.method.as_str(),
+                    crate::automatic_alignment::METHOD
+                        | crate::automatic_alignment::RECORDED_METHOD
+                )
+            }) {
                 "independent_customer_stt"
             } else if verified.is_some() {
                 "operator_whole_answer_listening"
@@ -206,7 +220,7 @@ pub async fn recover_interview(pool: &PgPool, interview: Uuid) -> Result<Recover
                             .iter()
                             .filter(|group| {
                                 !manifest
-                                    .segments
+                                    .support_segments()
                                     .iter()
                                     .filter(|s| s.speaker == "customer")
                                     .any(|segment| {

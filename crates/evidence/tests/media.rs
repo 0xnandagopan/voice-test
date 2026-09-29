@@ -268,3 +268,81 @@ async fn verified_clip_requires_listening_proof_and_extracts_only_customer_chann
     assert!(validator.verified_clip(&audio, &m, &id).await.is_err());
     tokio::fs::remove_dir_all(dir).await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires FFMPEG_PATH and FFPROBE_PATH; synthetic media plumbing only"]
+async fn recorded_source_uses_full_real_customer_wav_without_operator_confirmation() {
+    use v0_evidence::{
+        automatic_alignment,
+        stt::{RecordedTranscript, RecordedWord},
+    };
+    let (ffmpeg, ffprobe) = tools();
+    let dir = std::env::temp_dir().join(format!("v0-recorded-source-{}", Uuid::new_v4()));
+    tokio::fs::create_dir(&dir).await.unwrap();
+    let source = dir.join("source.ogg");
+    assert!(
+        tokio::process::Command::new(&ffmpeg)
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "aevalsrc=0.25*sin(2*PI*440*t)|0:s=24000:d=1",
+                "-c:a",
+                "libopus"
+            ])
+            .arg(&source)
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let audio = tokio::fs::read(source).await.unwrap();
+    let mut m = fixture(&audio);
+    m.product_end_reason = Some("explicit_finish".into());
+    let validator = FfmpegValidator::new(ffmpeg, ffprobe, dir.join("work"));
+    m.media = Some(validator.validate(&audio, &m).await.unwrap());
+    let transcript = RecordedTranscript {
+        id: "synthetic-asr-fixture".into(),
+        text: "Recorded source".into(),
+        audio_duration: 1.0,
+        words: vec![
+            RecordedWord {
+                text: "Recorded".into(),
+                start: 100,
+                end: 400,
+                confidence: 0.9,
+            },
+            RecordedWord {
+                text: "source".into(),
+                start: 350,
+                end: 900,
+                confidence: 0.9,
+            },
+        ],
+    };
+    let original = serde_json::to_value(&m.segments).unwrap();
+    automatic_alignment::prepare_recorded_sources(&mut m, &transcript).unwrap();
+    let plan = automatic_alignment::plan(&m, &transcript).unwrap();
+    let clip = validator
+        .preview_range(&audio, &m, &plan[0].source_id, plan[0].source_range_ms)
+        .await
+        .unwrap();
+    assert_eq!(clip.wav, validator.customer_wav(&audio, &m).await.unwrap());
+    automatic_alignment::confirm(&mut m, &transcript, &[clip], chrono::Utc::now()).unwrap();
+    let verified = validator
+        .verified_clip(&audio, &m, &plan[0].source_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        u16::from_le_bytes(verified.wav[22..24].try_into().unwrap()),
+        1
+    );
+    assert_eq!(verified.wav.len(), 48044);
+    assert_eq!(serde_json::to_value(&m.segments).unwrap(), original);
+    assert!(m.operator_alignment.is_empty());
+    tokio::fs::remove_dir_all(dir).await.unwrap();
+}

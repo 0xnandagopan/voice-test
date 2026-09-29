@@ -1,10 +1,10 @@
-//! Independent customer-channel transcription verifies the original timeline.
-//! This is exact token agreement, not fuzzy semantic matching or model approval.
-//! Original source text, ranges and turn identities are never rewritten.
+//! Recorded STT supplies a distinct recording-backed source for drafting.
+//! The original live timeline stays immutable and is not an ASR correctness gate.
+//! Legacy v1 proof verification remains supported for previously imported sources.
 use crate::{
     Error, Result,
     alignment::OperatorAlignmentProof,
-    manifest::{Manifest, digest},
+    manifest::{Manifest, RecordedSourceTranscript, Segment, digest},
     media::CandidateClip,
     stt::RecordedTranscript,
 };
@@ -12,6 +12,118 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const METHOD: &str = "assemblyai_independent_customer_stt_v1";
+pub const RECORDED_METHOD: &str = "assemblyai_recorded_customer_stt_v2";
+
+/// Prepare an independently transcribed full customer track. The original
+/// provider timeline remains private provenance, not the final support text.
+pub fn prepare_recorded_sources(
+    manifest: &mut Manifest,
+    transcript: &RecordedTranscript,
+) -> Result<()> {
+    preflight(manifest)?;
+    validate_recorded_transcript(manifest, transcript)?;
+    if !manifest.operator_alignment.is_empty() {
+        return Err(Error::Invalid("automatic alignment proof conflict"));
+    }
+    let duration = manifest.media.as_ref().unwrap().decoded_duration_ms;
+    manifest.recorded_transcript = Some(RecordedSourceTranscript {
+        recording_sha256: manifest.recording_sha256.clone(),
+        transcript_id: transcript.id.clone(),
+        model: "universal-2".into(),
+        transcript_sha256: digest(transcript.text.as_bytes()),
+        segments: vec![Segment {
+            source_id: format!(
+                "{}/recorded/{}/customer",
+                manifest.provider_session_id, transcript.id
+            ),
+            turn_id: format!("recorded:{}", transcript.id),
+            item_id: None,
+            speaker: "customer".into(),
+            channel: 0,
+            text: transcript.text.clone(),
+            turn_status: "completed".into(),
+            source_range_ms: Some([0, duration]),
+            alignment: "recorded_customer_track".into(),
+        }],
+    });
+    manifest.automatic_alignment.clear();
+    manifest.approval_eligible = false;
+    manifest.media.as_mut().unwrap().alignment_proven = false;
+    Ok(())
+}
+
+fn validate_recorded_transcript(
+    manifest: &Manifest,
+    transcript: &RecordedTranscript,
+) -> Result<()> {
+    let media = manifest
+        .media
+        .as_ref()
+        .ok_or(Error::Invalid("decoded recording required"))?;
+    if transcript.id.is_empty()
+        || transcript.id.len() > 100
+        || !transcript
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || transcript.text.trim().is_empty()
+        || transcript.text.len() > 200_000
+        || transcript.words.is_empty()
+        || transcript.words.len() > 20_000
+        || !transcript.audio_duration.is_finite()
+        || transcript.audio_duration <= 0.0
+        || ((transcript.audio_duration * 1000.0) - media.decoded_duration_ms as f64).abs() > 1500.0
+    {
+        return Err(Error::Invalid("transcription identity or duration"));
+    }
+    // Word times are diagnostics for a whole-track source. Overlapping estimates
+    // are valid; impossible bounds and non-finite confidence values are not.
+    if transcript.words.iter().any(|w| {
+        w.start >= w.end
+            || w.end > media.decoded_duration_ms
+            || w.text.trim().is_empty()
+            || !w.confidence.is_finite()
+            || w.confidence <= 0.0
+            || w.confidence > 1.0
+    }) {
+        return Err(Error::Invalid("transcription word timing"));
+    }
+    Ok(())
+}
+
+/// Validate all derived-source bindings again when consuming durable proofs.
+pub(crate) fn valid_recorded_source(manifest: &Manifest) -> bool {
+    let Some(recorded) = &manifest.recorded_transcript else {
+        return false;
+    };
+    let Some(media) = &manifest.media else {
+        return false;
+    };
+    if recorded.recording_sha256 != manifest.recording_sha256
+        || recorded.segments.len() != 1
+        || recorded.model != "universal-2"
+        || recorded.transcript_id.is_empty()
+        || recorded.transcript_id.len() > 100
+        || !recorded
+            .transcript_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return false;
+    }
+    let source = &recorded.segments[0];
+    source.source_id
+        == format!(
+            "{}/recorded/{}/customer",
+            manifest.provider_session_id, recorded.transcript_id
+        )
+        && source.source_range_ms == Some([0, media.decoded_duration_ms])
+        && source.speaker == "customer"
+        && source.channel == 0
+        && !source.text.trim().is_empty()
+        && recorded.transcript_sha256 == digest(source.text.as_bytes())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiedRange {
     pub source_id: String,
@@ -28,25 +140,29 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
         || media.decoded_duration_ms == 0
         || media.decoded_duration_ms > 390_000
         || media.customer_activity_groups_ms.is_empty()
+        || media
+            .customer_activity_groups_ms
+            .iter()
+            .any(|[start, end]| start >= end || *end > media.decoded_duration_ms)
+        || manifest.recording_sha256.len() != 64
+        || !manifest
+            .recording_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
     {
         return Err(Error::Invalid("recording completeness unverified"));
     }
     // Session wall-clock timestamps are not a documented sample-clock contract:
     // https://www.assemblyai.com/docs/voice-agents/voice-agent-api/session-history
     // Keep metadata_duration_delta_ms as diagnostic rather than treating an
-    // arbitrary tolerance as missing speech. plan() instead checks the independent
-    // transcript against the entire decoded customer WAV and every original word.
+    // arbitrary tolerance as missing speech. Recorded STT uses the decoded WAV
+    // clock directly; the original provider turn clock remains diagnostic.
     let sources: Vec<_> = manifest
         .segments
         .iter()
         .filter(|s| s.speaker == "customer")
         .collect();
-    if sources.is_empty()
-        || sources.len() > 100
-        || sources
-            .iter()
-            .any(|s| s.channel != 0 || tokens(&s.text).is_empty())
-    {
+    if sources.len() > 100 || sources.iter().any(|s| s.channel != 0) {
         return Err(Error::Invalid("customer source identity"));
     }
     match manifest.product_end_reason.as_deref() {
@@ -54,9 +170,11 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
         // Finish can interrupt that reply after a complete customer answer.
         Some("explicit_finish") => (),
         Some("explicit_stop")
-            if sources.iter().all(|s| {
-                s.turn_status == "completed" && !manifest.incomplete_turn_ids.contains(&s.turn_id)
-            }) =>
+            if !sources.is_empty()
+                && sources.iter().all(|s| {
+                    s.turn_status == "completed"
+                        && !manifest.incomplete_turn_ids.contains(&s.turn_id)
+                }) =>
         {
             ()
         }
@@ -67,6 +185,19 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 
 pub fn plan(manifest: &Manifest, transcript: &RecordedTranscript) -> Result<Vec<VerifiedRange>> {
     preflight(manifest)?;
+    if let Some(recorded) = &manifest.recorded_transcript {
+        validate_recorded_transcript(manifest, transcript)?;
+        if !valid_recorded_source(manifest)
+            || recorded.transcript_id != transcript.id
+            || recorded.transcript_sha256 != digest(transcript.text.as_bytes())
+        {
+            return Err(Error::Invalid("recorded source binding changed"));
+        }
+        return Ok(vec![VerifiedRange {
+            source_id: recorded.segments[0].source_id.clone(),
+            source_range_ms: recorded.segments[0].source_range_ms.unwrap(),
+        }]);
+    }
     let media = manifest.media.as_ref().unwrap();
     if transcript.id.is_empty()
         || transcript.id.len() > 100
@@ -202,7 +333,7 @@ pub fn confirm(
             return Err(Error::Invalid("automatic alignment clip binding"));
         }
         let source = manifest
-            .segments
+            .support_segments()
             .iter()
             .find(|s| s.source_id == range.source_id)
             .unwrap();
@@ -213,7 +344,12 @@ pub fn confirm(
             source_text_sha256: digest(source.text.as_bytes()),
             source_range_ms: range.source_range_ms,
             clip_sha256: digest(&clip.wav),
-            method: METHOD.into(),
+            method: if manifest.recorded_transcript.is_some() {
+                RECORDED_METHOD
+            } else {
+                METHOD
+            }
+            .into(),
             verified_by: format!("assemblyai:{}", transcript.id),
             verified_at: at,
         });
@@ -221,7 +357,12 @@ pub fn confirm(
     manifest.automatic_alignment = proofs;
     manifest.approval_eligible = true;
     manifest.media.as_mut().unwrap().alignment_proven = true;
-    manifest.recording_validation = "independent_customer_stt_alignment_verified".into();
+    manifest.recording_validation = if manifest.recorded_transcript.is_some() {
+        "recorded_customer_stt_verified"
+    } else {
+        "independent_customer_stt_alignment_verified"
+    }
+    .into();
     Ok(())
 }
 

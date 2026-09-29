@@ -243,3 +243,97 @@ fn decreasing_word_starts_or_ends_and_cross_answer_overlap_stay_rejected() {
         assert!(plan(&m, &transcript).is_err());
     }
 }
+
+#[test]
+fn recorded_sources_replace_live_caption_dependency_without_rewriting_original() {
+    let (mut m, t) = fixture();
+    m.segments[0].text = "A different live recognition of the answer".into();
+    let original = serde_json::to_value(&m.segments).unwrap();
+    let timeline_sha = m.timeline_sha256.clone();
+    automatic_alignment::prepare_recorded_sources(&mut m, &t).unwrap();
+    assert_eq!(serde_json::to_value(&m.segments).unwrap(), original);
+    assert_eq!(m.timeline_sha256, timeline_sha);
+    assert_eq!(m.support_segments().len(), 1);
+    assert_eq!(m.support_segments()[0].text, t.text);
+    assert_eq!(m.support_segments()[0].source_range_ms, Some([0, 4000]));
+    assert!(m.support_segments()[0].text.contains("but not always"));
+    assert!(m.support_segments()[0].text.contains("Around 60+"));
+    let c = clips(&m, &t);
+    confirm(&mut m, &t, &c, chrono::Utc::now()).unwrap();
+    assert!(m.approval_eligible);
+    let source_id = m.support_segments()[0].source_id.clone();
+    assert_eq!(
+        source_proof(&m, &source_id).unwrap().method,
+        automatic_alignment::RECORDED_METHOD
+    );
+    // The live captions are no longer proof text. The recorded source is.
+    m.segments[0].text.push_str(" live caption correction");
+    assert!(source_proof(&m, &source_id).is_some());
+    m.recorded_transcript.as_mut().unwrap().segments[0].text = "60 registrations guaranteed".into();
+    assert!(source_proof(&m, &source_id).is_none());
+}
+
+#[test]
+fn whole_track_sources_allow_asr_word_estimate_overlap_but_reject_impossible_media() {
+    let (mut m, mut t) = fixture();
+    t.words[1].start = 100; // harmless overlapping word estimates in one full track
+    t.words[1].end = 250;
+    automatic_alignment::prepare_recorded_sources(&mut m, &t).unwrap();
+    assert_eq!(plan(&m, &t).unwrap()[0].source_range_ms, [0, 4000]);
+    for fault in 0..7 {
+        let (mut m, mut t) = fixture();
+        match fault {
+            0 => m.media = None,
+            1 => m.dropped_chunks = Some(1),
+            2 => m.product_end_reason = Some("transport_lost".into()),
+            3 => t.words[0].end = 4001,
+            4 => t.audio_duration = 9.0,
+            5 => t.words[0].confidence = f64::NAN,
+            _ => m.media.as_mut().unwrap().customer_activity_groups_ms = vec![[0, 4500]],
+        }
+        assert!(automatic_alignment::prepare_recorded_sources(&mut m, &t).is_err());
+        assert!(m.recorded_transcript.is_none());
+        assert!(!m.approval_eligible);
+    }
+}
+
+#[test]
+fn recorded_source_proofs_bind_recording_identity_transcript_and_clip() {
+    for fault in 0..5 {
+        let (mut m, t) = fixture();
+        automatic_alignment::prepare_recorded_sources(&mut m, &t).unwrap();
+        let c = clips(&m, &t);
+        confirm(&mut m, &t, &c, chrono::Utc::now()).unwrap();
+        let id = m.support_segments()[0].source_id.clone();
+        match fault {
+            0 => m.recording_sha256 = "0".repeat(64),
+            1 => m.recorded_transcript.as_mut().unwrap().recording_sha256 = "0".repeat(64),
+            2 => m.recorded_transcript.as_mut().unwrap().transcript_id = "other".into(),
+            3 => {
+                m.recorded_transcript.as_mut().unwrap().segments[0].source_range_ms =
+                    Some([100, 3900])
+            }
+            _ => m.automatic_alignment[0].verified_by = "assemblyai:other".into(),
+        }
+        assert!(source_proof(&m, &id).is_none());
+    }
+}
+
+#[test]
+fn whole_recorded_source_does_not_need_missing_live_captions_and_recovery_keeps_progress_external()
+{
+    let (mut m, t) = fixture();
+    m.segments.clear();
+    automatic_alignment::prepare_recorded_sources(&mut m, &t).unwrap();
+    let c = clips(&m, &t);
+    confirm(&mut m, &t, &c, chrono::Utc::now()).unwrap();
+    let (recorded, unresolved) = v0_evidence::recovery::reconstruct(uuid::Uuid::new_v4(), &m);
+    assert!(unresolved.is_empty());
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].text, t.text);
+    assert_eq!(
+        recorded[0].status,
+        "recorded_utterance_automatically_verified"
+    );
+    assert!(m.segments.is_empty());
+}

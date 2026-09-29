@@ -56,7 +56,7 @@ pub fn confirm_operator_alignment(
         ));
     }
     let source = manifest
-        .segments
+        .support_segments()
         .iter()
         .find(|s| {
             s.source_id == confirmation.source_id && s.speaker == "customer" && s.channel == 0
@@ -118,7 +118,7 @@ pub fn confirm_operator_alignment(
     if manifest.product_end_reason.as_deref() != Some("explicit_finish")
         && !completed_pause
         && manifest
-            .segments
+            .support_segments()
             .iter()
             .rev()
             .find(|s| s.speaker == "customer")
@@ -143,7 +143,7 @@ pub fn confirm_operator_alignment(
         .retain(|p| p.source_id != proof.source_id);
     manifest.operator_alignment.push(proof);
     let all_verified = manifest
-        .segments
+        .support_segments()
         .iter()
         .filter(|s| s.speaker == "customer")
         .all(|s| source_proof(manifest, &s.source_id).is_some());
@@ -176,7 +176,7 @@ pub fn source_proof<'a>(
         return None;
     }
     let source = manifest
-        .segments
+        .support_segments()
         .iter()
         .find(|s| s.source_id == source_id && s.speaker == "customer" && s.channel == 0)?;
     manifest
@@ -192,7 +192,15 @@ pub fn source_proof<'a>(
                 && p.source_range_ms[1] <= media.decoded_duration_ms
                 && ((p.method == "operator_whole_answer_listening_v1"
                     && media.metadata_duration_delta_ms.unsigned_abs() <= 1500)
+                    || (p.method == crate::automatic_alignment::RECORDED_METHOD
+                        && crate::automatic_alignment::valid_recorded_source(manifest)
+                        && manifest.recorded_transcript.as_ref().is_some_and(|r| {
+                            p.verified_by == format!("assemblyai:{}", r.transcript_id)
+                        })
+                        && p.source_range_ms == source.source_range_ms.unwrap_or([0, 0])
+                        && crate::automatic_alignment::preflight(manifest).is_ok())
                     || (p.method == crate::automatic_alignment::METHOD
+                        && manifest.recorded_transcript.is_none()
                         && p.verified_by.starts_with("assemblyai:")
                         && crate::automatic_alignment::preflight(manifest).is_ok()))
                 && !p.verified_by.is_empty()
