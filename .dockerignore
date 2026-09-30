@@ -1,0 +1,20 @@
+# Only compiler inputs enter the image build context. This also excludes .env,
+# local audio, Git/worktrees, internal docs, skills, frontend builds and tests.
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!migrations/
+!migrations/**
+# Keep local secrets/instructions excluded even if placed below an allowed tree.
+**/.env
+**/.env.*
+**/AGENTS.md
+**/README.md
+**/target/
+**/.local/
+**/.git/
