@@ -1322,12 +1322,6 @@ function Interview() {
                   before trying again.
                 </Notice>
               )}
-              {processing && !ended && (
-                <Notice>
-                  Your interview is ready for recording review. No recording
-                  starts automatically.
-                </Notice>
-              )}
             </div>
             {!showStop && !reviewRequired && (
               <nav className="actions" aria-label="Conversation navigation">
@@ -1339,10 +1333,6 @@ function Interview() {
                 </Link>
               </nav>
             )}
-            <p className="small muted">
-              A saved recording or recoverable evidence will only be shown after
-              server confirmation.
-            </p>
           </>
         )}
       </section>
