@@ -260,9 +260,25 @@ impl GatewayClient {
         schema: Value,
         input: Value,
     ) -> Result<T, GatewayError> {
+        self.request_with_prompt(
+            &format!("{COMMON_PROMPT}\n{task_prompt}"),
+            schema_name,
+            schema,
+            input,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_with_prompt<T: DeserializeOwned>(
+        &self,
+        system_prompt: &str,
+        schema_name: &str,
+        schema: Value,
+        input: Value,
+    ) -> Result<T, GatewayError> {
         timeout(
             self.deadline,
-            self.request_inner(task_prompt, schema_name, schema, input),
+            self.request_inner(system_prompt, schema_name, schema, input),
         )
         .await
         .map_err(|_| GatewayError::Deadline)?
@@ -270,7 +286,7 @@ impl GatewayClient {
 
     async fn request_inner<T: DeserializeOwned>(
         &self,
-        task_prompt: &str,
+        system_prompt: &str,
         schema_name: &str,
         schema: Value,
         input: Value,
@@ -280,7 +296,7 @@ impl GatewayClient {
         // Never switch models, retry with different options, or repair JSON.
         let capabilities = model_capabilities(&self.model);
         let mut body = json!({"model":self.model,"max_tokens":3000,
-            "messages":[{"role":"system","content":format!("{COMMON_PROMPT}\n{task_prompt}\nRequired JSON Schema: {schema}")},
+            "messages":[{"role":"system","content":format!("{system_prompt}\nRequired JSON Schema: {schema}")},
             {"role":"user","content":input.to_string()}]});
         if capabilities.temperature {
             body["temperature"] = json!(0);

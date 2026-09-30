@@ -1,9 +1,12 @@
-//! Post-call composition only. Structural checks are not proof of semantic fidelity.
+//! Recorded-evidence composition and bounded pre-interview question preparation.
+//! Structural checks are not proof of semantic fidelity.
 //! Callers must supply authorized recorded evidence and fence persisted results by revisions.
 mod gateway;
+mod interview;
 mod validation;
 
 pub use gateway::{GatewayClient, GatewayError};
+pub use interview::{ContextAttachment, INTERVIEW_PROMPT_VERSION, InterviewQuestions};
 use serde::{Deserialize, Serialize};
 pub use validation::{validate_check, validate_generation};
 

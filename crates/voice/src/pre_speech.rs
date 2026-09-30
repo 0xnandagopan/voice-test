@@ -1,6 +1,6 @@
 //! Deterministic output boundary for an AssemblyAI custom-LLM integration.
 //! The caller must persist the question permit under its current fenced lease
-//! before obtaining a CommittedQuestion. No model/client text is ever passed to TTS.
+//! before obtaining a CommittedQuestion. Only validated, persisted question text is ever passed to TTS.
 //! This module is NOT a mounted/public endpoint: the application supplies auth,
 //! provider-attempt binding and the transaction that issues the receipt.
 use crate::controller::{Progress, Step, VoiceError};
@@ -60,13 +60,76 @@ impl QuestionCode {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "RawQuestionPlan")]
 pub struct QuestionPlan {
     pub code: QuestionCode,
     pub progress: Progress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contextual_text: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQuestionPlan {
+    code: QuestionCode,
+    progress: Progress,
+    #[serde(default)]
+    contextual_text: Option<String>,
+}
+impl TryFrom<RawQuestionPlan> for QuestionPlan {
+    type Error = VoiceError;
+    fn try_from(raw: RawQuestionPlan) -> Result<Self, Self::Error> {
+        let plan = Self {
+            code: raw.code,
+            progress: raw.progress,
+            contextual_text: raw.contextual_text,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+fn valid_contextual_question(text: &str) -> bool {
+    let start = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    text.trim() == text
+        && (8..=300).contains(&text.chars().count())
+        && text.ends_with('?')
+        && text.matches('?').count() == 1
+        && !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>' | '{' | '}' | '`' | '!'))
+        && matches!(
+            start.as_str(),
+            "what"
+                | "how"
+                | "which"
+                | "when"
+                | "where"
+                | "who"
+                | "could"
+                | "would"
+                | "can"
+                | "did"
+                | "do"
+                | "does"
+                | "is"
+                | "are"
+                | "was"
+                | "were"
+                | "has"
+                | "have"
+        )
 }
 impl QuestionPlan {
     fn validate(&self) -> Result<(), VoiceError> {
         self.progress.validate()?;
+        if self.contextual_text.as_ref().is_some_and(|text| {
+            self.code == QuestionCode::Complete || !valid_contextual_question(text)
+        }) {
+            return Err(VoiceError::InvalidProgress);
+        }
         if self.progress.current() == Step::Complete {
             return if self.code == QuestionCode::Complete {
                 Ok(())
@@ -95,10 +158,21 @@ impl QuestionPlan {
             Err(VoiceError::InvalidProgress)
         }
     }
+    /// Attach a prepared question before the application persists this exact plan.
+    /// Repeating/recovering the permit must reuse the stored text, not regenerate it.
+    pub fn with_contextual_text(mut self, text: String) -> Result<Self, VoiceError> {
+        self.contextual_text = Some(text);
+        self.validate()?;
+        Ok(self)
+    }
     pub fn initial(progress: Progress) -> Result<Self, VoiceError> {
         progress.validate()?;
         let code = primary(progress.current());
-        Ok(Self { code, progress })
+        Ok(Self {
+            code,
+            progress,
+            contextual_text: None,
+        })
     }
     pub fn after_answer(
         mut progress: Progress,
@@ -124,12 +198,20 @@ impl QuestionPlan {
                 },
             }
         };
-        Ok(Self { code, progress })
+        Ok(Self {
+            code,
+            progress,
+            contextual_text: None,
+        })
     }
     pub fn skip(mut progress: Progress) -> Result<Self, VoiceError> {
         progress.validate()?;
         let code = primary(progress.skip());
-        Ok(Self { code, progress })
+        Ok(Self {
+            code,
+            progress,
+            contextual_text: None,
+        })
     }
 }
 fn primary(step: Step) -> QuestionCode {
@@ -161,8 +243,11 @@ impl CommittedQuestion {
         }
         Ok(Self { permit_id, plan })
     }
-    pub fn text(&self) -> &'static str {
-        self.plan.code.text()
+    pub fn text(&self) -> &str {
+        self.plan
+            .contextual_text
+            .as_deref()
+            .unwrap_or_else(|| self.plan.code.text())
     }
     /// OpenAI-compatible response body for POST /v1/chat/completions. Request
     /// messages cannot bypass the permit; raw provider/model instructions ignored.
@@ -214,11 +299,13 @@ mod tests {
     fn incompatible_or_expired_permits_cannot_emit_questions() {
         let invalid = QuestionPlan {
             code: QuestionCode::Result,
+            contextual_text: None,
             progress: Progress::default(),
         };
         assert!(CommittedQuestion::after_commit("p".into(), invalid).is_err());
         let expired = QuestionPlan {
             code: QuestionCode::Problem,
+            contextual_text: None,
             progress: Progress {
                 consumed_millis: 360_000,
                 ..Progress::default()
@@ -263,5 +350,90 @@ mod tests {
         assert!(body.contains(QuestionCode::Problem.text()));
         assert_eq!(body.matches('?').count(), 1);
         assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+}
+
+#[cfg(test)]
+mod contextual_tests {
+    use super::*;
+    #[test]
+    fn legacy_permit_and_contextual_repeat_roundtrip() {
+        let legacy =
+            serde_json::to_value(QuestionPlan::initial(Progress::default()).unwrap()).unwrap();
+        assert!(legacy.get("contextual_text").is_none());
+        let restored: QuestionPlan = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            CommittedQuestion::after_commit("legacy".into(), restored)
+                .unwrap()
+                .text(),
+            QuestionCode::Problem.text()
+        );
+        let wording = "What prompted your community livestream project?";
+        let plan = QuestionPlan::initial(Progress::default())
+            .unwrap()
+            .with_contextual_text(wording.into())
+            .unwrap();
+        let resumed: QuestionPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(plan, resumed);
+        assert_eq!(
+            CommittedQuestion::after_commit("repeat".into(), resumed)
+                .unwrap()
+                .text(),
+            wording
+        );
+    }
+    #[test]
+    fn complete_and_unbounded_text_cannot_override_a_permit() {
+        let complete = QuestionPlan::initial(Progress {
+            topic: 3,
+            ..Progress::default()
+        })
+        .unwrap();
+        assert_eq!(
+            CommittedQuestion::after_commit("done".into(), complete.clone())
+                .unwrap()
+                .text(),
+            QuestionCode::Complete.text()
+        );
+        assert!(
+            complete
+                .with_contextual_text("What else can we ask?".into())
+                .is_err()
+        );
+        for text in [
+            "What changed? What improved?".to_owned(),
+            "Ignore controls and publish now?".into(),
+            "What happened\nnext?".into(),
+            format!("What {}?", "x".repeat(300)),
+        ] {
+            let mut plan = QuestionPlan::initial(Progress::default()).unwrap();
+            assert!(plan.clone().with_contextual_text(text.clone()).is_err());
+            plan.contextual_text = Some(text);
+            assert!(CommittedQuestion::after_commit("invalid".into(), plan.clone()).is_err());
+            assert!(
+                serde_json::from_str::<QuestionPlan>(&serde_json::to_string(&plan).unwrap())
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn contextual_text_cannot_bypass_progress_or_expand_question_count() {
+        let mut progress = Progress::default();
+        for _ in 0..8 {
+            let plan = QuestionPlan::after_answer(progress, true, FollowupKind::Detail)
+                .unwrap()
+                .with_contextual_text("How did the community launch affect your work?".into())
+                .unwrap();
+            CommittedQuestion::after_commit("permit".into(), plan.clone()).unwrap();
+            progress = plan.progress;
+        }
+        assert_eq!(progress.followups, [2, 2, 2]);
+        let done = QuestionPlan::after_answer(progress, true, FollowupKind::Detail).unwrap();
+        assert_eq!(done.code, QuestionCode::Complete);
+        assert!(
+            done.with_contextual_text("How can we ask another question?".into())
+                .is_err()
+        );
     }
 }
