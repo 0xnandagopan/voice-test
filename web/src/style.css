@@ -879,3 +879,225 @@ button.invitation-revoke:hover {
 .preparation-status {
   font-weight: 650;
 }
+
+/* Conversation: bounded question card beside a separately scrolling transcript. */
+.interview.conversation-screen {
+  max-width: none;
+  margin: 40px 0;
+  padding: 0;
+  text-align: left;
+}
+.conversation-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 375.8px) minmax(0, 1fr);
+  gap: 36px;
+  align-items: start;
+}
+.interviewer-column {
+  position: sticky;
+  top: 20px;
+  min-width: 0;
+}
+.interviewer-card {
+  min-height: 435px;
+  padding: 48px 36px 21px;
+  border-radius: 12px;
+  background: #fffefa;
+  box-shadow: 0 4px 4px rgb(10 51 42 / 12%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+.interviewer-art {
+  position: relative;
+  width: 93.6px;
+  height: 93.6px;
+  flex: 0 0 auto;
+}
+.interviewer-art img {
+  position: absolute;
+  top: -24.2px;
+  left: -24.2px;
+}
+.interview h1.current-question {
+  font-family: inherit;
+  font-size: 18px;
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: #1e1e1e;
+}
+.interviewer-primary-control {
+  min-height: 60px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+}
+button.pause-interview {
+  padding: 0;
+  border-radius: 50%;
+  width: 60px;
+  height: 60px;
+  background: transparent;
+}
+button.pause-interview:hover {
+  background: #edf0e6;
+}
+.pause-interview img {
+  display: block;
+}
+.interviewer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 24px;
+}
+.interviewer-actions button,
+.interviewer-actions .button {
+  border-radius: 24px;
+  min-height: 44px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 8px;
+}
+.interviewer-actions .secondary {
+  border: 1px solid #254d3c;
+  background: transparent;
+}
+.interviewer-actions .review-recording {
+  margin-left: auto;
+}
+.interviewer-repeat {
+  text-align: center;
+}
+.interviewer-repeat .repeat-question {
+  background: transparent;
+  color: #254d3c;
+  text-decoration: underline;
+  margin: 8px 0 0;
+  padding: 8px;
+  min-height: 44px;
+}
+.conversation-transcript {
+  min-width: 0;
+}
+.conversation-transcript header {
+  display: block;
+  max-width: 390px;
+  margin: 0 0 24px;
+  padding: 0;
+  border: 0;
+}
+.conversation-transcript h2 {
+  font-family: inherit;
+  margin: 0 0 12px;
+  font-size: 12px;
+}
+.conversation-transcript header p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.transcript-messages {
+  height: 363px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid rgb(30 61 47 / 52%);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 20px;
+  scrollbar-gutter: stable;
+}
+.transcript-empty {
+  margin: auto;
+  font-size: 13px;
+  color: #637369;
+  text-align: center;
+}
+.transcript-message {
+  flex: 0 0 auto;
+  max-width: 85%;
+  padding: 10px 12px;
+  border-image: url("/icons/message-question.svg") 12 fill / 12px / 0 stretch;
+  color: #1e1e1e;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.transcript-message.message-long {
+  border-image-source: url("/icons/message-question-long.svg");
+}
+.transcript-message.message-customer {
+  align-self: flex-end;
+  border-image-source: url("/icons/message-answer.svg");
+}
+.transcript-message p {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+  color: inherit;
+  line-height: 1.5;
+}
+.message-speaker {
+  font-size: 10px;
+  color: #254d3c;
+  font-weight: 650;
+}
+.message-progress {
+  font-size: 10px;
+  color: #637369;
+}
+.transcript-disclosure {
+  margin-top: 12px;
+}
+.conversation-notices {
+  margin-top: 24px;
+}
+@media (max-width: 760px) {
+  .interview.conversation-screen {
+    margin: 24px 0;
+  }
+  .conversation-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
+  .interviewer-column {
+    position: sticky;
+    top: 8px;
+    z-index: 2;
+    background: #f6f4ee;
+    padding-bottom: 8px;
+  }
+  .interviewer-card {
+    min-height: 330px;
+    padding: 28px 24px 16px;
+    gap: 20px;
+  }
+  .interview h1.current-question {
+    font-size: 18px;
+    max-height: 128px;
+    overflow-y: auto;
+  }
+  .interviewer-actions {
+    margin-top: 16px;
+  }
+  .transcript-messages {
+    height: 300px;
+    padding: 16px;
+    gap: 16px;
+  }
+  .transcript-message {
+    max-width: 92%;
+  }
+}

@@ -240,7 +240,7 @@ test("only acknowledged Finish reports completion and releases microphone", asyn
     page.getByRole("button", { name: "Pause interview", exact: true }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("link", { name: "Review testimonial", exact: true }),
+    page.getByRole("link", { name: "Review recording", exact: true }),
   ).toBeVisible();
   await expect(page.getByText(/minutes remaining/)).toHaveCount(0);
   await page.reload();
@@ -413,7 +413,7 @@ for (const width of [320, 390, 768]) {
     for (const name of [
       "Pause interview",
       "Repeat question",
-      "Skip topic",
+      "Skip question",
       "Finish interview",
     ]) {
       const button = page.getByRole("button", { name, exact: true });
@@ -442,8 +442,81 @@ for (const width of [320, 390, 768]) {
       page.getByRole("button", { name: "Pause interview" }),
     ).toHaveCount(0);
     await expect(
-      page.getByRole("link", { name: "Review testimonial", exact: true }),
+      page.getByRole("link", { name: "Review recording", exact: true }),
     ).toBeInViewport();
     expect(await tracksEnded(page)).toBe(true);
   });
 }
+
+test("question card and message transcript preserve exact caption text and turn order", async ({
+  page,
+}) => {
+  const f = await fixture(page);
+  await f.start();
+  const question = "What, if anything, changed for your studio?";
+  f.send({
+    type: "caption",
+    speaker: "interviewer",
+    item_id: "20",
+    text: "What, if anything, changed",
+    final: false,
+  });
+  await expect(page.locator(".current-question")).toHaveText(
+    "What, if anything, changed",
+  );
+  f.send({
+    type: "caption",
+    speaker: "interviewer",
+    item_id: "20",
+    text: question,
+    final: true,
+  });
+  const answer =
+    "Um, we saw 12—not 20—new enquiries.\nIt's early; we don't know the results yet.";
+  f.send({
+    type: "caption",
+    speaker: "customer",
+    item_id: "2",
+    text: answer,
+    final: false,
+  });
+  f.send({
+    type: "caption",
+    speaker: "customer",
+    item_id: "2",
+    text: answer,
+    final: true,
+  });
+  await expect(page.locator(".current-question")).toHaveText(question);
+  const messages = page
+    .getByRole("log", { name: "Live transcript" })
+    .locator(".transcript-message");
+  await expect(messages).toHaveCount(2);
+  expect(await messages.nth(0).locator("p").textContent()).toBe(question);
+  expect(await messages.nth(1).locator("p").textContent()).toBe(answer);
+  await expect(page.getByText("Speaking…", { exact: true })).toHaveCount(0);
+  f.send({
+    type: "caption",
+    speaker: "interviewer",
+    item_id: "3",
+    text: "What could have worked better?",
+    final: true,
+  });
+  await expect(page.locator(".current-question")).toHaveText(
+    "What could have worked better?",
+  );
+  await expect(messages).toHaveCount(3);
+  await page
+    .getByRole("button", { name: "Skip question", exact: true })
+    .click();
+  await expect
+    .poll(() => f.commands.some((c) => c.action === "skip"))
+    .toBe(true);
+  await page
+    .getByRole("button", { name: "Pause interview", exact: true })
+    .click();
+  await expect(
+    page.getByRole("link", { name: "Resume interview", exact: true }),
+  ).toHaveAttribute("href", `/review/${id}#recordings`);
+  expect(await tracksEnded(page)).toBe(true);
+});

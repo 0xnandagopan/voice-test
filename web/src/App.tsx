@@ -902,6 +902,12 @@ function Interview() {
   const [captions, setCaptions] = useState<
     Record<string, Extract<RelayEvent, { type: "caption" }>>
   >({});
+  const transcript = useRef<HTMLDivElement | null>(null);
+  const followTranscript = useRef(true);
+  useEffect(() => {
+    const panel = transcript.current;
+    if (panel && followTranscript.current) panel.scrollTop = panel.scrollHeight;
+  }, [captions]);
   const transport = useRef<RelayTransport | null>(null);
   const connection = useRef<AbortController | null>(null);
   const pinnedInterview = useRef<string | null>(null);
@@ -966,7 +972,7 @@ function Interview() {
               if (event.type === "caption")
                 setCaptions((previous) => ({
                   ...previous,
-                  [event.item_id]: event,
+                  [`turn:${event.item_id}`]: event,
                 }));
               if (event.type === "ended") {
                 setActive(false);
@@ -1020,10 +1026,28 @@ function Interview() {
     session.data?.remaining_seconds === 0;
   const canOfferStart = !active && !reviewRequired;
   const continuing = (session.data?.remaining_seconds ?? 360) < 360;
+  const messages = Object.values(captions);
+  const currentQuestion = messages
+    .filter((caption) => caption.speaker === "interviewer")
+    .at(-1)?.text;
+  const interviewTitle =
+    completed || session.data?.state === "completed"
+      ? "Your interview is complete."
+      : processing
+        ? "Your interview is ready for review."
+        : stopped
+          ? currentQuestion || "Your interview is paused."
+          : reviewRequired
+            ? "Review recording recovery."
+            : connecting
+              ? "Connecting to your interviewer…"
+              : active
+                ? currentQuestion || "Your interviewer is getting ready…"
+                : "Ready when you are.";
   return (
     <Shell>
       <Steps current={3} />
-      <section className="interview card">
+      <section className="interview conversation-screen">
         {session.isPending ? (
           <Pending />
         ) : session.isError ? (
@@ -1046,213 +1070,265 @@ function Interview() {
           </>
         ) : (
           <>
-            <p className="eyebrow">YOUR CONVERSATION</p>
-            <div className="voice-orb" aria-hidden>
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
-            </div>
-            <h1>
-              {active
-                ? "Tell us your story."
-                : completed || session.data.state === "completed"
-                  ? "Your interview is complete."
-                  : processing
-                    ? "Your interview is ready for review."
-                    : reviewRequired
-                      ? "Review recording recovery."
-                      : "Ready when you are."}
-            </h1>
-            <p>
-              {completed || processing ? (
-                "Review your recordings and prepare the testimonial you want to share."
-              ) : reviewRequired ? (
-                "Review the available recordings before deciding what to do next."
-              ) : (
-                <>
-                  Three topics. Up to{" "}
-                  {Math.ceil(
-                    (remaining ?? session.data.remaining_seconds) / 60,
-                  )}{" "}
-                  minutes remaining. Tell us what worked, what changed, and what
-                  could have been better.
-                </>
-              )}
-            </p>
-            {!session.data.voice_available && (
-              <Notice>
-                {["queued", "running"].includes(
-                  session.data.interview_preparation ?? "",
-                )
-                  ? "Preparing your project-specific interview. Please try again shortly. No recording is in progress."
-                  : session.data.interview_preparation === "failed"
-                    ? "Your interview could not be prepared. Please contact the person who invited you. No recording is in progress."
-                    : "Live interviews are not ready in this build. No recording is in progress."}
-              </Notice>
-            )}
-            {active && (
-              <Notice>
-                Recording is active. Pause stops your microphone and playback;
-                Finish ends the interview.
-              </Notice>
-            )}
-            <ErrorNotice error={start.error} />
-            <ErrorNotice error={error} />
-            {stopped && (
-              <Notice>
-                Paused locally. No microphone or playback is active. Review
-                recording recovery before resuming; your used time and question
-                counts are preserved.
-              </Notice>
-            )}
-            {ended && (
-              <Notice>
-                {completed
-                  ? "The server confirmed the interview is complete. Recording recovery may still be in progress; completion does not approve or publish a testimonial."
-                  : budgetExhausted
-                    ? "Your six-minute interview allowance is used. Recording has stopped. Review the available recording; reconnecting cannot reset the allowance."
-                    : "The connection has ended. Review recording recovery before continuing. Available recordings may still be recovering."}
-              </Notice>
-            )}
-            {requiresRecovery && !ended && (
-              <Notice>
-                Review and acknowledge recording recovery before resuming. Your
-                used time and question counts are preserved.
-              </Notice>
-            )}
-            {existingSession && (
-              <Notice>
-                A conversation may still be active or awaiting recovery. No
-                microphone is active in this tab. Review recording recovery
-                before trying again.
-              </Notice>
-            )}
-            {processing && !ended && (
-              <Notice>
-                Your interview is ready for recording review. No recording
-                starts automatically.
-              </Notice>
-            )}
-            <div
-              className={`conversation-controls ${showStop || reviewRequired ? "persistent-controls" : ""}`}
-              role="group"
-              aria-label="Conversation controls"
-            >
-              {canOfferStart && (
-                <button
-                  disabled={
-                    start.isPending ||
-                    session.data.state !== "consented" ||
-                    !session.data.voice_available ||
-                    session.data.remaining_seconds <= 0
-                  }
-                  onClick={() => {
-                    setError(null);
-                    setStopped(false);
-                    start.mutate();
-                  }}
-                >
-                  {connecting
-                    ? "Connecting…"
-                    : continuing
-                      ? "Resume interview"
-                      : "Start interview"}
-                </button>
-              )}
-              {showStop && (
-                <button className="secondary" onClick={stop}>
-                  Pause interview
-                </button>
-              )}
-              {reviewRequired && !showStop && (
-                <Link
-                  className="button"
-                  to={`/review/${session.data.id}${completed || processing ? "" : "#recordings"}`}
-                >
-                  {completed || processing
-                    ? "Review testimonial"
-                    : "Review recording recovery"}
-                </Link>
-              )}
-              {active && (
-                <>
-                  <button
-                    className="secondary"
-                    disabled={finishing}
-                    onClick={() => {
-                      try {
-                        transport.current?.control("repeat");
-                      } catch {
-                        stop();
-                      }
-                    }}
-                  >
-                    Repeat question
-                  </button>
-                  <button
-                    className="secondary"
-                    disabled={finishing}
-                    onClick={() => {
-                      try {
-                        transport.current?.control("skip");
-                      } catch {
-                        stop();
-                      }
-                    }}
-                  >
-                    Skip topic
-                  </button>
-                  <button
-                    disabled={!canFinish || finishing}
-                    onClick={() => {
-                      try {
-                        if (!transport.current)
-                          throw new Error(
-                            "The voice connection is unavailable.",
-                          );
-                        transport.current.control("finish");
-                        setFinishing(true);
-                        setError(null);
-                      } catch (reason) {
-                        setFinishing(false);
-                        setError(
-                          reason instanceof Error
-                            ? reason
-                            : new Error(
-                                "Finish could not be requested. You can still pause at any time.",
-                              ),
-                        );
-                      }
-                    }}
-                  >
-                    {finishing ? "Finishing…" : "Finish interview"}
-                  </button>
-                </>
-              )}
-            </div>
-            {Object.keys(captions).length > 0 && (
+            <div className="conversation-layout">
+              <div
+                className="interviewer-column"
+                role="group"
+                aria-label="Conversation controls"
+              >
+                <div className="interviewer-card">
+                  <div className="interviewer-art" aria-hidden="true">
+                    <img
+                      src="/icons/interviewer.svg"
+                      width="142"
+                      height="142"
+                      alt=""
+                    />
+                  </div>
+                  <h1 className="current-question">{interviewTitle}</h1>
+                  <div className="interviewer-primary-control">
+                    {canOfferStart && (
+                      <button
+                        disabled={
+                          start.isPending ||
+                          session.data.state !== "consented" ||
+                          !session.data.voice_available ||
+                          session.data.remaining_seconds <= 0
+                        }
+                        onClick={() => {
+                          setError(null);
+                          setStopped(false);
+                          start.mutate();
+                        }}
+                      >
+                        {connecting
+                          ? "Connecting…"
+                          : continuing
+                            ? "Resume interview"
+                            : "Start interview"}
+                      </button>
+                    )}
+                    {showStop && (
+                      <button
+                        className="pause-interview"
+                        onClick={stop}
+                        aria-label="Pause interview"
+                        title="Pause interview"
+                      >
+                        <img
+                          src="/icons/pause-interview.svg"
+                          width="60"
+                          height="60"
+                          alt=""
+                        />
+                      </button>
+                    )}
+
+                    {reviewRequired &&
+                      !showStop &&
+                      !completed &&
+                      !processing &&
+                      !budgetExhausted &&
+                      session.data.remaining_seconds > 0 && (
+                        <Link
+                          className="button secondary"
+                          to={`/review/${session.data.id}#recordings`}
+                          title="Review recording recovery before resuming"
+                        >
+                          Resume interview
+                        </Link>
+                      )}
+                  </div>
+                </div>
+                <div className="interviewer-actions">
+                  {active && (
+                    <>
+                      <button
+                        className="secondary skip-question"
+                        disabled={finishing}
+                        onClick={() => {
+                          try {
+                            transport.current?.control("skip");
+                          } catch {
+                            stop();
+                          }
+                        }}
+                      >
+                        Skip question
+                      </button>
+                      <button
+                        disabled={!canFinish || finishing}
+                        onClick={() => {
+                          try {
+                            if (!transport.current)
+                              throw new Error(
+                                "The voice connection is unavailable.",
+                              );
+                            transport.current.control("finish");
+                            setFinishing(true);
+                            setError(null);
+                          } catch (reason) {
+                            setFinishing(false);
+                            setError(
+                              reason instanceof Error
+                                ? reason
+                                : new Error(
+                                    "Finish could not be requested. You can still pause at any time.",
+                                  ),
+                            );
+                          }
+                        }}
+                      >
+                        <img
+                          src="/icons/finish-interview.svg"
+                          width="13"
+                          height="13"
+                          alt=""
+                        />
+                        {finishing ? "Finishing…" : "Finish interview"}
+                      </button>
+                    </>
+                  )}
+                  {reviewRequired && !showStop && (
+                    <Link
+                      className="button review-recording"
+                      to={`/review/${session.data.id}${completed || processing ? "" : "#recordings"}`}
+                    >
+                      {completed || processing
+                        ? "Review recording"
+                        : "Review recording recovery"}
+                    </Link>
+                  )}
+                </div>
+                {active && (
+                  <div className="interviewer-repeat">
+                    <button
+                      className="repeat-question text-link"
+                      disabled={finishing}
+                      onClick={() => {
+                        try {
+                          transport.current?.control("repeat");
+                        } catch {
+                          stop();
+                        }
+                      }}
+                    >
+                      Repeat question
+                    </button>
+                  </div>
+                )}
+              </div>
               <section
-                className="live-captions"
+                className="conversation-transcript"
                 aria-label="Provisional conversation captions"
               >
-                <h2>Live captions</h2>
-                <p className="small">
-                  Provisional captions are not saved recording evidence.
-                </p>
-                {Object.values(captions).map((caption) => (
-                  <p key={caption.item_id}>
-                    <strong>
-                      {caption.speaker === "customer" ? "You" : "Interviewer"}
-                      :{" "}
-                    </strong>
-                    {caption.text}
-                    {!caption.final && " …"}
+                <header>
+                  <h2 className="eyebrow">TELL US YOUR STORY</h2>
+                  <p>
+                    {completed || processing
+                      ? "Review your recordings and prepare the testimonial you want to share."
+                      : `Tell us what worked, what changed, and what could have been better. Up to ${Math.ceil((remaining ?? session.data.remaining_seconds) / 60)} minutes remaining.`}
                   </p>
-                ))}
+                </header>
+                <div
+                  className="transcript-messages"
+                  ref={transcript}
+                  role="log"
+                  aria-label="Live transcript"
+                  tabIndex={0}
+                  onScroll={(event) => {
+                    const panel = event.currentTarget;
+                    followTranscript.current =
+                      panel.scrollHeight -
+                        panel.scrollTop -
+                        panel.clientHeight <
+                      64;
+                  }}
+                >
+                  {messages.length === 0 && (
+                    <p className="transcript-empty">
+                      {reviewRequired
+                        ? "Open recording review to see the available saved transcripts."
+                        : "Your conversation will appear here when the interview begins."}
+                    </p>
+                  )}
+                  {messages.map((caption) => (
+                    <div
+                      key={caption.item_id}
+                      className={`transcript-message message-${caption.speaker} ${caption.text.length > 90 ? "message-long" : ""}`}
+                    >
+                      <span className="message-speaker">
+                        {caption.speaker === "customer" ? "You" : "Interviewer"}
+                      </span>
+                      <p>{caption.text}</p>
+                      {!caption.final && (
+                        <span className="message-progress">Speaking…</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <p className="small muted transcript-disclosure">
+                  Live transcription may contain errors. Provisional captions
+                  are not saved recording evidence.
+                </p>
               </section>
-            )}
+            </div>
+            <div className="conversation-notices">
+              {!session.data.voice_available && (
+                <Notice>
+                  {["queued", "running"].includes(
+                    session.data.interview_preparation ?? "",
+                  )
+                    ? "Preparing your project-specific interview. Please try again shortly. No recording is in progress."
+                    : session.data.interview_preparation === "failed"
+                      ? "Your interview could not be prepared. Please contact the person who invited you. No recording is in progress."
+                      : "Live interviews are not ready in this build. No recording is in progress."}
+                </Notice>
+              )}
+              {active && (
+                <Notice>
+                  Recording is active. Pause stops your microphone and playback;
+                  Finish ends the interview.
+                </Notice>
+              )}
+              <ErrorNotice error={start.error} />
+              <ErrorNotice error={error} />
+              {stopped && (
+                <Notice>
+                  Paused locally. No microphone or playback is active. Review
+                  recording recovery before resuming; your used time and
+                  question counts are preserved.
+                </Notice>
+              )}
+              {ended && (
+                <Notice>
+                  {completed
+                    ? "The server confirmed the interview is complete. Recording recovery may still be in progress; completion does not approve or publish a testimonial."
+                    : budgetExhausted
+                      ? "Your six-minute interview allowance is used. Recording has stopped. Review the available recording; reconnecting cannot reset the allowance."
+                      : "The connection has ended. Review recording recovery before continuing. Available recordings may still be recovering."}
+                </Notice>
+              )}
+              {requiresRecovery && !ended && (
+                <Notice>
+                  Review and acknowledge recording recovery before resuming.
+                  Your used time and question counts are preserved.
+                </Notice>
+              )}
+              {existingSession && (
+                <Notice>
+                  A conversation may still be active or awaiting recovery. No
+                  microphone is active in this tab. Review recording recovery
+                  before trying again.
+                </Notice>
+              )}
+              {processing && !ended && (
+                <Notice>
+                  Your interview is ready for recording review. No recording
+                  starts automatically.
+                </Notice>
+              )}
+            </div>
             {!showStop && !reviewRequired && (
               <nav className="actions" aria-label="Conversation navigation">
                 <Link className="text-link" to={`/review/${session.data.id}`}>
