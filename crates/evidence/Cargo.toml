@@ -19,3 +19,5 @@ hmac.workspace = true
 hex.workspace = true
 url.workspace = true
 async-trait.workspace = true
+object_store.workspace = true
+futures-util.workspace = true

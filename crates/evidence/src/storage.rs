@@ -3,6 +3,51 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
+mod s3;
+pub use s3::S3PrivateStorage;
+
+/// Covers the bounded source recordings and decoded clips, not arbitrary uploads.
+pub const MAX_PRIVATE_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Explicit credentials are required for S3; no implicit instance metadata lookup.
+pub async fn storage_from_env() -> Result<Box<dyn PrivateStorage>> {
+    storage_from_config(|name| std::env::var(name).ok()).await
+}
+
+async fn storage_from_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Box<dyn PrivateStorage>> {
+    match get("EVIDENCE_STORAGE_BACKEND")
+        .as_deref()
+        .unwrap_or("local")
+    {
+        "local" => Ok(Box::new(
+            LocalPrivateStorage::new(
+                get("EVIDENCE_STORAGE_DIR").unwrap_or_else(|| ".local/private-evidence".into()),
+            )
+            .await?,
+        )),
+        "s3" => Ok(Box::new(S3PrivateStorage::from_config(get)?)),
+        _ => Err(Error::Invalid(
+            "EVIDENCE_STORAGE_BACKEND must be local or s3",
+        )),
+    }
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    // Flat opaque keys prevent traversal and ambiguous URL encoding on both backends.
+    if key.is_empty()
+        || key.len() > 240
+        || key.starts_with('.')
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::Invalid("private object key"));
+    }
+    Ok(())
+}
+
 /// Implementations must keep objects private and never return public URLs.
 #[async_trait]
 pub trait PrivateStorage: Send + Sync {
@@ -28,16 +73,7 @@ impl LocalPrivateStorage {
         })
     }
     fn path(&self, key: &str) -> Result<PathBuf> {
-        // Flat opaque keys also prevent symlink traversal through nested directories.
-        if key.is_empty()
-            || key.len() > 240
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-            || key.starts_with('.')
-        {
-            return Err(Error::Invalid("private object key"));
-        }
+        validate_key(key)?;
         Ok(self.root.join(key))
     }
 }

@@ -21,6 +21,9 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("private storage operation failed")]
     Io(#[from] std::io::Error),
+    // Deliberately exclude the SDK error: it may contain signed URLs or credentials.
+    #[error("private object storage request failed")]
+    Storage,
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
     #[error("job lease or interview eligibility changed")]
