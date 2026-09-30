@@ -91,7 +91,7 @@ Both processes load `.env` automatically; process environment variables take pre
 | `VOICE_PUBLIC_ORIGIN` | Reachable HTTPS origin for the authenticated voice-agent custom-LLM callback |
 | `EVIDENCE_STORAGE_BACKEND` | `local` for development; `s3` for the hosted services |
 | `EVIDENCE_STORAGE_DIR` | Shared persistent private evidence directory when using local storage |
-| `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION` | Private bucket connection settings from Railway |
+| `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION` | Bucket endpoint, actual name and signing region from Credentials (`auto` for this Railway bucket, distinct from Singapore/`sin`) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Bucket credentials; server-side only |
 | `S3_FORCE_PATH_STYLE` | Use the URL style specified by your bucket; defaults to virtual-hosted style |
 | `VOICE_ARTIFACT_HOSTS` | Exact trusted provider artifact hostnames; do not replace with an unrestricted allowlist |
@@ -167,9 +167,9 @@ These are deployment targets, not evidence that DNS or services are already live
 
 ### 1. Create data resources
 
-In one Railway project/environment, create PostgreSQL (prefer version 17 to match development) and a private Storage Bucket. Choose regions near the API/worker; a bucket's region cannot be changed after creation. Keep PostgreSQL private and configure backups. Start with empty resources unless you separately plan to migrate the existing test database and its corresponding audio files.
+In one Railway project/environment, create PostgreSQL and a private Storage Bucket. The prepared Railway database uses PostgreSQL 18; local integration tests currently use PostgreSQL 17. Keep the existing database version when configuring hosting. Choose regions near the API/worker; a bucket's region cannot be changed after creation. Keep PostgreSQL private and configure backups. Start with empty resources unless you separately plan to migrate the existing test database and its corresponding audio files.
 
-The bucket Credentials tab supplies its actual S3 bucket name, endpoint, region and credentials. Use the actual bucket identifier rather than its display name. Use Railway variable references to supply values to both services. Never expose these settings through `VITE_` variables or commit a production `.env`.
+The bucket Credentials tab supplies its actual S3 bucket name, endpoint, region and credentials. Use the actual bucket identifier rather than its display name. Use Railway variable references to supply values to both services. Take the S3 signing region from the Credentials tab: this bucket uses `auto`, while its physical region is Singapore (`sin`). Set `S3_REGION=auto` explicitly if the bucket's `REGION` reference resolves to `sin`. Never expose these settings through `VITE_` variables or commit a production `.env`.
 
 ### 2. Deploy API and worker from one commit
 
@@ -196,7 +196,7 @@ DATABASE_URL=<reference to PostgreSQL private DATABASE_URL>
 EVIDENCE_STORAGE_BACKEND=s3
 S3_ENDPOINT=<bucket endpoint>
 S3_BUCKET=<actual bucket name>
-S3_REGION=<bucket region>
+S3_REGION=auto
 AWS_ACCESS_KEY_ID=<reference to bucket access key>
 AWS_SECRET_ACCESS_KEY=<reference to bucket secret key>
 S3_FORCE_PATH_STYLE=false
