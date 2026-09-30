@@ -83,11 +83,13 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
   ).toBeVisible();
   // UI availability is advisory: the API must independently reject a direct Start.
   const session = await (
-    await customer.request.get(new URL("/api/customer/session", url).href)
+    await customer.request.get(
+      new URL("/api/customer/session", process.env.TEST_API_ORIGIN ?? url).href,
+    )
   ).json();
   expect(session.interview_preparation).toBe("queued");
   const unavailable = await customer.request.post(
-    new URL("/api/customer/start", url).href,
+    new URL("/api/customer/start", process.env.TEST_API_ORIGIN ?? url).href,
     {
       headers: { Origin: new URL(url).origin },
       data: { interview_id: session.id, expected_revision: session.revision },
@@ -195,7 +197,8 @@ test("same-browser invitation tabs cannot consent to the wrong interview", async
       tabA.getByRole("button", { name: "Check microphone", exact: true }),
     ).toHaveCount(0);
     const current = await customer.request.get(
-      new URL("/api/customer/session", urls[1]).href,
+      new URL("/api/customer/session", process.env.TEST_API_ORIGIN ?? urls[1])
+        .href,
     );
     expect(current.ok()).toBe(true);
     const session = await current.json();

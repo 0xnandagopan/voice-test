@@ -1,3 +1,4 @@
+import { apiUrl } from "./api-origin";
 import { useEffect, useState } from "react";
 import { Link, Navigate, useLocation, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -906,10 +907,13 @@ function Editor({
                   </p>
                 )}
                 <audio
+                  crossOrigin="use-credentials"
                   controls
                   preload="none"
                   aria-label={`Recording ${index + 1}`}
-                  src={`/api${interviewPath(id)}/clips/${encodeURIComponent(clip.id)}/audio`}
+                  src={apiUrl(
+                    `${interviewPath(id)}/clips/${encodeURIComponent(clip.id)}/audio`,
+                  )}
                 />
               </div>
             ))
@@ -1239,10 +1243,13 @@ function Source({
       </p>
       {source.playback_available ? (
         <audio
+          crossOrigin="use-credentials"
           aria-label={`Play source ${index + 1}`}
           controls
           preload="none"
-          src={`/api${interviewPath(id)}/sources/${encodeURIComponent(source.source_id)}/audio`}
+          src={apiUrl(
+            `${interviewPath(id)}/sources/${encodeURIComponent(source.source_id)}/audio`,
+          )}
           onError={() => setPlaybackError(true)}
         />
       ) : (

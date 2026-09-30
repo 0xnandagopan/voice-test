@@ -1,3 +1,4 @@
+import { apiUrl } from "./api-origin";
 import { useState, type SyntheticEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
@@ -323,10 +324,13 @@ function SourceReview({
             does not count as listening.
           </p>
           <audio
+            crossOrigin="use-credentials"
             aria-label="Exact recorded answer preview"
             controls
             preload="none"
-            src={`/api${endpoint}/audio${params(...preview.source_range_ms)}`}
+            src={apiUrl(
+              `${endpoint}/audio${params(...preview.source_range_ms)}`,
+            )}
             onEnded={playbackEnded}
             onError={() => setListened(false)}
           />

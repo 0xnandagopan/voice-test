@@ -1,3 +1,4 @@
+import { apiUrl } from "./api-origin";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlignmentReview } from "./AlignmentReview";
@@ -28,12 +29,13 @@ export function TestimonialPreview({
       {content.clips.map((clip, index) =>
         clipBasePath ? (
           <audio
+            crossOrigin="use-credentials"
             key={`${clip.id}:${clip.sha256}`}
             aria-label={`Selected audio clip ${index + 1}`}
             controls
             preload="none"
             style={{ width: "100%" }}
-            src={`/api${clipBasePath}/${encodeURIComponent(clip.id)}/audio`}
+            src={apiUrl(`${clipBasePath}/${encodeURIComponent(clip.id)}/audio`)}
           />
         ) : (
           <p key={clip.id}>Clip playback is unavailable on this screen.</p>
@@ -177,7 +179,7 @@ export function OperatorReview() {
             <Link className="button" to={`/t/${interviewId}`}>
               View public testimonial
             </Link>
-            <a className="button secondary" href={`/api${path}/export`}>
+            <a className="button secondary" href={apiUrl(`${path}/export`)}>
               Download exact text
             </a>
             <button
