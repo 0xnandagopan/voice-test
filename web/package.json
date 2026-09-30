@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "playwright test",
     "test:api": "playwright test --config playwright.api.config.ts",
-    "format:check": "prettier --check src/App.tsx src/Review.tsx src/Publication.tsx src/workflow.ts src/voice-transport.ts src/api.ts src/main.tsx src/style.css tests *.ts *.json index.html"
+    "format:check": "prettier --check src/App.tsx src/Review.tsx src/Publication.tsx src/workflow.ts src/voice-transport.ts src/api.ts src/api-origin.ts src/main.tsx src/style.css tests *.ts *.json index.html"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.0",

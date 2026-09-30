@@ -1,4 +1,4 @@
-.PHONY: check test-db test-media test-browser test-api
+.PHONY: check test-db test-media test-browser test-api test-split-api
 
 check:
 	cargo fmt --all -- --check
@@ -26,3 +26,7 @@ test-api:
 	cargo build --locked -p v0-app
 	npm --prefix web run build
 	python3 scripts/test-headless-api.py
+
+test-split-api:
+	cargo build --locked -p v0-app
+	TEST_SPLIT_ORIGIN=true python3 scripts/test-headless-api.py

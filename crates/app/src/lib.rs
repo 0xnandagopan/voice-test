@@ -12,6 +12,7 @@ pub mod progress;
 pub mod recovery_maintenance;
 pub mod relay;
 pub mod review;
+pub mod runtime;
 pub mod voice_hook;
 pub mod workflow;
 use axum::{
@@ -29,7 +30,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -114,6 +118,24 @@ async fn policy(
     Ok(response)
 }
 pub fn router(state: AppState) -> Router {
+    // Browser credentials may cross origins only to the single configured app.
+    // Mutation and WebSocket Origin checks remain independent of CORS.
+    let cors = CorsLayer::new()
+        .allow_origin(
+            state
+                .config
+                .origin
+                .parse::<HeaderValue>()
+                .expect("validated APP_ORIGIN"),
+        )
+        .allow_credentials(true)
+        .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::RANGE])
+        .expose_headers([
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::CONTENT_DISPOSITION,
+        ]);
     let api = Router::new()
         .route("/api/health", get(handlers::health))
         .route("/api/ready", get(handlers::ready))
@@ -225,13 +247,12 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), policy))
+        .layer(cors)
         .with_state(state.clone());
     // Machine-authenticated provider callback uses a scoped Bearer token, not
     // browser cookies. Keep it outside the browser Origin policy.
     api.merge(voice_hook::router(state))
 }
 pub fn with_static(app: Router, dir: &str) -> Router {
-    app.fallback_service(
-        ServeDir::new(dir).not_found_service(ServeFile::new(format!("{dir}/index.html"))),
-    )
+    app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(format!("{dir}/index.html"))))
 }

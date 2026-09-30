@@ -6,12 +6,12 @@ use sqlx::postgres::PgPoolOptions;
 use std::{
     env,
     io::{self, Read},
-    net::SocketAddr,
 };
 use v0_app::{AppState, config::Config, router, with_static};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    v0_app::runtime::initialize_tls();
     v0_app::config::load_dotenv()?;
     if env::args().nth(1).as_deref() == Some("hash-password") {
         let mut password = String::new();
@@ -44,9 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = Config::from_env()?;
-    let address: SocketAddr = env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:3000".into())
-        .parse()?;
+    // Validate private storage configuration before accepting traffic. This does
+    // not probe remote access; the synthetic bucket gate verifies that separately.
+    let _storage = v0_evidence::storage::storage_from_env().await?;
+    let address = v0_app::runtime::bind_address(
+        env::var("BIND_ADDR").ok().as_deref(),
+        env::var("PORT").ok().as_deref(),
+    )?;
     if !config.secure_cookie && !address.ip().is_loopback() {
         return Err("Insecure development cookies require a loopback bind".into());
     }
@@ -57,16 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "VOICE_PUBLIC_ORIGIN is required for controlled voice")?,
         )?;
     }
-    let app = with_static(
-        router(state),
-        &env::var("WEB_DIST").unwrap_or_else(|_| "web/dist".into()),
-    );
+    let app = router(state);
+    let app = match env::var("SERVE_WEB").as_deref().unwrap_or("true") {
+        "true" => with_static(
+            app,
+            &env::var("WEB_DIST").unwrap_or_else(|_| "web/dist".into()),
+        ),
+        "false" => app,
+        _ => return Err("SERVE_WEB must be true or false".into()),
+    };
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(address=%listener.local_addr()?, "Application listening");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(v0_app::runtime::shutdown_signal())
         .await?;
     Ok(())
 }

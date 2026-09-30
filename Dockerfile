@@ -25,6 +25,7 @@ COPY --from=build /src/target/release/v0-worker /usr/local/bin/v0-worker
 WORKDIR /app
 USER 10001:10001
 ENV SERVE_WEB=false \
+    EVIDENCE_STORAGE_BACKEND=s3 \
     EVIDENCE_WORK_DIR=/tmp/voice-test-jobs \
     FFMPEG_PATH=/usr/bin/ffmpeg \
     FFPROBE_PATH=/usr/bin/ffprobe \

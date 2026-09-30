@@ -3,10 +3,11 @@ use std::{env, time::Duration};
 use v0_app::alignment_jobs;
 use v0_app::composition_jobs::{self, JobFailure};
 use v0_composition::GatewayClient;
-use v0_evidence::{Error, jobs, provider::AssemblyHistory, storage::LocalPrivateStorage};
+use v0_evidence::{Error, jobs, provider::AssemblyHistory, storage::storage_from_env};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    v0_app::runtime::initialize_tls();
     v0_app::config::load_dotenv()?;
     tracing_subscriber::fmt()
         .with_env_filter("v0_worker=info")
@@ -42,10 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(String::from)
         .collect();
     let provider = AssemblyHistory::new(key.clone(), hosts)?;
-    let storage = LocalPrivateStorage::new(
-        env::var("EVIDENCE_STORAGE_DIR").unwrap_or_else(|_| ".local/private-evidence".into()),
-    )
-    .await?;
+    let storage = storage_from_env().await?;
     let validator = v0_evidence::media::FfmpegValidator::new(
         env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),
         env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".into()),
@@ -67,8 +65,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let run = async {
                 match job.kind.as_str() {
                     "align_evidence" | "delete_alignment_transcript" => {
-                        alignment_jobs::dispatch(&pool, &job, &transcriber, &storage, &validator)
-                            .await
+                        alignment_jobs::dispatch(
+                            &pool,
+                            &job,
+                            &transcriber,
+                            storage.as_ref(),
+                            &validator,
+                        )
+                        .await
                     }
                     "prepare_interview" => match gateway.as_ref() {
                         Some(client) => {
@@ -99,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &pool,
                         &job,
                         &provider,
-                        &storage,
+                        storage.as_ref(),
                         Some(&validator),
                     )
                     .await
@@ -108,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Error::NotReady => "artifacts_not_ready",
                             Error::Invalid(_) | Error::Json(_) => "invalid_artifacts",
                             Error::Http(_) => "provider_unavailable",
-                            Error::Io(_) => "storage_unavailable",
+                            Error::Io(_) | Error::Storage => "storage_unavailable",
                             _ => "import_failed",
                         },
                         retry_after_secs: 30,
@@ -139,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::pin!(renew);
                 tokio::select! {
                     result = &mut run => Some(result),
-                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                    _ = v0_app::runtime::shutdown_signal() => return Ok(()),
                     _ = &mut deadline => Some(Err(JobFailure {code:"job_timeout",retry_after_secs:60,terminal:false})),
                     _ = &mut renew => None,
                 }
@@ -160,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
+                _ = v0_app::runtime::shutdown_signal() => break,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
         }
