@@ -15,7 +15,7 @@ use v0_evidence::{
     alignment::{OperatorAlignmentConfirmation, confirm_operator_alignment},
     manifest::{Manifest, digest},
     media::{CandidateClip, FfmpegValidator},
-    storage::{LocalPrivateStorage, PrivateStorage},
+    storage::{PrivateStorage, storage_from_env},
 };
 
 fn invalid() -> ApiError {
@@ -50,12 +50,8 @@ fn alignment_error(error: v0_evidence::Error) -> ApiError {
         _ => invalid(),
     }
 }
-async fn storage() -> Result<LocalPrivateStorage, ApiError> {
-    LocalPrivateStorage::new(
-        std::env::var("EVIDENCE_STORAGE_DIR").unwrap_or_else(|_| ".local/private-evidence".into()),
-    )
-    .await
-    .map_err(|_| invalid())
+async fn storage() -> Result<Box<dyn PrivateStorage>, ApiError> {
+    storage_from_env().await.map_err(|_| invalid())
 }
 fn validator() -> FfmpegValidator {
     FfmpegValidator::new(

@@ -10,10 +10,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
 use v0_domain::workflow::{CommandResult, WorkflowCommand, WorkflowView};
-use v0_evidence::{
-    manifest::Manifest,
-    storage::{LocalPrivateStorage, PrivateStorage},
-};
+use v0_evidence::{manifest::Manifest, storage::storage_from_env};
 
 pub(crate) async fn token(
     state: &AppState,
@@ -212,11 +209,7 @@ async fn audio(
         }
     }
     let (manifest, key) = selected.ok_or_else(ApiError::unauthorized)?;
-    let storage = LocalPrivateStorage::new(
-        std::env::var("EVIDENCE_STORAGE_DIR").unwrap_or_else(|_| ".local/private-evidence".into()),
-    )
-    .await
-    .map_err(|_| unavailable_media())?;
+    let storage = storage_from_env().await.map_err(|_| unavailable_media())?;
     let recording = storage.read(&key).await.map_err(|_| unavailable_media())?;
     let validator = v0_evidence::media::FfmpegValidator::new(
         std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into()),

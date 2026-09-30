@@ -25,8 +25,14 @@ pub enum ProviderFailure {
 pub struct VoiceClient {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
+/// Pin the TLS backend even when S3 dependencies also enable aws-lc. Safe when
+/// called by a library consumer that does not use the application's entrypoint.
+pub fn initialize_tls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 impl VoiceClient {
     pub async fn connect(api_key: &str) -> Result<Self, ProviderFailure> {
+        initialize_tls();
         if api_key.trim().is_empty() {
             return Err(ProviderFailure::Configuration);
         }
@@ -54,6 +60,7 @@ impl VoiceClient {
         api_key: &str,
         maximum_seconds: u32,
     ) -> Result<Self, ProviderFailure> {
+        initialize_tls();
         if api_key.trim().is_empty() || !(60..=360).contains(&maximum_seconds) {
             return Err(ProviderFailure::Configuration);
         }

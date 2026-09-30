@@ -1,3 +1,4 @@
+import { relayUrl } from "./api-origin";
 import type { VoiceEvent, VoiceTransport } from "./audio";
 
 export type RelayState = {
@@ -22,23 +23,17 @@ export type RelayEvent =
 export type RelayTransport = VoiceTransport & {
   control(action: "skip" | "repeat" | "finish"): void;
 };
-/** Only a same-origin application relay can receive microphone audio. */
+/** Only the configured application relay can receive microphone audio. */
 export function connectRelay(
   path: string,
   onAudio: (event: VoiceEvent) => void,
   onEvent: (event: RelayEvent) => void,
   signal: AbortSignal,
 ): Promise<RelayTransport> {
-  const url = new URL(path, window.location.href);
-  if (url.protocol === "http:") url.protocol = "ws:";
-  if (url.protocol === "https:") url.protocol = "wss:";
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  if (
-    url.host !== window.location.host ||
-    url.protocol !== protocol ||
-    !url.pathname.startsWith("/api/customer/interviews/") ||
-    !url.pathname.endsWith("/live")
-  ) {
+  let url: URL;
+  try {
+    url = relayUrl(path);
+  } catch {
     return Promise.reject(new Error("The voice relay address is invalid."));
   }
   return new Promise((resolve, reject) => {
