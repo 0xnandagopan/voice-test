@@ -8,9 +8,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY migrations ./migrations
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --locked -p v0-app -p v0-worker
+# Railway cache mounts require literal service-specific IDs. Keep this shared
+# API/worker Dockerfile portable by using ordinary Docker layer caching.
+RUN cargo build --release --locked -p v0-app -p v0-worker
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
