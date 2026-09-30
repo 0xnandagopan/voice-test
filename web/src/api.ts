@@ -19,6 +19,8 @@ export type SessionView = {
   expires_at: string;
   remaining_seconds: number;
   voice_available: boolean;
+  interview_preparation?:
+    "not_required" | "queued" | "running" | "ready" | "failed";
 };
 export class ApiError extends Error {
   constructor(

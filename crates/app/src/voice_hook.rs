@@ -87,7 +87,10 @@ pub async fn bind(
             previous.progress = progress;
             previous
         } else {
-            QuestionPlan::initial(progress).map_err(|_| ApiError::conflict())?
+            crate::interview_context::contextualize(
+                &row,
+                QuestionPlan::initial(progress).map_err(|_| ApiError::conflict())?,
+            )?
         };
         let permit = Uuid::new_v4();
         CommittedQuestion::after_commit(permit.to_string(), plan.clone())
@@ -289,6 +292,7 @@ pub async fn complete(
                 let (follow, kind) = classify(&answer);
                 let plan = QuestionPlan::after_answer(progress, follow, kind)
                     .map_err(|_| ApiError::conflict())?;
+                let plan = crate::interview_context::contextualize(&row, plan)?;
                 next = Uuid::new_v4();
                 let revision = row.get::<i64, _>("progress_revision") + 1;
                 sqlx::query("INSERT INTO question_permits(id,attempt_id,request_hash,progress_revision,plan) VALUES($1,$2,$3,$4,$5)")
@@ -390,9 +394,10 @@ pub async fn control_question(
         return Err(ApiError::conflict());
     }
     let plan = match request.action {
-        VoiceAction::Skip => {
-            QuestionPlan::skip(previous.progress).map_err(|_| ApiError::conflict())?
-        }
+        VoiceAction::Skip => crate::interview_context::contextualize(
+            &row,
+            QuestionPlan::skip(previous.progress).map_err(|_| ApiError::conflict())?,
+        )?,
         VoiceAction::Repeat => previous,
         _ => unreachable!(),
     };
@@ -494,7 +499,10 @@ pub async fn configured_greeting(
     validate(&row, row.get("lease_generation"))?;
     let plan: QuestionPlan =
         serde_json::from_value(row.get("plan")).map_err(|_| ApiError::conflict())?;
-    Ok(plan.code.text().to_owned())
+    Ok(CommittedQuestion::after_commit("greeting".into(), plan)
+        .map_err(|_| ApiError::conflict())?
+        .text()
+        .to_owned())
 }
 
 /// Server-only delivery checkpoint, invoked for the first audio frame of the

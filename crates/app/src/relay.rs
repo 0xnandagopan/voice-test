@@ -404,7 +404,8 @@ pub async fn run(
                                 let permit=offered_at_audio.ok_or_else(ApiError::conflict)?;
                                 let plan:Value=sqlx::query_scalar("SELECT plan FROM question_permits WHERE id=$1 AND attempt_id=$2").bind(permit).bind(attempt).fetch_one(&pool).await?;
                                 let plan:v0_voice::pre_speech::QuestionPlan=serde_json::from_value(plan).map_err(|_|ApiError::conflict())?;
-                                if v0_voice::history::words(&text)!=v0_voice::history::words(plan.code.text()){return Err(ApiError::conflict());}
+                                let committed=v0_voice::pre_speech::CommittedQuestion::after_commit(permit.to_string(),plan).map_err(|_|ApiError::conflict())?;
+                                if v0_voice::history::words(&text)!=v0_voice::history::words(committed.text()){return Err(ApiError::conflict());}
                             }
                             if interrupted {playback.suppressed=true;emit(&mut socket,json!({"type":"clear_playback"})).await?;}
                             agent_captions.remove(&item_id);

@@ -146,7 +146,9 @@ export function ContextAttachments({
               <span>
                 <strong>{file.name}</strong>
                 <span className="small muted">
-                  {(bytes(file.content) / 1024).toFixed(1)} KiB
+                  {bytes(file.content) < 1024
+                    ? `${bytes(file.content)} B`
+                    : `${(bytes(file.content) / 1024).toFixed(1)} KiB`}
                 </span>
               </span>
               <button

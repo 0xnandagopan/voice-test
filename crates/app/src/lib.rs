@@ -5,6 +5,7 @@ pub mod composition_jobs;
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod interview_context;
 pub mod leases;
 pub mod live;
 pub mod progress;
@@ -121,7 +122,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/operator/me", get(handlers::me))
         .route(
             "/api/operator/invitations",
-            get(handlers::list).post(handlers::invite),
+            get(handlers::list)
+                .post(handlers::invite)
+                .layer(DefaultBodyLimit::max(768 * 1024)),
         )
         .route(
             "/api/operator/invitations/{id}/link",
@@ -130,6 +133,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/operator/invitations/{id}/revoke",
             post(handlers::revoke),
+        )
+        .route(
+            "/api/operator/invitations/{id}/prepare",
+            post(interview_context::retry),
         )
         .route("/api/customer/exchange", post(handlers::exchange))
         .route("/api/customer/session", get(handlers::session))

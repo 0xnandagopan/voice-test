@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|model| GatewayClient::new(key.clone(), model).ok());
     loop {
         alignment_jobs::enqueue_missing(&pool).await?;
+        v0_app::interview_context::reconcile(&pool).await?;
         let claimed = jobs::claim(&pool).await?;
         v0_app::workflow::reconcile_failed_support(&pool)
             .await
@@ -69,6 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         alignment_jobs::dispatch(&pool, &job, &transcriber, &storage, &validator)
                             .await
                     }
+                    "prepare_interview" => match gateway.as_ref() {
+                        Some(client) => {
+                            v0_app::interview_context::dispatch(&pool, &job, client).await
+                        }
+                        None => Err(JobFailure {
+                            code: "gateway_configuration",
+                            retry_after_secs: 0,
+                            terminal: true,
+                        }),
+                    },
                     "generate_draft" | "support_check" => match gateway.as_ref() {
                         Some(client) => composition_jobs::dispatch(&pool, &job, client).await,
                         None => Err(JobFailure {

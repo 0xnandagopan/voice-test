@@ -85,14 +85,14 @@ pub struct JobFailure {
     pub terminal: bool,
 }
 impl JobFailure {
-    fn stale() -> Self {
+    pub(crate) fn stale() -> Self {
         Self {
             code: "stale_composition",
             retry_after_secs: 0,
             terminal: true,
         }
     }
-    fn gateway(error: GatewayError) -> Self {
+    pub(crate) fn gateway(error: GatewayError) -> Self {
         match error {
             GatewayError::RateLimited { retry_after_secs } => Self {
                 code: "gateway_rate_limited",

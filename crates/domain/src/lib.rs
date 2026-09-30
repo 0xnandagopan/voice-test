@@ -19,4 +19,6 @@ pub struct SessionView {
     pub expires_at: DateTime<Utc>,
     pub remaining_seconds: i32,
     pub voice_available: bool,
+    #[serde(default)]
+    pub interview_preparation: String,
 }

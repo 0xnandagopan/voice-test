@@ -46,6 +46,14 @@ async fn acquire_inner(
     {
         return Err(ApiError::expired());
     }
+    if !matches!(
+        row.get::<String, _>("interview_preparation").as_str(),
+        "not_required" | "ready"
+    ) {
+        return Err(ApiError::invalid(
+            "The project-specific interview is still being prepared. Please try again shortly.",
+        ));
+    }
     if !matches!(state.as_str(), "consented" | "recovering" | "interviewing")
         || row
             .get::<Option<DateTime<Utc>>, _>("consented_at")

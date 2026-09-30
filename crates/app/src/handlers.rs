@@ -128,7 +128,12 @@ fn view(state: &AppState, row: &PgRow) -> SessionView {
                 .unwrap_or(0);
             (360 - row.get::<i32, _>("time_consumed_seconds") - elapsed).max(0)
         },
-        voice_available: state.controlled_voice_origin.is_some(),
+        voice_available: state.controlled_voice_origin.is_some()
+            && matches!(
+                row.get::<String, _>("interview_preparation").as_str(),
+                "not_required" | "ready"
+            ),
+        interview_preparation: row.get("interview_preparation"),
     }
 }
 fn available(row: &PgRow) -> Result<(), ApiError> {
@@ -192,6 +197,8 @@ pub struct Invite {
     idempotency_key: Uuid,
     customer_label: String,
     project_context: String,
+    #[serde(default)]
+    context_attachments: Vec<v0_composition::ContextAttachment>,
 }
 pub async fn invite(
     State(state): State<AppState>,
@@ -205,17 +212,30 @@ pub async fn invite(
         || label.chars().count() > 120
         || context.is_empty()
         || context.chars().count() > 2000
+        || context
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
     {
         return Err(ApiError::invalid(
             "Provide a customer label and project context within the stated limits.",
         ));
     }
-    let request_hash = auth::hash_secret(&json!([label, context]).to_string());
+    crate::interview_context::validate_attachments(&input.context_attachments)?;
+    let context_hash = crate::interview_context::context_hash(context, &input.context_attachments);
+    // Preserve legacy idempotency hashes for attachment-free invitations.
+    let request_hash = auth::hash_secret(
+        &if input.context_attachments.is_empty() {
+            json!([label, context])
+        } else {
+            json!([label, context, input.context_attachments])
+        }
+        .to_string(),
+    );
     let id = Uuid::new_v4();
     let secret = auth::invitation_secret(&state.config.invitation_signing_key, id);
     let mut tx = state.pool.begin().await?;
-    sqlx::query("INSERT INTO interviews(id,customer_label,project_context,secret_hash,idempotency_key,request_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,now()+interval '14 days') ON CONFLICT (idempotency_key) DO NOTHING")
-        .bind(id).bind(label).bind(context).bind(auth::hash_secret(&secret)).bind(input.idempotency_key).bind(&request_hash).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO interviews(id,customer_label,project_context,secret_hash,idempotency_key,request_hash,expires_at,context_attachments,context_hash,interview_preparation) VALUES($1,$2,$3,$4,$5,$6,now()+interval '14 days',$7,$8,'queued') ON CONFLICT (idempotency_key) DO NOTHING")
+        .bind(id).bind(label).bind(context).bind(auth::hash_secret(&secret)).bind(input.idempotency_key).bind(&request_hash).bind(json!(input.context_attachments)).bind(&context_hash).execute(&mut *tx).await?;
     let row = sqlx::query("SELECT * FROM interviews WHERE idempotency_key=$1 FOR UPDATE")
         .bind(input.idempotency_key)
         .fetch_one(&mut *tx)
@@ -225,6 +245,10 @@ pub async fn invite(
     }
     available(&row)?;
     let id: Uuid = row.get("id");
+    if row.get::<String, _>("interview_preparation") == "queued" {
+        crate::interview_context::enqueue(&mut tx, id, &row.get::<String, _>("context_hash"))
+            .await?;
+    }
     let token = auth::invitation_secret(&state.config.invitation_signing_key, id);
     // Key rotation invalidates old links; never return a newly derived but unusable token.
     if auth::hash_secret(&token) != row.get::<String, _>("secret_hash") {

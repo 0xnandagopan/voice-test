@@ -11,7 +11,7 @@ check:
 test-db:
 	@test -n "$(TEST_DATABASE_URL)" || (echo 'Set TEST_DATABASE_URL to isolated PostgreSQL'; exit 1)
 	cargo test -p v0-app --test access --locked -- --ignored
-	cargo test -p v0-app --test workflow --test g1_authority --test review --test composition_jobs --locked -- --ignored
+	cargo test -p v0-app --test workflow --test g1_authority --test review --test composition_jobs --test interview_context --locked -- --ignored
 	cargo test -p v0-app --test relay --locked stop_during_startup_releases_lease_without_creating_provider_session -- --ignored --exact
 	cargo test -p v0-worker --locked agent_cleanup::tests::cleanup_fences_tombstones_active_attempts_and_deadline_races -- --ignored --exact
 	cargo test -p v0-evidence --test recovery --locked -- --include-ignored

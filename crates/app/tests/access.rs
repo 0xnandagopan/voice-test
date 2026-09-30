@@ -79,6 +79,8 @@ async fn stale_heartbeat_and_expired_lock_wait_cannot_renew_lease() {
     let invite = t.invite(&op).await;
     let customer = t.exchange(&invite).await;
     let id = Uuid::parse_str(invite["invitation"]["id"].as_str().unwrap()).unwrap();
+    // Lease races below require a finished synthetic question-preparation job.
+    seed_prepared_questions(&t.pool, id).await;
     t.request(
         "POST",
         "/api/customer/consent",
@@ -525,6 +527,8 @@ async fn interview_lease_fences_tabs_and_preserves_reconnect_allowance() {
     let invite = t.invite(&op).await;
     let customer = t.exchange(&invite).await;
     let id = Uuid::parse_str(invite["invitation"]["id"].as_str().unwrap()).unwrap();
+    // Lease races below require a finished synthetic question-preparation job.
+    seed_prepared_questions(&t.pool, id).await;
     assert!(leases::acquire(&t.pool, id, 1).await.is_err());
     t.request(
         "POST",
@@ -602,4 +606,42 @@ async fn invitation_links_remain_copyable_only_by_operator_while_active() {
         StatusCode::GONE
     );
     t.close().await;
+}
+
+async fn seed_prepared_questions(pool: &PgPool, id: Uuid) {
+    use v0_voice::pre_speech::QuestionCode::*;
+    let codes = [
+        Problem,
+        ProblemDetail,
+        ProblemExample,
+        Change,
+        ChangeDetail,
+        ChangeExample,
+        Result,
+        ResultDetail,
+        ResultExample,
+        Uncertainty,
+        MixedFeedback,
+    ];
+    let questions: serde_json::Map<String, Value> = codes
+        .into_iter()
+        .map(|code| {
+            (
+                serde_json::to_value(code)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                json!(code.text()),
+            )
+        })
+        .collect();
+    sqlx::query(
+        "UPDATE interviews SET interview_preparation='ready',interview_questions=$2 WHERE id=$1",
+    )
+    .bind(id)
+    .bind(json!({"questions":questions}))
+    .execute(pool)
+    .await
+    .unwrap();
 }

@@ -79,12 +79,13 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
     customerPage.getByRole("button", { name: "Start interview", exact: true }),
   ).toBeDisabled();
   await expect(
-    customerPage.getByText(/Live interviews are not ready/),
+    customerPage.getByText(/Preparing your project-specific interview/),
   ).toBeVisible();
   // UI availability is advisory: the API must independently reject a direct Start.
   const session = await (
     await customer.request.get(new URL("/api/customer/session", url).href)
   ).json();
+  expect(session.interview_preparation).toBe("queued");
   const unavailable = await customer.request.post(
     new URL("/api/customer/start", url).href,
     {
