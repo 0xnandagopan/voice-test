@@ -16,6 +16,10 @@ import {
 } from "./api";
 import { AudioController, browserAudioDependencies } from "./audio";
 import { Review } from "./Review";
+import {
+  ContextAttachments,
+  type ContextAttachment,
+} from "./ContextAttachments";
 import { OperatorReview, PublicTestimonial } from "./Publication";
 import {
   connectRelay,
@@ -244,9 +248,17 @@ function Dashboard({ username }: { username: string }) {
   const invitations = useQuery({
     queryKey: ["invitations"],
     queryFn: () => api<{ invitations: SessionView[] }>("/operator/invitations"),
+    refetchInterval: (query) =>
+      query.state.data?.invitations.some((item) =>
+        ["queued", "running"].includes(item.interview_preparation ?? ""),
+      )
+        ? 5000
+        : false,
   });
   const [label, setLabel] = useState("");
   const [context, setContext] = useState("");
+  const [attachments, setAttachments] = useState<ContextAttachment[]>([]);
+  const [readingAttachments, setReadingAttachments] = useState(false);
   const [privateUrl, setPrivateUrl] = useState("");
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
@@ -258,6 +270,7 @@ function Dashboard({ username }: { username: string }) {
         {
           customer_label: label,
           project_context: context,
+          context_attachments: attachments,
           idempotency_key: (idempotency.current ??= crypto.randomUUID()),
         },
       ),
@@ -267,9 +280,17 @@ function Dashboard({ username }: { username: string }) {
       setCopyError(false);
       setLabel("");
       setContext("");
+      setAttachments([]);
       idempotency.current = null;
       void client.invalidateQueries({ queryKey: ["invitations"] });
     },
+  });
+  const prepare = useMutation({
+    mutationFn: (item: SessionView) =>
+      api(`/operator/invitations/${item.id}/prepare`, {}),
+    onSuccess: () =>
+      void client.invalidateQueries({ queryKey: ["invitations"] }),
+    onError: () => void client.invalidateQueries({ queryKey: ["invitations"] }),
   });
   const revoke = useMutation({
     mutationFn: (item: SessionView) =>
@@ -289,6 +310,7 @@ function Dashboard({ username }: { username: string }) {
   });
   function submit(e: FormEvent) {
     e.preventDefault();
+    if (readingAttachments || create.isPending) return;
     setPrivateUrl("");
     create.mutate();
   }
@@ -318,6 +340,7 @@ function Dashboard({ username }: { username: string }) {
               Customer name
               <input
                 value={label}
+                disabled={create.isPending}
                 maxLength={120}
                 placeholder="e.g. Alex at Studio North"
                 onChange={(e) => {
@@ -331,6 +354,7 @@ function Dashboard({ username }: { username: string }) {
               Project context
               <textarea
                 value={context}
+                disabled={create.isPending}
                 maxLength={2000}
                 rows={4}
                 placeholder="What did you work on together?"
@@ -345,8 +369,17 @@ function Dashboard({ username }: { username: string }) {
               This context is shared with your customer and helps guide the
               conversation.
             </p>
+            <ContextAttachments
+              value={attachments}
+              onChange={(files) => {
+                setAttachments(files);
+                idempotency.current = null;
+              }}
+              disabled={create.isPending}
+              onReadingChange={setReadingAttachments}
+            />
             <ErrorNotice error={create.error} />
-            <button disabled={create.isPending}>
+            <button disabled={create.isPending || readingAttachments}>
               {create.isPending ? "Creating…" : "Create private invitation"}
               <span aria-hidden>↗</span>
             </button>
@@ -392,6 +425,7 @@ function Dashboard({ username }: { username: string }) {
           <h2>Invitations</h2>
           <ErrorNotice error={invitations.error} />
           <ErrorNotice error={revoke.error} />
+          <ErrorNotice error={prepare.error} />
           {invitations.isPending ? (
             <Pending />
           ) : invitations.data?.invitations.length ? (
@@ -402,6 +436,27 @@ function Dashboard({ username }: { username: string }) {
                     <strong>{item.customer_label}</strong>
                     <p>{item.project_context}</p>
                     <span className="badge">{item.state}</span>
+                    {item.interview_preparation &&
+                      item.interview_preparation !== "not_required" && (
+                        <p className="preparation-status" role="status">
+                          {item.interview_preparation === "ready"
+                            ? "Interview ready"
+                            : item.interview_preparation === "failed"
+                              ? "Preparation failed"
+                              : "Preparing interview"}
+                        </p>
+                      )}
+                    {item.interview_preparation === "failed" &&
+                      !["revoked", "deleted"].includes(item.state) &&
+                      Date.parse(item.expires_at) > Date.now() && (
+                        <button
+                          className="secondary"
+                          disabled={prepare.isPending}
+                          onClick={() => prepare.mutate(item)}
+                        >
+                          Retry interview preparation
+                        </button>
+                      )}
                     <Link
                       className="text-link"
                       to={`/operator/interviews/${item.id}`}
@@ -762,7 +817,12 @@ function Interview() {
     // Local Stop releases audio before the server finishes recording recovery.
     // Keep refreshing an occupied lease until the authoritative state settles.
     refetchInterval: (query) =>
-      query.state.data?.state === "interviewing" ? 2000 : false,
+      query.state.data?.state === "interviewing" ||
+      ["queued", "running"].includes(
+        query.state.data?.interview_preparation ?? "",
+      )
+        ? 2000
+        : false,
   });
   const controller = useAudioController();
   const [stopped, setStopped] = useState(false);
@@ -958,8 +1018,13 @@ function Interview() {
             </p>
             {!session.data.voice_available && (
               <Notice>
-                Live interviews are not ready in this build. No recording is in
-                progress.
+                {["queued", "running"].includes(
+                  session.data.interview_preparation ?? "",
+                )
+                  ? "Preparing your project-specific interview. Please try again shortly. No recording is in progress."
+                  : session.data.interview_preparation === "failed"
+                    ? "Your interview could not be prepared. Please contact the person who invited you. No recording is in progress."
+                    : "Live interviews are not ready in this build. No recording is in progress."}
               </Notice>
             )}
             {active && (

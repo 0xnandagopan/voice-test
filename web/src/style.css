@@ -738,3 +738,68 @@ textarea {
   width: 100%;
   max-width: 100%;
 }
+
+.context-attachments {
+  border-top: 1px solid #a3b5ad;
+  margin: 48px 0 32px;
+  padding-top: 48px;
+}
+.context-attachments h3 {
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 10px;
+}
+.attachment-input {
+  display: none;
+}
+.attachment-dropzone {
+  width: 100%;
+  min-height: 92px;
+  padding: 16px;
+  border: 1px solid #cbd9d2;
+  border-radius: 12px;
+  background: #f4f6f566;
+  color: #273b34;
+  flex-direction: column;
+  gap: 11px;
+  font-size: 10px;
+  font-weight: 400;
+  margin-bottom: 12px;
+}
+.attachment-dropzone strong {
+  color: #254d3c;
+  font-weight: 650;
+}
+.attachment-dropzone:hover,
+.attachment-dropzone.dragging {
+  background: #eef2e7;
+}
+.attachment-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 16px;
+}
+.attachment-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #e0e3d9;
+}
+.attachment-list li > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.attachment-list button {
+  flex-shrink: 0;
+}
+.context-attachments p:last-child {
+  margin-bottom: 0;
+}
+.preparation-status {
+  font-weight: 650;
+}
