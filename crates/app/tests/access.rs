@@ -645,3 +645,61 @@ async fn seed_prepared_questions(pool: &PgPool, id: Uuid) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL via TEST_DATABASE_URL"]
+async fn invitation_listing_reports_only_current_publication_without_private_workflow() {
+    let t = TestApp::new().await;
+    let op = t.login().await;
+    let invite = t.invite(&op).await;
+    let id = Uuid::parse_str(invite["invitation"]["id"].as_str().unwrap()).unwrap();
+    let approval = Uuid::new_v4();
+    let current = json!({"published_approval_id":approval,"approval":{"id":approval,"content_revision":2,"evidence_revision":3,"content":{"text":"PRIVATE TEST CONTENT"}},"revisions":{"content":2,"evidence":3}});
+    for (value, expired, revoked, expected) in [
+        (json!({}), false, false, false),
+        (current.clone(), false, false, true),
+        (
+            {
+                let mut v = current.clone();
+                v["published_approval_id"] = Value::Null;
+                v
+            },
+            false,
+            false,
+            false,
+        ),
+        (
+            {
+                let mut v = current.clone();
+                v["revisions"]["content"] = json!(4);
+                v
+            },
+            false,
+            false,
+            false,
+        ),
+        (
+            {
+                let mut v = current.clone();
+                v["revisions"]["evidence"] = json!(4);
+                v
+            },
+            false,
+            false,
+            false,
+        ),
+        (current.clone(), true, false, false),
+        (current, false, true, false),
+    ] {
+        sqlx::query("INSERT INTO workflow_state(interview_id,value) VALUES($1,$2) ON CONFLICT(interview_id) DO UPDATE SET value=EXCLUDED.value").bind(id).bind(value).execute(&t.pool).await.unwrap();
+        sqlx::query("UPDATE interviews SET state=$2,expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE id=$1").bind(id).bind(if revoked {"revoked"} else {"completed"}).bind(if expired {-60.0f64} else {86400.0f64}).execute(&t.pool).await.unwrap();
+        let (status, body, _) = t
+            .request("GET", "/api/operator/invitations", Some(&op), json!({}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["invitations"][0]["published"], expected);
+        assert!(!body.to_string().contains("PRIVATE TEST CONTENT"));
+        assert!(!body.to_string().contains("published_approval_id"));
+    }
+    t.close().await;
+}

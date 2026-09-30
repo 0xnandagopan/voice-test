@@ -206,9 +206,11 @@ test("preparation failures retry and pending rows refresh to ready", async ({
   ).toBeVisible();
   expect(mock.retries()).toBe(1);
   mock.ready();
-  await expect(page.getByText("Interview ready", { exact: true })).toBeVisible({
-    timeout: 8000,
-  });
+  await expect(page.getByTitle("Interview ready", { exact: true })).toBeVisible(
+    {
+      timeout: 8000,
+    },
+  );
   await expect(
     page.getByRole("button", { name: "Retry interview preparation" }),
   ).toHaveCount(0);

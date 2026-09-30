@@ -406,19 +406,96 @@ textarea {
 }
 .invitation-list li {
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  padding: 24px 12px 20px;
+  gap: 8px;
+  border-top: 1px solid rgb(10 51 42 / 32%);
+  background: #fffefa;
+  color: #1e1e1e;
+}
+.invitation-heading {
+  display: flex;
   align-items: flex-start;
-  padding: 20px 0;
-  gap: 14px;
-  border-top: 1px solid #e4e6dc;
+  justify-content: space-between;
+  width: 100%;
+  gap: 12px;
 }
 .invitation-list strong {
-  font-size: 14px;
-}
-.invitation-list p {
-  font-size: 12px;
-  margin: 5px 0 10px;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
   overflow-wrap: anywhere;
+  min-width: 0;
+}
+.invitation-list strong a {
+  text-decoration: none;
+}
+.invitation-list strong a:hover {
+  text-decoration: underline;
+}
+.invitation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 13px;
+  font-size: 12px;
+}
+.invitation-status {
+  border-radius: 32px;
+  background: #edf0e6;
+  color: #0a332a;
+  padding: 4px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+}
+.invitation-status.status-completed {
+  background: #62bca7;
+}
+.invitation-status.status-published {
+  background: #254d3c;
+  color: #fffefa;
+}
+.invitation-status.status-revoked,
+.invitation-status.status-expired {
+  background: #f6e5df;
+  color: #8c2929;
+}
+.invitation-review {
+  align-self: flex-end;
+  font-size: 12px;
+  font-weight: 800;
+  color: #0a332a;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding: 8px 0;
+}
+.invitation-review:hover {
+  text-decoration: underline;
+}
+button.invitation-icon {
+  width: 44px;
+  min-height: 44px;
+  padding: 12px;
+  margin: -8px 0;
+  flex-shrink: 0;
+  background: transparent;
+}
+button.invitation-icon:hover {
+  background: #edf0e6;
+}
+button.invitation-revoke {
+  margin-right: -12px;
+}
+button.invitation-revoke:hover {
+  background: #f6e5df;
+}
+.invitation-icon img {
+  display: block;
+}
+.invitation-preparation {
+  width: 100%;
 }
 .badge {
   font-size: 10px;
@@ -662,19 +739,18 @@ textarea {
   white-space: normal;
 }
 
-.invitation-details {
-  min-width: 0;
-  flex: 1;
-}
 .invitation-copy {
-  margin-top: 14px;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, auto) auto;
+  align-items: start;
+  column-gap: 0;
+  row-gap: 8px;
 }
 .invitation-copy label,
-.invitation-copy .notice {
+.invitation-copy .notice,
+.invitation-copy [role="status"] {
+  grid-column: 1 / -1;
   width: 100%;
   margin: 0;
 }

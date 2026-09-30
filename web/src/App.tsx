@@ -185,7 +185,13 @@ function Operator() {
     );
   return <Dashboard username={auth.data.username} />;
 }
-function InvitationCopy({ item }: { item: SessionView }) {
+function InvitationCopy({
+  item,
+  active,
+}: {
+  item: SessionView;
+  active: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const [fallbackUrl, setFallbackUrl] = useState("");
   const copy = useMutation({
@@ -206,18 +212,29 @@ function InvitationCopy({ item }: { item: SessionView }) {
   });
   return (
     <div className="invitation-copy">
-      <button
-        className="secondary"
-        aria-label={`Copy invitation link for ${item.customer_label}`}
-        disabled={copy.isPending}
-        onClick={() => copy.mutate()}
-      >
-        {copy.isPending
-          ? "Getting link…"
-          : copied
-            ? "Link copied"
-            : "Copy link"}
-      </button>
+      <strong>
+        {item.published && active ? (
+          <Link
+            to={`/operator/interviews/${item.id}`}
+            title="Manage published testimonial"
+          >
+            {item.customer_label}
+          </Link>
+        ) : (
+          item.customer_label
+        )}
+      </strong>
+      {active && (
+        <button
+          className="invitation-icon"
+          title={copied ? "Link copied" : "Copy invitation link"}
+          aria-label={`Copy invitation link for ${item.customer_label}`}
+          disabled={copy.isPending}
+          onClick={() => copy.mutate()}
+        >
+          <img src="/icons/invitation-link.svg" alt="" width="20" height="20" />
+        </button>
+      )}
       {copied && (
         <span role="status" className="small">
           Private link copied.
@@ -430,66 +447,114 @@ function Dashboard({ username }: { username: string }) {
             <Pending />
           ) : invitations.data?.invitations.length ? (
             <ul className="invitation-list">
-              {invitations.data.invitations.map((item) => (
-                <li key={item.id}>
-                  <div className="invitation-details">
-                    <strong>{item.customer_label}</strong>
-                    <p>{item.project_context}</p>
-                    <span className="badge">{item.state}</span>
-                    {item.interview_preparation &&
-                      item.interview_preparation !== "not_required" && (
-                        <p className="preparation-status" role="status">
-                          {item.interview_preparation === "ready"
-                            ? "Interview ready"
-                            : item.interview_preparation === "failed"
-                              ? "Preparation failed"
-                              : "Preparing interview"}
-                        </p>
-                      )}
-                    {item.interview_preparation === "failed" &&
-                      !["revoked", "deleted"].includes(item.state) &&
-                      Date.parse(item.expires_at) > Date.now() && (
+              {invitations.data.invitations.map((item) => {
+                const days = Math.max(
+                  0,
+                  Math.ceil(
+                    (Date.parse(item.expires_at) - Date.now()) / 86400000,
+                  ),
+                );
+                const revoked = ["revoked", "deleted"].includes(item.state);
+                const active = !revoked && days > 0;
+                const completed = ["completed", "processing", "draft"].includes(
+                  item.state,
+                );
+                const status = revoked
+                  ? item.state
+                  : !active
+                    ? "expired"
+                    : item.published
+                      ? "published"
+                      : completed
+                        ? "completed"
+                        : item.state === "consented"
+                          ? "invited"
+                          : item.state === "interviewing"
+                            ? "in progress"
+                            : item.state;
+                return (
+                  <li key={item.id}>
+                    <div className="invitation-heading">
+                      <InvitationCopy item={item} active={active} />
+                      {active && (
                         <button
-                          className="secondary"
-                          disabled={prepare.isPending}
-                          onClick={() => prepare.mutate(item)}
+                          className="invitation-icon invitation-revoke"
+                          aria-label={`Revoke invitation for ${item.customer_label}`}
+                          title="Revoke invitation"
+                          disabled={revoke.isPending}
+                          onClick={() => {
+                            if (
+                              window.confirm(
+                                `Revoke ${item.customer_label}’s invitation? Their link will stop working.`,
+                              )
+                            )
+                              revoke.mutate(item);
+                          }}
                         >
-                          Retry interview preparation
+                          <img
+                            src="/icons/invitation-revoke.svg"
+                            alt=""
+                            width="20"
+                            height="20"
+                          />
                         </button>
                       )}
-                    <Link
-                      className="text-link"
-                      to={`/operator/interviews/${item.id}`}
-                    >
-                      Review testimonial
-                    </Link>
-                    <span className="small muted">
-                      {" "}
-                      Expires {new Date(item.expires_at).toLocaleDateString()}
-                    </span>
-                    {!["revoked", "deleted"].includes(item.state) &&
-                      Date.parse(item.expires_at) > Date.now() && (
-                        <InvitationCopy item={item} />
+                    </div>
+                    <div className="invitation-meta">
+                      <span
+                        title={`Expires ${new Date(item.expires_at).toLocaleString()}`}
+                      >
+                        {revoked
+                          ? "Link inactive"
+                          : days > 0
+                            ? `expiring in ${days}d`
+                            : "Link expired"}
+                      </span>
+                      <span
+                        className={`invitation-status status-${status.replaceAll(" ", "-")}`}
+                        title={
+                          item.interview_preparation === "ready"
+                            ? "Interview ready"
+                            : undefined
+                        }
+                      >
+                        {status}
+                      </span>
+                    </div>
+                    {active &&
+                      !completed &&
+                      item.interview_preparation &&
+                      ["queued", "running", "failed"].includes(
+                        item.interview_preparation,
+                      ) && (
+                        <div className="invitation-preparation">
+                          <p className="preparation-status" role="status">
+                            {item.interview_preparation === "failed"
+                              ? "Preparation failed"
+                              : "Preparing interview"}
+                          </p>
+                          {item.interview_preparation === "failed" && (
+                            <button
+                              className="secondary"
+                              disabled={prepare.isPending}
+                              onClick={() => prepare.mutate(item)}
+                            >
+                              Retry interview preparation
+                            </button>
+                          )}
+                        </div>
                       )}
-                  </div>
-                  {!["revoked", "deleted"].includes(item.state) && (
-                    <button
-                      className="quiet danger"
-                      disabled={revoke.isPending}
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `Revoke ${item.customer_label}’s invitation? Their link will stop working.`,
-                          )
-                        )
-                          revoke.mutate(item);
-                      }}
-                    >
-                      Revoke
-                    </button>
-                  )}
-                </li>
-              ))}
+                    {active && completed && !item.published && (
+                      <Link
+                        className="invitation-review"
+                        to={`/operator/interviews/${item.id}`}
+                      >
+                        Review testimonial
+                      </Link>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           ) : (
             <div className="empty">

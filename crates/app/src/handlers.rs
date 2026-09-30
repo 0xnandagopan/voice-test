@@ -152,13 +152,15 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     auth::operator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT * FROM interviews WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200",
+        "SELECT i.*, COALESCE(i.expires_at>clock_timestamp() AND i.state NOT IN ('revoked','deleted') AND w.value->>'published_approval_id'=w.value->'approval'->>'id' AND w.value->'approval'->'content_revision'=w.value->'revisions'->'content' AND w.value->'approval'->'evidence_revision'=w.value->'revisions'->'evidence',false) AS published FROM interviews i LEFT JOIN workflow_state w ON w.interview_id=i.id WHERE i.deleted_at IS NULL ORDER BY i.created_at DESC LIMIT 200",
     )
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(
-        json!({"invitations":rows.iter().map(|r|view(&state,r)).collect::<Vec<_>>()}),
-    ))
+    Ok(Json(json!({"invitations":rows.iter().map(|r| {
+            let mut item = json!(view(&state,r));
+            item["published"] = json!(r.get::<bool,_>("published"));
+            item
+        }).collect::<Vec<_>>()})))
 }
 /// Return the original invitation only to the authenticated operator. Tokens
 /// stay out of list responses and are never persisted in browser storage.

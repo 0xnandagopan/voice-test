@@ -111,7 +111,7 @@ test("real API invitation, consent, synthetic readiness, unavailable voice and r
   await page
     .getByRole("listitem")
     .filter({ hasText: label })
-    .getByRole("button", { name: "Revoke", exact: true })
+    .getByRole("button", { name: /Revoke invitation for/ })
     .click();
   await expect(
     page

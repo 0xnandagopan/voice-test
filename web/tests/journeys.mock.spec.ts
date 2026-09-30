@@ -233,7 +233,7 @@ test("operator signs in, creates, copies and revokes an invitation", async ({
     `#token=synthetic-secret`,
   );
   page.once("dialog", (dialog) => dialog.accept());
-  await page.getByRole("button", { name: "Revoke", exact: true }).click();
+  await page.getByRole("button", { name: /Revoke invitation for/ }).click();
   await expect(page.getByText("revoked", { exact: true })).toBeVisible();
 });
 test("mobile welcome fits viewport and never fabricates published content", async ({
@@ -391,4 +391,93 @@ test("invitation copy offers manual fallback and reports retrieval denial withou
   await expect(
     page.getByLabel("Private invitation link for Alex", { exact: true }),
   ).toHaveCount(0);
+});
+
+test("invitation entries show expiry, current publication and only actionable review links", async ({
+  page,
+}) => {
+  await page.clock.install({ time: new Date("2026-09-30T12:00:00Z") });
+  const invitations = [
+    {
+      ...fixture,
+      id: "completed",
+      customer_label: "Paul at BlueRoomStudios",
+      state: "completed",
+      expires_at: "2026-10-14T12:00:00Z",
+    },
+    {
+      ...fixture,
+      id: "invited",
+      customer_label: "New customer",
+      state: "invited",
+    },
+    {
+      ...fixture,
+      id: "published",
+      customer_label: "Published customer",
+      state: "completed",
+      published: true,
+    },
+    {
+      ...fixture,
+      id: "expired",
+      customer_label: "Expired customer",
+      state: "completed",
+      expires_at: "2026-09-30T12:00:00Z",
+    },
+    {
+      ...fixture,
+      id: "long",
+      customer_label:
+        "A customer with a very long studio name that must wrap without hiding either action",
+      state: "completed",
+      expires_at: "2026-09-30T13:00:00Z",
+    },
+  ];
+  await page.route("**/api/operator/**", (route) =>
+    route.fulfill({
+      json: route.request().url().endsWith("/me")
+        ? { username: "operator" }
+        : { invitations },
+    }),
+  );
+  await page.goto("/operator");
+  const row = (name: string) =>
+    page.locator(".invitation-list > li").filter({ hasText: name });
+  await expect(
+    row("Paul at BlueRoomStudios").getByText("expiring in 14d"),
+  ).toBeVisible();
+  await expect(
+    row("Paul at BlueRoomStudios").getByRole("link", {
+      name: "Review testimonial",
+    }),
+  ).toBeVisible();
+  await expect(row("New customer").getByRole("link")).toHaveCount(0);
+  await expect(
+    row("Published customer").getByText("published", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    row("Published customer").getByRole("link", { name: "Published customer" }),
+  ).toHaveAttribute("href", "/operator/interviews/published");
+  await expect(
+    row("Published customer").getByRole("link", { name: "Review testimonial" }),
+  ).toHaveCount(0);
+  await expect(row("Expired customer").getByText("Link expired")).toBeVisible();
+  await expect(row("Expired customer").getByRole("button")).toHaveCount(0);
+  await expect(row("Expired customer").getByRole("link")).toHaveCount(0);
+  await expect(
+    row("A customer with").getByText("expiring in 1d"),
+  ).toBeVisible();
+  for (const width of [1280, 393, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    for (const image of await row("A customer with").locator("img").all()) {
+      await expect(image).toHaveJSProperty("naturalWidth", 20);
+      const bounds = await image.boundingBox();
+      expect(bounds?.width).toBe(20);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+    }
+  }
 });
